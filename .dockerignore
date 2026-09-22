@@ -16,3 +16,11 @@ update.sh
 .env
 .env.*
 docker-compose.yml
+
+# Host dependencies, test evidence and build output never enter release context.
+.venv
+**/node_modules
+**/dist
+**/.pytest_cache
+**/__pycache__
+**/.venv

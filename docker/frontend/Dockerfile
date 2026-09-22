@@ -4,7 +4,7 @@
 
 # ====== 第一阶段：构建 ======
 # 基础镜像走 docker.io 官方名（由 buildx 的 buildkitd 镜像加速配置拉取，见流水线 BUILDKIT 配置）
-FROM node:18-alpine AS builder
+FROM node:22-alpine AS builder
 
 # 配置国内镜像源
 RUN npm config set registry https://registry.npmmirror.com
@@ -22,10 +22,15 @@ COPY frontend/ .
 
 # 构建生产版本（前端API已使用相对路径/api/v1，通过nginx反向代理到后端）
 RUN npm run build
+ARG XYMB_BUILD_COMMIT=unknown
+RUN printf '{"commit":"%s"}\n' "$XYMB_BUILD_COMMIT" > /app/dist/build-info.json
 
 # ====== 第二阶段：运行 ======
 # 基础镜像走 docker.io 官方名（由 buildx 的 buildkitd 镜像加速配置拉取，见流水线 BUILDKIT 配置）
 FROM nginx:alpine
+ARG XYMB_BUILD_COMMIT=unknown
+LABEL org.opencontainers.image.revision=${XYMB_BUILD_COMMIT}
+LABEL org.opencontainers.image.source="https://github.com/yunqiasen/xianyu-management-bot"
 
 # 配置国内镜像源
 RUN sed -i 's|dl-cdn.alpinelinux.org|mirrors.aliyun.com|g' /etc/apk/repositories

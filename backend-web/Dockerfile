@@ -19,19 +19,21 @@ RUN apt-get update && apt-get install -y curl ca-certificates gcc \
     && rm -rf /var/lib/apt/lists/*
 
 # 复制项目源码
-COPY common /app/common
-COPY backend-web /app/backend-web
-COPY launcher /app/launcher
+COPY backend-web/pyproject.toml /tmp/service.toml
 
 # 从pyproject.toml提取并安装依赖
 RUN python -c "\
 import tomllib; \
-deps = tomllib.load(open('/app/backend-web/pyproject.toml','rb')).get('project',{}).get('dependencies',[]); \
+deps = tomllib.load(open('/tmp/service.toml','rb')).get('project',{}).get('dependencies',[]); \
 open('/tmp/requirements.txt','w').write('\n'.join(deps))" && \
     pip install --no-cache-dir -r /tmp/requirements.txt
 
 RUN python -m playwright install --with-deps chromium
 RUN python -m patchright install --with-deps chromium
+
+COPY common /app/common
+COPY backend-web /app/backend-web
+COPY launcher /app/launcher
 
 # 创建日志目录
 RUN mkdir -p /app/backend-web/logs /app/static/uploads
@@ -42,6 +44,11 @@ EXPOSE 8089
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
 ENV TZ=Asia/Shanghai
+
+ARG XYMB_BUILD_COMMIT=unknown
+ENV XYMB_BUILD_COMMIT=${XYMB_BUILD_COMMIT}
+LABEL org.opencontainers.image.revision=${XYMB_BUILD_COMMIT}
+LABEL org.opencontainers.image.source="https://github.com/yunqiasen/xianyu-management-bot"
 
 # 启动服务
 CMD ["python", "backend-web/main.py"]

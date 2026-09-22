@@ -1,0 +1,170 @@
+# Isolated release topology; start with a loopback candidate port before moving 9000.
+name: xymb-production
+x-logging: &logging
+  driver: json-file
+  options: {max-size: 10m, max-file: "3"}
+x-app-env: &app-env
+  ENVIRONMENT: production
+  MYSQL_HOST: mysql
+  MYSQL_PORT: "3306"
+  MYSQL_DATABASE: ${MYSQL_DATABASE:-xymb_production}
+  MYSQL_USER: xymb
+  MYSQL_PASSWORD: ${MYSQL_PASSWORD:?private MYSQL_PASSWORD required}
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  REDIS_PASSWORD: ${REDIS_PASSWORD:?private REDIS_PASSWORD required}
+  REDIS_DB: "0"
+  DB_POOL_SIZE: "5"
+  DB_MAX_OVERFLOW: "5"
+  INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?private INTERNAL_API_TOKEN required}
+  XYMB_BUILD_COMMIT: ${XYMB_BUILD_COMMIT:?full source commit required}
+  XYMB_ENABLE_BARGAINING_V2: ${XYMB_ENABLE_BARGAINING_V2:-false}
+  XYMB_ENABLE_MONITOR_V2: ${XYMB_ENABLE_MONITOR_V2:-false}
+  HOST: 0.0.0.0
+  STATIC_DIR: /app/static
+  BACKUP_DIR: /app/backups
+  SQL_ECHO: "false"
+  LOG_LEVEL: INFO
+  BROWSER_HEADLESS: "true"
+  TZ: Asia/Shanghai
+x-build-args: &build-args
+  XYMB_BUILD_COMMIT: ${XYMB_BUILD_COMMIT:?full source commit required}
+services:
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?private MYSQL_ROOT_PASSWORD required}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-xymb_production}
+      MYSQL_USER: xymb
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?private MYSQL_PASSWORD required}
+    command: [--character-set-server=utf8mb4, --collation-server=utf8mb4_unicode_ci, --max-connections=120, --innodb-buffer-pool-size=128M, --default-time-zone=+00:00]
+    ports: ["127.0.0.1:${MYSQL_HOST_PORT:-19106}:3306"]
+    volumes: ["${XYMB_RUNTIME_DIR:?runtime directory required}/mysql:/var/lib/mysql"]
+    healthcheck:
+      test: [CMD-SHELL, 'MYSQL_PWD="$$MYSQL_ROOT_PASSWORD" mysqladmin ping -h 127.0.0.1 -uroot --silent']
+      interval: 5s
+      timeout: 4s
+      retries: 30
+  mysql-restore:
+    image: mysql:8.0
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      MYSQL_ROOT_PASSWORD: ${XYMB_RESTORE_ROOT_PASSWORD:?private restore root password required}
+      MYSQL_DATABASE: xymb_restore_release
+      MYSQL_USER: xymb
+      MYSQL_PASSWORD: ${XYMB_RESTORE_PASSWORD:?private restore password required}
+    command: [--max-connections=40, --innodb-buffer-pool-size=64M, --default-time-zone=+00:00]
+    ports: ["127.0.0.1:${RESTORE_HOST_PORT:-19107}:3306"]
+    volumes: ["${XYMB_RUNTIME_DIR:?runtime directory required}/mysql-restore:/var/lib/mysql"]
+    healthcheck:
+      test: [CMD-SHELL, 'MYSQL_PWD="$$MYSQL_ROOT_PASSWORD" mysqladmin ping -h 127.0.0.1 -uroot --silent']
+      interval: 5s
+      timeout: 4s
+      retries: 30
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?private REDIS_PASSWORD required}
+    command: [sh, -c, 'exec redis-server --requirepass "$$REDIS_PASSWORD" --appendonly yes --maxmemory 256mb --maxmemory-policy noeviction']
+    ports: ["127.0.0.1:${REDIS_HOST_PORT:-19380}:6379"]
+    volumes: ["${XYMB_RUNTIME_DIR:?runtime directory required}/redis:/data"]
+    healthcheck:
+      test: [CMD-SHELL, 'REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  backend-web:
+    image: xianyu-management-bot/backend-web:${XYMB_RELEASE_ID:?release identity required}
+    build: {context: ., dockerfile: backend-web/Dockerfile, args: *build-args}
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      <<: *app-env
+      BACKEND_WEB_PORT: "8089"
+      WEBSOCKET_SERVICE_URL: http://websocket:8090
+      SCHEDULER_SERVICE_URL: http://scheduler:8091
+      AUTO_START_CRAWL_JOBS: "false"
+      ENABLE_REMOTE_ADS: "false"
+      ENABLE_REMOTE_ANNOUNCEMENTS: "false"
+      ENABLE_REMOTE_POPUP_ANNOUNCEMENTS: "false"
+      CORS_ORIGINS: ${FRONTEND_PUBLIC_URL:-http://localhost:9000}
+      FRONTEND_PUBLIC_URL: ${FRONTEND_PUBLIC_URL:-http://localhost:9000}
+      BACKEND_WEB_PUBLIC_URL: ${FRONTEND_PUBLIC_URL:-http://localhost:9000}
+      ADMIN_RESTORE_DATABASE_URL: ${ADMIN_RESTORE_DATABASE_URL:-}
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    ports: ["127.0.0.1:${BACKEND_HOST_PORT:-18089}:8089"]
+    volumes:
+      - ${XYMB_RUNTIME_DIR:?runtime directory required}/static:/app/static
+      - ${XYMB_RUNTIME_DIR:?runtime directory required}/backups:/app/backups
+      - ${XYMB_RUNTIME_DIR:?runtime directory required}/logs/backend-web:/app/backend-web/logs
+    depends_on:
+      mysql: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, curl, -fsS, http://127.0.0.1:8089/health]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+  websocket:
+    image: xianyu-management-bot/websocket:${XYMB_RELEASE_ID:?release identity required}
+    build: {context: ., dockerfile: websocket/Dockerfile, args: *build-args}
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      <<: *app-env
+      WEBSOCKET_PORT: "8090"
+      BACKEND_WEB_SERVICE_URL: http://backend-web:8089
+      AUTO_START_WEBSOCKET: ${AUTO_START_WEBSOCKET:-false}
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    ports: ["127.0.0.1:${WEBSOCKET_HOST_PORT:-18090}:8090"]
+    volumes:
+      - ${XYMB_RUNTIME_DIR:?runtime directory required}/static:/app/static
+      - ${XYMB_RUNTIME_DIR:?runtime directory required}/browser:/app/browser_data
+      - ${XYMB_RUNTIME_DIR:?runtime directory required}/logs/websocket:/app/websocket/logs
+    depends_on:
+      backend-web: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, curl, -fsS, http://127.0.0.1:8090/health]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+  scheduler:
+    image: xianyu-management-bot/scheduler:${XYMB_RELEASE_ID:?release identity required}
+    build: {context: ., dockerfile: scheduler/Dockerfile, args: *build-args}
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      <<: *app-env
+      SCHEDULER_PORT: "8091"
+      BACKEND_WEB_SERVICE_URL: http://backend-web:8089
+      WEBSOCKET_SERVICE_URL: http://websocket:8090
+      AUTO_START_SCHEDULER: ${AUTO_START_SCHEDULER:-false}
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    ports: ["127.0.0.1:${SCHEDULER_HOST_PORT:-18091}:8091"]
+    volumes:
+      - ${XYMB_RUNTIME_DIR:?runtime directory required}/static:/app/static
+      - ${XYMB_RUNTIME_DIR:?runtime directory required}/backups:/app/backups
+      - ${XYMB_RUNTIME_DIR:?runtime directory required}/logs/scheduler:/app/scheduler/logs
+    depends_on:
+      websocket: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, curl, -fsS, http://127.0.0.1:8091/health]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+  frontend:
+    image: xianyu-management-bot/frontend:${XYMB_RELEASE_ID:?release identity required}
+    build: {context: ., dockerfile: docker/frontend/Dockerfile, args: *build-args}
+    restart: unless-stopped
+    logging: *logging
+    ports: ["${FRONTEND_BIND:-0.0.0.0}:${FRONTEND_PORT:-9000}:80"]
+    depends_on:
+      backend-web: {condition: service_healthy}
