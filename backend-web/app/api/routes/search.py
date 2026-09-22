@@ -48,7 +48,8 @@ async def search_items(
             keyword=request.keyword,
             page=request.page,
             page_size=request.page_size,
-            db_session=db
+            db_session=db,
+            user_id=str(current_user.id)
         )
         
         # 检查是否有错误

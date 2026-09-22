@@ -41,6 +41,7 @@ const routeTitles: Record<string, string> = {
   '/goofish-compass': '数据罗盘',
   '/goofish-scheduled-crawler': '定时采集',
   '/settings': '系统设置',
+  '/ai-settings': 'AI 回复配置',
   '/message-filters': '消息过滤',
   '/online-chat': '在线聊天',
   '/online-chat-new': '在线聊天',

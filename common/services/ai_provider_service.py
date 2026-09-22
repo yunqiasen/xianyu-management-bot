@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 import httpx
+from common.services.ai_gateway import (AIConfig, AIGatewayError, canonical_provider, generate_text)
 from loguru import logger
 
 
@@ -18,11 +19,15 @@ DEFAULT_AI_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_AI_PROVIDER_TYPE = "openai_compatible"
 VALID_AI_PROVIDER_TYPES = {
     "openai_compatible",
+    "responses",
+    "azure",
     "anthropic",
     "gemini",
     "dashscope_app",
 }
 AI_PROVIDER_NAMES = {
+    "responses": "OpenAI Responses",
+    "azure": "Azure OpenAI",
     "openai_compatible": "OpenAI兼容",
     "anthropic": "Anthropic Claude",
     "gemini": "Google Gemini",
@@ -30,6 +35,8 @@ AI_PROVIDER_NAMES = {
 }
 
 AI_PROVIDER_DEFAULT_BASE_URLS = {
+    "responses": "https://api.openai.com/v1",
+    "azure": "",
     "openai_compatible": DEFAULT_AI_BASE_URL,
     "anthropic": "https://api.anthropic.com",
     "gemini": "https://generativelanguage.googleapis.com",
@@ -66,6 +73,9 @@ def normalize_ai_provider_type(
         return aliases[provider]
     if provider in VALID_AI_PROVIDER_TYPES:
         return provider
+
+    if provider and provider != "dashscope":
+        return canonical_provider(provider)
 
     base = clean_ai_text(base_url).lower()
     model = clean_ai_text(model_name).lower()
@@ -158,25 +168,11 @@ def normalize_ai_settings(settings: dict[str, Any] | None) -> dict[str, Any]:
 
 def get_ai_settings_missing_fields(settings: dict[str, Any] | None) -> list[str]:
     """获取启用AI前必须补全的配置字段"""
-    payload = dict(settings or {})
-    provider = normalize_ai_provider_type(
-        payload.get("provider_type"),
-        payload.get("base_url"),
-        payload.get("model_name"),
-    )
-    base_url = clean_ai_text(payload.get("base_url"))
-    api_key = clean_ai_text(payload.get("api_key"))
-    model_name = clean_ai_text(payload.get("model_name"))
-    missing_fields: list[str] = []
-    if not base_url:
-        missing_fields.append("API地址")
-    if not api_key:
-        missing_fields.append("API Key")
-    if provider != "dashscope_app" and not model_name:
-        missing_fields.append("模型名称")
-    if provider == "dashscope_app" and ("{app_id}" in base_url or "/apps/" not in base_url):
-        missing_fields.append("DashScope应用地址")
-    return missing_fields
+    try:
+        AIConfig.from_settings(settings or {})
+        return []
+    except (ValueError, TypeError) as exc:
+        return [str(exc)]
 
 
 def normalize_openai_base_url(base_url: str) -> str:
@@ -185,6 +181,8 @@ def normalize_openai_base_url(base_url: str) -> str:
     base = base.rstrip("/")
     if base.endswith("/chat/completions"):
         base = base[: -len("/chat/completions")]
+    if base.endswith("/responses"):
+        base = base[: -len("/responses")]
     if base.endswith("/models"):
         base = base[: -len("/models")]
     return base
@@ -236,11 +234,8 @@ def ensure_success_response(response: httpx.Response, provider_name: str) -> Non
     """检查第三方接口响应状态"""
     if 200 <= response.status_code < 300:
         return
-    error_detail = extract_response_error(response)
-    logger.warning(
-        f"【AI接口】{provider_name} 调用失败 status={response.status_code} url={response.request.url} body={error_detail}"
-    )
-    raise RuntimeError(f"{provider_name}返回HTTP {response.status_code}: {error_detail}")
+    logger.warning(f"【AI接口】调用失败 status={response.status_code}")
+    raise RuntimeError(f"AI 服务返回 HTTP {response.status_code}")
 
 
 def normalize_model_options(models: list[dict[str, Any]]) -> list[dict[str, str]]:
@@ -321,174 +316,19 @@ async def test_ai_connection(
     base_url: Any,
     api_key: Any,
     model_name: Any,
-) -> str:
-    """按服务商协议测试AI连接"""
-    raw_settings = {
-        "provider_type": provider_type,
-        "base_url": base_url,
-        "api_key": api_key,
-        "model_name": model_name,
+    *,
+    settings: dict[str, Any] | None = None,
+    messages: list[dict[str, str]] | None = None,
+    client: Any = None,
+    return_result: bool = False,
+) -> Any:
+    """兼容旧测试调用方；新增字段通过完整 settings 快照传入。"""
+    snapshot = dict(settings) if settings is not None else {
+        "provider_type": provider_type, "base_url": base_url,
+        "api_key": api_key, "model_name": model_name,
     }
-    missing_fields = get_ai_settings_missing_fields(raw_settings)
-    if missing_fields:
-        raise ValueError(f"AI配置未填写完整，请先补全：{'、'.join(missing_fields)}")
-
-    settings = normalize_ai_settings(raw_settings)
-    provider = settings["provider_type"]
-    key = settings["api_key"]
-    model = settings["model_name"]
-    if not key:
-        raise ValueError("未配置API Key，请先配置AI设置")
-
-    max_tokens = 100
-    temperature = 0.7
-    messages = [
+    result = await generate_text(snapshot, messages or [
         {"role": "system", "content": "你是AI连接测试助手。"},
-        {"role": "user", "content": "你好，请回复'测试成功'"},
-    ]
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        if provider == "anthropic":
-            url = build_anthropic_url(settings["base_url"], "/messages")
-            system_content = ""
-            user_messages: list[dict[str, str]] = []
-            for msg in messages:
-                role = msg.get("role")
-                content = msg.get("content", "")
-                if role == "system":
-                    system_content = content
-                elif role in ("user", "assistant"):
-                    user_messages.append({"role": role, "content": content})
-            payload = {
-                "model": model,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                "messages": user_messages or [{"role": "user", "content": ""}],
-            }
-            if system_content:
-                payload["system"] = system_content
-            response = await client.post(
-                url,
-                headers={
-                    "x-api-key": key,
-                    "anthropic-version": "2023-06-01",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
-            ensure_success_response(response, get_ai_provider_name(provider, settings["base_url"], model))
-            result = response.json()
-            content = result.get("content", []) if isinstance(result, dict) else []
-            for item in content:
-                if isinstance(item, dict) and item.get("type") == "text" and item.get("text"):
-                    return clean_ai_text(item["text"])
-            raise RuntimeError(f"Anthropic响应格式错误: {str(result)[:500]}")
-
-        if provider == "gemini":
-            url = build_gemini_url(settings["base_url"], f"/models/{model}:generateContent")
-            system_instruction = ""
-            user_content_parts: list[str] = []
-            for msg in messages:
-                if msg["role"] == "system":
-                    system_instruction = msg["content"]
-                elif msg["role"] == "user":
-                    user_content_parts.append(msg["content"])
-            user_content = "\n".join(user_content_parts)
-            if not user_content:
-                raise ValueError("未在消息中找到用户内容")
-            payload = {
-                "contents": [{"role": "user", "parts": [{"text": user_content}]}],
-                "generationConfig": {
-                    "temperature": temperature,
-                    "maxOutputTokens": max_tokens,
-                },
-            }
-            if system_instruction:
-                payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
-            response = await client.post(
-                url,
-                params={"key": key},
-                headers={"Content-Type": "application/json"},
-                json=payload,
-            )
-            ensure_success_response(response, get_ai_provider_name(provider, settings["base_url"], model))
-            result = response.json()
-            try:
-                return clean_ai_text(result["candidates"][0]["content"]["parts"][0]["text"])
-            except Exception as exc:
-                raise RuntimeError(f"Gemini响应格式错误: {str(result)[:500]}") from exc
-
-        if provider == "dashscope_app":
-            base = settings["base_url"]
-            if "/apps/" not in base:
-                raise ValueError("DashScope应用API地址中未找到app_id")
-            app_id = base.split("/apps/", 1)[1].split("/", 1)[0]
-            url = f"https://dashscope.aliyuncs.com/api/v1/apps/{app_id}/completion"
-            system_content = ""
-            user_content = ""
-            for msg in messages:
-                if msg["role"] == "system":
-                    system_content = msg["content"]
-                elif msg["role"] == "user":
-                    user_content = msg["content"]
-            if system_content and user_content:
-                prompt = f"{system_content}\n\n用户问题：{user_content}\n\n请直接回答用户的问题："
-            elif user_content:
-                prompt = user_content
-            else:
-                prompt = "\n".join([f"{msg['role']}: {msg['content']}" for msg in messages])
-            response = await client.post(
-                url,
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                json={
-                    "input": {"prompt": prompt},
-                    "parameters": {"max_tokens": max_tokens, "temperature": temperature},
-                    "debug": {},
-                },
-            )
-            ensure_success_response(response, get_ai_provider_name(provider, settings["base_url"], model))
-            result = response.json()
-            try:
-                return clean_ai_text(result["output"]["text"])
-            except Exception as exc:
-                raise RuntimeError(f"DashScope应用响应格式错误: {str(result)[:500]}") from exc
-
-        url = build_openai_url(settings["base_url"], "/chat/completions")
-        # 优先使用字符串 content（兼容性最广），失败后回退到数组形式（兼容omni等多模态模型）
-        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-        response = await client.post(
-            url,
-            headers=headers,
-            json={
-                "model": model,
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-            },
-        )
-        if response.status_code == 400:
-            # 多模态/全模态模型可能要求 content 为数组格式，回退重试
-            logger.info(f"【AI接口】OpenAI兼容 字符串content被拒绝，尝试数组content格式 model={model}")
-            converted_messages = []
-            for msg in messages:
-                content = msg.get("content")
-                if isinstance(content, str):
-                    converted_messages.append({**msg, "content": [{"type": "text", "text": content}]})
-                else:
-                    converted_messages.append(msg)
-            response = await client.post(
-                url,
-                headers=headers,
-                json={
-                    "model": model,
-                    "messages": converted_messages,
-                    "max_tokens": max_tokens,
-                    "temperature": temperature,
-                },
-            )
-        ensure_success_response(response, get_ai_provider_name(provider, settings["base_url"], model))
-        result = response.json()
-        try:
-            return clean_ai_text(result["choices"][0]["message"]["content"])
-        except Exception as exc:
-            raise RuntimeError(f"OpenAI兼容响应格式错误: {str(result)[:500]}") from exc
+        {"role": "user", "content": "你好，请回复测试成功"},
+    ], client=client)
+    return result if return_result else result.text

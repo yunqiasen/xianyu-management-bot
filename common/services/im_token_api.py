@@ -126,6 +126,7 @@ async def request_im_token(
     *,
     api_mode: str = DEFAULT_TOKEN_API_MODE,
     timeout_seconds: int = 30,
+    proxy_config: dict | None = None,
 ) -> ImTokenApiResult:
     """调用闲鱼 IM Token API。
 
@@ -166,10 +167,9 @@ async def request_im_token(
         "spm_pre": "a21ybx.home.sidebar.1.4c053da6vYwnmf",
         "log_id": "4c053da6vYwnmf",
     }
-    data_value = (
-        '{"appKey":"444e9908a51d1cb236a27862abc769c9","deviceId":"'
-        + device_id
-        + '"}'
+    data_value = json.dumps(
+        {"appKey": "444e9908a51d1cb236a27862abc769c9", "deviceId": device_id},
+        ensure_ascii=False, separators=(",", ":"),
     )
     cookies = trans_cookies(cookies_str)
     m_h5_token = cookies.get("_m_h5_tk", "")
@@ -200,7 +200,9 @@ async def request_im_token(
     }
 
     started_at = time.time()
-    async with aiohttp.ClientSession() as session:
+    from common.services.account_proxy import account_connector
+    connector = account_connector(proxy_config or {'proxy_type':'none'})
+    async with aiohttp.ClientSession(connector=connector, trust_env=False) as session:
         async with session.post(
             build_im_token_api_url(normalized_mode),
             params=params,
@@ -383,6 +385,7 @@ async def request_im_token_with_fallback(
     api_mode: str = DEFAULT_TOKEN_API_MODE,
     timeout_seconds: int = 600,
     log_tag: str = "",
+    proxy_config: dict | None = None,
 ) -> ImTokenApiResult:
     """按系统设置调用 Token 接口。
 
@@ -418,4 +421,5 @@ async def request_im_token_with_fallback(
         device_id,
         api_mode=TOKEN_API_MODE_WEB,
         timeout_seconds=timeout_seconds,
+        proxy_config=proxy_config,
     )

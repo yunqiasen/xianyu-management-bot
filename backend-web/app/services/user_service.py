@@ -1,4 +1,4 @@
-﻿"""
+"""
 
 用户服务
 
@@ -154,6 +154,14 @@ class UserService:
 
 
 
+    async def registration_enabled(self) -> bool:
+        """Apply the public-registration switch at both server entry points."""
+        raw = await self.session.scalar(
+            select(SystemSetting.value).where(SystemSetting.key == "registration_enabled")
+        )
+        return raw is None or str(raw).strip().lower() in {"true", "1"}
+
+
     async def _calc_register_expire_at(self) -> Optional[datetime]:
 
         """根据系统设置「注册用户默认天数」计算注册用户的到期日。
@@ -244,7 +252,7 @@ class UserService:
 
 
 
-    async def update_admin_user(self, user: User, payload: AdminUserUpdate) -> User:
+    async def update_admin_user(self, user: User, payload: AdminUserUpdate, *, actor_id: int | None = None) -> User:
 
         data = payload.model_dump(exclude_unset=True)
 
@@ -257,6 +265,11 @@ class UserService:
         if password:
 
             user.password_hash = security.get_password_hash(password)
+            user.token_version = (user.token_version or 0) + 1
+
+        if actor_id is not None:
+            from common.models.admin_control import AdminAudit
+            self.session.add(AdminAudit(actor_id=actor_id, action='user_update', target=str(user.id), details={'fields':sorted(data), 'credential_changed':bool(password)}))
 
         await self.session.flush()
 

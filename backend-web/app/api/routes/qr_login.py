@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 from typing import Dict
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, Body
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,12 +25,21 @@ router = APIRouter(prefix="/qr-login", tags=["二维码登录"])
 
 # 会话所有者映射
 SESSION_OWNER: Dict[str, int] = {}
+SESSION_ACCOUNT: Dict[str, dict] = {}
 
 # 已处理的会话记录，防止重复处理
 PROCESSED_SESSIONS: Dict[str, Dict] = {}
 
 # 会话处理锁，防止并发处理同一个会话
 SESSION_LOCKS: Dict[str, asyncio.Lock] = {}
+
+
+def _require_session_owner(session_id: str, owner_id: int):
+    actual = SESSION_OWNER.get(session_id)
+    if actual is None:
+        actual = PROCESSED_SESSIONS.get(session_id, {}).get('owner_id')
+    if actual != owner_id:
+        raise HTTPException(404, '扫码会话不存在')
 
 
 def _get_session_lock(session_id: str) -> asyncio.Lock:
@@ -42,7 +51,9 @@ def _get_session_lock(session_id: str) -> asyncio.Lock:
 
 def _cleanup_session(session_id: str):
     """清理会话相关数据"""
-    SESSION_OWNER.pop(session_id, None)
+    owner = SESSION_OWNER.pop(session_id, None)
+    if session_id in PROCESSED_SESSIONS and owner is not None:
+        PROCESSED_SESSIONS[session_id]['owner_id'] = owner
     SESSION_LOCKS.pop(session_id, None)
 
 
@@ -68,18 +79,40 @@ def _build_processed_response(processed_info: dict) -> ApiResponse:
 @router.post("/generate")
 async def generate_qr_code(
     current_user: User = Depends(deps.get_current_active_user),
+    payload: dict | None = Body(None),
+    db: AsyncSession = Depends(get_db),
 ) -> ApiResponse:
     """
     生成二维码
     
     返回二维码图片的Base64编码和会话ID
     """
+    from common.services import account_policy as policy
+    target = (payload or {}).get('account_id')
+    binding = None
+    proxy = None
+    if target:
+        service = AccountService(db)
+        account = await service.get_account_for_user(current_user.id, target)
+        if not account:
+            raise HTTPException(404, '账号不存在')
+        proxy = policy.proxy_url({k: getattr(account,k) for k in ('proxy_type','proxy_host','proxy_port','proxy_user','proxy_pass')})
+        job = await service.start_credential_job(account, 'qr_refresh', current_user.id)
+        if not job['created']:
+            for sid, saved in SESSION_ACCOUNT.items():
+                if saved['job_id'] == job['id']:
+                    info = qr_login_manager.get_session_status(sid)
+                    return ApiResponse(success=True, data={'session_id': sid, **info})
+            raise HTTPException(409, '账号已有凭据任务，请查询或取消后再试')
+        binding = {'account_id': target, 'job_id': job['id']}
     try:
-        result = await qr_login_manager.generate_qr_code()
+        result = await qr_login_manager.generate_qr_code(proxy=proxy)
         session_id = result.get("session_id")
         
         if result.get("success") and session_id:
             SESSION_OWNER[session_id] = current_user.id
+            if binding:
+                SESSION_ACCOUNT[session_id] = binding
             logger.info(f"二维码生成成功: session_id={session_id}, user_id={current_user.id}")
             return ApiResponse(
                 success=True,
@@ -123,6 +156,7 @@ async def get_qr_status(
     - not_found: 会话不存在
     - already_processed: 已处理过
     """
+    _require_session_owner(session_id, current_user.id)
     try:
         # 检查是否已处理过
         if session_id in PROCESSED_SESSIONS:
@@ -134,7 +168,7 @@ async def get_qr_status(
         
         # 如果扫码成功，自动创建或更新账号
         if status == "success":
-            owner_id = SESSION_OWNER.get(session_id, current_user.id)
+            owner_id = SESSION_OWNER[session_id]
             
             # 使用锁防止并发处理
             lock = _get_session_lock(session_id)
@@ -151,11 +185,27 @@ async def get_qr_status(
                     
                     try:
                         account_service = AccountService(db)
-                        account, is_new_account = await account_service.upsert_account_from_qr(
-                            owner_id=owner_id,
-                            cookies=cookies_str,
-                            unb=unb,
-                        )
+                        from common.services.account_credentials import validate_credentials
+                        from common.services import account_policy as policy
+                        binding = SESSION_ACCOUNT.get(session_id)
+                        existing = (await account_service.get_account_for_user(owner_id, binding['account_id'])
+                                    if binding else await account_service.get_account_by_unb(owner_id, unb))
+                        if not binding and existing:
+                            # 新建入口扫到已有账号也走统一任务；不新建资料。
+                            job = await account_service.start_credential_job(existing, 'qr_refresh', owner_id)
+                            if not job['created']:
+                                raise ValueError('账号已有在途凭据任务')
+                            binding = {'account_id': existing.account_id, 'job_id': job['id']}
+                        proxy_config = ({k: getattr(existing,k) for k in ('proxy_type','proxy_host','proxy_port','proxy_user','proxy_pass')}
+                                        if existing else {'proxy_type': 'none'})
+                        verified = await validate_credentials(cookies_str, existing.unb if existing else unb, proxy_config)
+                        if binding:
+                            if not existing or not await account_service.finish_credential_job(existing, binding['job_id'], verified):
+                                raise ValueError('扫码任务已结束或版本已更新')
+                            account, is_new_account = existing, False
+                        else:
+                            account, is_new_account = await account_service.upsert_account_from_qr(
+                                owner_id=owner_id, cookies=verified, unb=unb)
                     except AccountLimitExceededError as exc:
                         message = str(exc)
                         PROCESSED_SESSIONS[session_id] = {
@@ -184,6 +234,8 @@ async def get_qr_status(
                     
                     # 调用 WebSocket 服务启动账号任务
                     try:
+                        if account.status != "active":
+                            raise RuntimeError("账号保持手动停用")
                         from app.core.config import get_settings
                         settings = get_settings()
                         client = get_http_client()
@@ -266,6 +318,7 @@ async def get_qr_cookie(
     
     仅在扫码成功后可用
     """
+    _require_session_owner(session_id, current_user.id)
     try:
         cookies_info = qr_login_manager.get_session_cookies(session_id)
         
@@ -286,3 +339,27 @@ async def get_qr_cookie(
             success=False,
             message=f"获取Cookie失败: {str(e)}",
         )
+
+
+@router.delete('/cancel/{session_id}')
+async def cancel_qr_session(
+    session_id: str,
+    current_user: User = Depends(deps.get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_session_owner(session_id, current_user.id)
+    binding = SESSION_ACCOUNT.get(session_id)
+    if binding:
+        svc = AccountService(db)
+        account = await svc.get_account_for_user(current_user.id, binding['account_id'])
+        if account:
+            await svc.cancel_credential_job(account, binding['job_id'], current_user.id)
+    session = qr_login_manager.sessions.get(session_id)
+    if session:
+        session.status = 'cancelled'
+        session.cookies.clear()
+        session.face_qr_url = None
+        session.face_qr_content = None
+    PROCESSED_SESSIONS[session_id] = {'owner_id': current_user.id, 'status': 'failed', 'message': '扫码已取消'}
+    _cleanup_session(session_id)
+    return ApiResponse(success=True, message='扫码已取消')

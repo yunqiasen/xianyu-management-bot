@@ -19,24 +19,16 @@ from PIL import Image
 class ImageUploader:
     """图片上传器 - 上传图片到闲鱼CDN"""
     
-    def __init__(self, cookies_str: str):
-        self.cookies_str = cookies_str
+    def __init__(self, cookies_str: str, *, account_id: str | None = None, owner_id: int | None = None):
+        self.account_id, self.owner_id = account_id, owner_id
+        self.cookies_str = ""
         self.upload_url = "https://stream-upload.goofish.com/api/upload.api?floderId=0&appkey=xy_chat&_input_charset=utf-8"
         self.session: Optional[aiohttp.ClientSession] = None
     
     async def create_session(self):
-        """创建HTTP会话"""
-        if not self.session:
-            connector = aiohttp.TCPConnector(limit=100, limit_per_host=30)
-            timeout = aiohttp.ClientTimeout(total=30)
-            self.session = aiohttp.ClientSession(
-                connector=connector,
-                timeout=timeout,
-                headers={
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                }
-            )
-    
+        """The worker owns the HTTP session; this adapter only prepares image bytes."""
+        return None
+
     async def close_session(self):
         """关闭HTTP会话"""
         if self.session:
@@ -99,64 +91,28 @@ class ImageUploader:
             return None
     
     async def upload_image(self, image_path: str) -> Optional[str]:
-        """上传图片到闲鱼CDN"""
-        import uuid
-        
-        temp_path = None
+        from common.services.image_gateway import upload_account_image
+        if not self.account_id or self.owner_id is None:
+            logger.warning('图片上传缺少账号执行身份')
+            return None
+        from common.services.media_paths import owned_media_path
         try:
-            if not self.session:
-                await self.create_session()
-            
-            temp_path = self._compress_image(image_path)
-            if not temp_path:
-                logger.error("图片压缩失败")
-                return None
-            
-            with open(temp_path, 'rb') as f:
-                image_data = f.read()
-            
-            # 使用短随机文件名，避免文件名过长被拒绝
-            short_uuid = uuid.uuid4().hex[:12]
-            filename = f"img_{short_uuid}.jpg"
-            
-            headers = {
-                'cookie': self.cookies_str,
-                'Referer': 'https://www.goofish.com/',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'x-requested-with': 'XMLHttpRequest',
-                'Accept': 'application/json, text/javascript, */*; q=0.01',
-            }
-            
-            data = aiohttp.FormData()
-            data.add_field('file', image_data, filename=filename, content_type='image/jpeg')
-            
-            logger.info(f"开始上传图片到闲鱼CDN: {filename}")
-            async with self.session.post(self.upload_url, data=data, headers=headers) as response:
-                if response.status == 200:
-                    response_text = await response.text()
-                    logger.debug(f"上传响应: {response_text}")
-                    
-                    image_url = self._parse_upload_response(response_text)
-                    if image_url:
-                        logger.info(f"图片上传成功: {image_url}")
-                        return image_url
-                    else:
-                        logger.error("解析上传响应失败")
-                        return None
-                else:
-                    logger.error(f"图片上传失败: HTTP {response.status}")
-                    return None
-                    
-        except Exception as e:
-            logger.error(f"图片上传异常: {e}")
+            image_path = str(owned_media_path(image_path, self.owner_id))
+        except ValueError:
+            logger.warning('图片资源归属校验失败')
+            return None
+        temp_path = self._compress_image(image_path)
+        if not temp_path:
+            return None
+        try:
+            return await upload_account_image(self.account_id, self.owner_id, temp_path)
+        except Exception as exc:
+            logger.warning('图片上传结果待核实: {}', type(exc).__name__)
             return None
         finally:
-            if temp_path and os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except Exception:
-                    pass
-    
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
     def _parse_upload_response(self, response_text: str) -> Optional[str]:
         """解析上传响应获取图片URL"""
         try:

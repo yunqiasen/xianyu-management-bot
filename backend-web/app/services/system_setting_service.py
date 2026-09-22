@@ -15,6 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.models.system_setting import SystemSetting
+from common.services.typed_settings import SETTINGS_KEY
 from common.services.remote_token_api import (
     TOKEN_REMOTE_SECRET_KEY_SETTING_KEY,
     TOKEN_REMOTE_URL_SETTING_KEY,
@@ -65,7 +66,7 @@ DEFAULT_SYSTEM_SETTINGS: dict[str, tuple[str, str | None]] = {
     "theme.effect": ("solid", "系统主题效果（solid-纯色，gradient-炫彩）"),
     "theme.color_preset": ("ocean", "系统主题颜色预设"),
     "theme.font_family": ("system", "系统主题字体预设"),
-    "log.retention_days": ("7", "日志保留天数（所有模块生效，修改后实时刷新各服务日志策略）"),
+    "log.retention_days": ("30", "日志保留天数（所有模块生效，修改后实时刷新各服务日志策略）"),
     "account.face_verify_timeout_disable": ("true", "人脸验证超时是否自动禁用账号"),
     # 代理设置：用于配置网络请求的代理 API URL 和启用开关
     # api_url 默认空字符串表示未配置；enabled 默认 false 表示不启用
@@ -197,7 +198,7 @@ class SystemSettingService:
         settings: Dict[str, str] = {}
         for entry in result.scalars().all():
             # JWT 密钥和服务间令牌即使内部调用 include_sensitive=True 也不返回。
-            if entry.key in {"security.internal_api_token", "security.jwt_secret_key"}:
+            if entry.key in {"security.internal_api_token", "security.jwt_secret_key", SETTINGS_KEY}:
                 continue
             if not include_sensitive and entry.key in SENSITIVE_KEYS:
                 continue
@@ -219,6 +220,8 @@ class SystemSettingService:
         return settings
 
     async def set_setting(self, key: str, value: str, description: str | None = None) -> None:
+        if key == SETTINGS_KEY:
+            raise ValueError('dedicated_configuration_endpoint_required')
         if key in SENSITIVE_KEYS:
             raise ValueError("敏感设置不能通过通用接口修改")
         stmt = select(SystemSetting).where(SystemSetting.key == key)
@@ -251,6 +254,8 @@ class SystemSettingService:
         if not settings:
             return
 
+        if SETTINGS_KEY in settings:
+            raise ValueError('dedicated_configuration_endpoint_required')
         sensitive_keys = set(settings).intersection(SENSITIVE_KEYS)
         if sensitive_keys:
             raise ValueError("敏感设置不能通过通用接口修改")

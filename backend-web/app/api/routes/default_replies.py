@@ -165,18 +165,18 @@ async def upload_default_reply_image(
         raise HTTPException(status_code=404, detail="账号不存在")
 
     try:
-        # 保留原行为：只校验类型，不限制文件大小
+        # 统一图片类型、大小与资源归属限制
         _, filename, _ = await save_uploaded_image(
             image,
-            UPLOAD_DIR,
+            UPLOAD_DIR / str(account.owner_id),
             filename_prefix=account_id,
-            validate_size=False,
+            validate_size=True,
         )
     except ImageUploadError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.message)
 
     # 返回相对URL路径
-    image_url = f"/static/uploads/default_reply/{filename}"
+    image_url = f"/static/uploads/default_reply/{account.owner_id}/{filename}"
     return {"success": True, "image_url": image_url}
 
 

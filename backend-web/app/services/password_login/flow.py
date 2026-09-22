@@ -36,7 +36,7 @@ from common.services.xianyu_login.login_do import (
 from common.utils.xianyu_utils import trans_cookies
 
 # 最多解几次滑块（每次解完重发 login.do）
-_MAX_SLIDER_ROUNDS = 3
+_MAX_SLIDER_ROUNDS = 2
 # 单账号协议登录总预算（秒）：需覆盖多轮过滑块(每轮可达 ~90s) + 人脸时用户扫码/识别耗时
 _LOGIN_BUDGET = 600
 _LOGIN_GUARD_COOKIE_NAMES = ("x5secdata", "x5sectag")
@@ -109,7 +109,7 @@ async def _collect_login_cookies(client: httpx.AsyncClient) -> Tuple[str, str]:
 
 async def _save_and_start(
     *, account_id: str, account: str, password: str, show_browser: bool,
-    owner_id: int, cookies_str: str, unb: str,
+    owner_id: int, cookies_str: str, unb: str, job_id: str | None = None,
 ) -> Tuple[bool, str]:
     """入库（按 account_id upsert）+ 清 token 缓存 + 起/重启 WebSocket。
 
@@ -118,15 +118,22 @@ async def _save_and_start(
     """
     async with async_session_maker() as session:
         svc = AccountService(session)
-        account_obj, is_new = await svc.upsert_account_from_password(
-            owner_id=owner_id,
-            account_id=account_id,
-            account=account,
-            password=password,
-            cookies=cookies_str,
-            unb=unb or None,
-            show_browser=show_browser,
-        )
+        if job_id:
+            account_obj = await svc.get_account_for_user(owner_id, account_id)
+            if not account_obj or not await svc.finish_credential_job(account_obj, job_id, cookies_str):
+                raise ValueError('登录任务已取消、到期或版本已更新')
+            # 刷新保留资料；显式修改账密通过账号编辑入口。
+            is_new = False
+        else:
+            account_obj, is_new = await svc.upsert_account_from_password(
+                owner_id=owner_id,
+                account_id=account_id,
+                account=account,
+                password=password,
+                cookies=cookies_str,
+                unb=unb or None,
+                show_browser=show_browser,
+            )
         # 标记该账号 Token 缓存失效（保留记录，新 Cookie 需重新取 Token）
         if unb:
             invalidation = await mark_token_cache_expired(
@@ -135,6 +142,9 @@ async def _save_and_start(
             )
             if not invalidation.success:
                 logger.warning(f"【{account_id}】{invalidation.message}")
+
+    if account_obj.status != "active":
+        return is_new, "凭据已验证；账号保持手动停用"
 
     # 起/重启 WebSocket（与扫码登录同一套 /internal/accounts 接口）
     try:
@@ -193,6 +203,24 @@ async def run_protocol_login(
     show_browser: bool, owner_id: int,
 ) -> None:
     """协议化密码登录主编排（在后台任务中运行，直接更新传入的 session 字典）。"""
+    if session.get('cancelled'):
+        return
+    from common.services import account_policy as policy
+    async with async_session_maker() as db:
+        svc = AccountService(db)
+        existing = await svc.get_account_by_identifier(account_id)
+        if existing and existing.owner_id != owner_id:
+            session.update(status='failed', error='账号归属冲突')
+            return
+        config = ({k: getattr(existing,k) for k in ('proxy_type','proxy_host','proxy_port','proxy_user','proxy_pass')}
+                  if existing else {'proxy_type':'none'})
+        session['proxy_config'] = config
+        if existing:
+            job = await svc.start_credential_job(existing, 'password_login', owner_id)
+            if not job['created']:
+                session.update(status='failed', error='账号已有在途凭据任务')
+                return
+            session['job_id'] = job['id']
     start = time.time()
     remote_config = await _read_remote_config()
 
@@ -201,7 +229,8 @@ async def run_protocol_login(
 
     try:
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(30.0), follow_redirects=False
+            timeout=httpx.Timeout(30.0), follow_redirects=False,
+            trust_env=False, proxy=policy.proxy_url(config)
         ) as client:
             slider_rounds = 0
             pending_login_cookies: Optional[Dict[str, str]] = None
@@ -326,11 +355,17 @@ async def _finish_success(
     show_browser: bool, owner_id: int, cookies_str: str, unb: str,
 ) -> None:
     """成功收尾：入库 + 起 WS + 置成功态。"""
+    if session.get('cancelled'):
+        return
+    from common.services.account_credentials import validate_credentials
+    cookies_str = await validate_credentials(cookies_str, unb, session.get('proxy_config') or {'proxy_type':'none'})
+    if session.get('cancelled'):
+        return
     try:
         is_new, msg = await _save_and_start(
             account_id=account_id, account=account, password=password,
             show_browser=show_browser, owner_id=owner_id,
-            cookies_str=cookies_str, unb=unb,
+            cookies_str=cookies_str, unb=unb, job_id=session.get("job_id"),
         )
     except ValueError as ve:
         session["status"] = "failed"
@@ -340,3 +375,18 @@ async def _finish_success(
     session["account_id"] = account_id
     session["is_new_account"] = is_new
     session["message"] = msg
+
+
+async def end_pending_job(session, account_id, owner_id):
+    job_id = session.get('job_id')
+    if not job_id or session.get('status') == 'success':
+        return
+    try:
+        async with async_session_maker() as db:
+            svc = AccountService(db)
+            account = await svc.get_account_for_user(owner_id, account_id)
+            if account:
+                await svc.cancel_credential_job(account, job_id, owner_id)
+    finally:
+        session.pop('proxy_config', None)
+        session['face_qr_url'] = None

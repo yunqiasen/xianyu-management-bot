@@ -1,3 +1,4 @@
+import { ProductFeedbackPanel } from '@/pages/product-feedback/ProductFeedbackPanel'
 /**
  * 定时补评价执行记录页面
  *
@@ -37,7 +38,7 @@ const columns: BatchLogColumn<RateBatch>[] = [
 
 export function RateBatches() {
   return (
-    <BatchLogList
+    <><ProductFeedbackPanel kind="rate" /><BatchLogList
       title="定时补评价日志"
       description="查看定时任务执行记录"
       fetchBatches={getRateBatches}
@@ -46,6 +47,6 @@ export function RateBatches() {
       detailPath={(batchId) => `/admin/rate-batches/${batchId}`}
       clearConfirmMessage="此操作将清空10天前的补评价日志数据，最近10天的日志将被保留。确定要继续吗？"
       showPageSizeSelector={false}
-    />
+    /></>
   )
 }

@@ -218,7 +218,10 @@ class ConnectionManager:
         proxy_url = self.xianyu._get_proxy_url()
         proxy_sock = None
         
-        if proxy_url:
+        https_proxy = bool(proxy_url and self.xianyu.proxy_config.get('proxy_type') == 'https')
+        if https_proxy and 'proxy' not in inspect.signature(websockets.connect).parameters:
+            raise ValueError('https_proxy_requires_websockets_15')
+        if proxy_url and not https_proxy:
             proxy_type = self.xianyu.proxy_config.get('proxy_type', 'none')
             logger.info(f"【{self.cookie_id}】WebSocket将通过代理连接: {proxy_type}://{self.xianyu.proxy_config.get('proxy_host')}:{self.xianyu.proxy_config.get('proxy_port')}")
             
@@ -262,14 +265,13 @@ class ConnectionManager:
                     
                     logger.info(f"【{self.cookie_id}】代理连接建立成功")
                     
-            except ImportError:
-                logger.warning(f"【{self.cookie_id}】代理连接需要安装 python-socks: pip install python-socks[asyncio]")
-                logger.warning(f"【{self.cookie_id}】将尝试不使用代理进行WebSocket连接")
-                proxy_sock = None
-            except Exception as e:
-                logger.error(f"【{self.cookie_id}】通过代理建立连接失败: {str(e)}")
-                logger.warning(f"【{self.cookie_id}】将尝试不使用代理进行WebSocket连接")
-                proxy_sock = None
+            except Exception:
+                # 代理错误与缺依赖保持闭合，由账号恢复链记录原因。
+                if proxy_sock is not None:
+                    proxy_sock.close()
+                if getattr(self.xianyu, '_account_runtime', None):
+                    await self.xianyu._account_runtime.pause('proxy')
+                raise
 
         # 选择正确的请求头参数名（关键修复）
         # ──────────────────────────────────────────────────────────────
@@ -286,6 +288,8 @@ class ConnectionManager:
             header_kwarg: headers,
             **timeout_kwargs,
         }
+        if 'proxy' in inspect.signature(websockets.connect).parameters:
+            connect_kwargs['proxy'] = proxy_url if https_proxy else None  # 不继承环境代理
         if proxy_sock:
             connect_kwargs['sock'] = proxy_sock
 

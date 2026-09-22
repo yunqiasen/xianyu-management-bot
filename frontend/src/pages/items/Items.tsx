@@ -1,3 +1,6 @@
+import { ItemOperationHistory } from './ItemOperationHistory'
+import { ProductPageFailure, type ProductPageFailureData } from './ProductPageFailure'
+import { PolishWindow } from './PolishWindow'
 ﻿import { useEffect, useState, useRef } from 'react'
 import { CheckSquare, Download, Edit2, ExternalLink, Loader2, Package, PackageX, RefreshCw, Search, Square, Trash2, X, Settings, Plus, MessageSquare, Bot, ChevronLeft, ChevronRight, ImagePlus, Unlink, Tag } from 'lucide-react'
 import { batchDeleteItems, batchDeleteXianyuItems, batchOfflineItems, deleteItem, fetchAllItemsFromAccessibleAccounts, fetchAllItemsFromAccount, getItemsPaginated, updateItem, updateItemMultiQuantityDelivery, updateItemMultiSpec, updateItemPrice, getItemDefaultReply, saveItemDefaultReply, deleteItemDefaultReply, batchSaveItemDefaultReply, batchDeleteItemDefaultReply, getItemAiPrompt, saveItemAiPrompt, batchDeleteItemAiPrompt, batchSaveItemAiPrompt, uploadItemDefaultReplyImage, uploadBatchDefaultReplyImage, type ItemFilterParams } from '@/api/items'
@@ -27,6 +30,7 @@ const EMPTY_LOCATION_REPLY: LocationContactReplyValue = {
 
 
 export function Items() {
+  const [pageFailure, setPageFailure] = useState<ProductPageFailureData|null>(null)
   const { addToast } = useUIStore()
   const { isAuthenticated, token, _hasHydrated } = useAuthStore()
   const [loading, setLoading] = useState(true)
@@ -229,6 +233,7 @@ export function Items() {
     try {
       // 使用获取所有页的接口，后端会自动遍历所有页
       const result = await fetchAllItemsFromAccount(selectedAccount)
+      setPageFailure(result.success ? null : result)
 
       if (result.success) {
         const totalCount = (result as { total_count?: number }).total_count || 0
@@ -236,6 +241,7 @@ export function Items() {
         addToast({ type: 'success', message: `成功获取商品，共 ${totalCount} 件，保存 ${savedCount} 件` })
         await loadItems()
       } else {
+        if (result.saved_count) await loadItems()
         addToast({ type: 'error', message: result.message || '获取商品失败' })
       }
     } catch {
@@ -1283,6 +1289,9 @@ export function Items() {
 
   return (
     <div className="space-y-4">
+      <ProductPageFailure data={pageFailure} />
+      {selectedAccount && <ItemOperationHistory key={`history:${selectedAccount}`} accountId={selectedAccount} />}
+      {selectedAccount && <PolishWindow key={selectedAccount} accountId={selectedAccount} />}
       {/* Header */}
       <div className="page-header flex-between flex-wrap gap-4">
         <div>
@@ -2933,7 +2942,7 @@ export function Items() {
       <ConfirmModal
         isOpen={batchXianyuDeleteConfirm}
         title="删除闲鱼商品确认"
-        message={`确定要用账号「${selectedAccount}」删除选中的 ${selectedXianyuItems.length} 个闲鱼平台商品吗？平台删除后无法恢复，本地商品记录和配置会保留。`}
+        message={`确定要用账号「${selectedAccount}」删除选中的 ${selectedXianyuItems.length} 个闲鱼平台商品吗？平台删除后不可恢复；平台成功项会同步清理本地商品记录及关联，失败项保留。`}
         confirmText="删除闲鱼商品"
         cancelText="取消"
         type="danger"

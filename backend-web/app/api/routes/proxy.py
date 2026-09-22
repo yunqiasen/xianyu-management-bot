@@ -7,7 +7,7 @@ from __future__ import annotations
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, StrictInt
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from loguru import logger
@@ -15,6 +15,7 @@ from loguru import logger
 from app.api import deps
 from common.models.user import User
 from common.models.xy_account import XYAccount
+from common.services import account_policy as policy
 
 router = APIRouter(tags=["代理配置"])
 
@@ -25,9 +26,10 @@ class ProxyConfig(BaseModel):
     """代理配置"""
     proxy_type: str = "none"  # none, http, https, socks5
     proxy_host: Optional[str] = None
-    proxy_port: Optional[int] = None
+    proxy_port: Optional[StrictInt] = Field(None, ge=1, le=65535)
     proxy_user: Optional[str] = None
     proxy_pass: Optional[str] = None
+    clear_password: bool = False
 
 
 class ProxyConfigResponse(BaseModel):
@@ -52,7 +54,7 @@ async def get_proxy_config(
             XYAccount.owner_id == current_user.id,
             XYAccount.account_id == account_id,
         )
-        result = await session.execute(stmt)
+        result = await session.execute(stmt.with_for_update().execution_options(populate_existing=True))
         account = result.scalars().first()
         
         if not account:
@@ -67,7 +69,7 @@ async def get_proxy_config(
             proxy_host=account.proxy_host,
             proxy_port=account.proxy_port,
             proxy_user=account.proxy_user,
-            proxy_pass=account.proxy_pass,
+            proxy_pass="********" if account.proxy_pass else None,
         )
         
         return ProxyConfigResponse(
@@ -118,7 +120,7 @@ async def update_proxy_config(
             XYAccount.owner_id == current_user.id,
             XYAccount.account_id == account_id,
         )
-        result = await session.execute(stmt)
+        result = await session.execute(stmt.with_for_update().execution_options(populate_existing=True))
         account = result.scalars().first()
         
         if not account:
@@ -127,13 +129,19 @@ async def update_proxy_config(
                 message="账号不存在或无权限访问"
             )
         
+        merged = config.model_dump()
+        merged['proxy_pass'] = (None if config.clear_password else
+                                (policy._secret(config.proxy_pass) or account.proxy_pass))
+        policy.proxy_url(merged)
+        policy.browser_proxy(merged)
         # 更新代理配置
         account.proxy_type = config.proxy_type
         account.proxy_host = config.proxy_host if config.proxy_type != "none" else None
         account.proxy_port = config.proxy_port if config.proxy_type != "none" else None
         account.proxy_user = config.proxy_user if config.proxy_type != "none" else None
-        account.proxy_pass = config.proxy_pass if config.proxy_type != "none" else None
+        account.proxy_pass = merged["proxy_pass"]
         
+        policy.bump_config(account)
         session.add(account)
         await session.commit()
         
@@ -166,7 +174,7 @@ async def clear_proxy_config(
             XYAccount.owner_id == current_user.id,
             XYAccount.account_id == account_id,
         )
-        result = await session.execute(stmt)
+        result = await session.execute(stmt.with_for_update().execution_options(populate_existing=True))
         account = result.scalars().first()
         
         if not account:
@@ -182,6 +190,7 @@ async def clear_proxy_config(
         account.proxy_user = None
         account.proxy_pass = None
         
+        policy.bump_config(account)
         session.add(account)
         await session.commit()
         

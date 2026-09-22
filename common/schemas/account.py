@@ -8,7 +8,7 @@
 """
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_serializer
 
 
 class AccountDetail(BaseModel):
@@ -46,6 +46,11 @@ class AccountDetail(BaseModel):
     filter_count: int = 0  # 消息过滤规则数量
 
 
+    @field_serializer('value', 'login_password')
+    def redact_credentials(self, value):
+        return '********' if value else ''
+
+
 class AccountOption(BaseModel):
     """账号下拉选项"""
 
@@ -62,6 +67,7 @@ class AccountCreate(BaseModel):
 
 
 class AccountCookieUpdate(BaseModel):
+    expected_version: int | None = Field(None, ge=0)
     value: str = Field(..., description="Updated cookie text")
 
 
@@ -92,6 +98,7 @@ class AccountPauseDurationUpdate(BaseModel):
 
 class AccountLoginInfoUpdate(BaseModel):
     """账号登录信息更新"""
+    clear_fields: list[str] = Field(default_factory=list)
     username: str | None = Field(None, description="登录用户名")
     login_password: str | None = Field(None, description="登录密码")
     show_browser: bool | None = Field(None, description="是否显示浏览器")

@@ -34,7 +34,10 @@ async def create_notification_channel(
     current_user: User = Depends(deps.get_current_active_user),
     service: NotificationChannelService = Depends(deps.get_notification_channel_service),
 ) -> ApiResponse:
-    await service.create_channel(current_user.id, payload)
+    try:
+        await service.create_channel(current_user.id, payload)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
     return ApiResponse(success=True, message="通知渠道已创建")
 
 
@@ -45,7 +48,11 @@ async def update_notification_channel(
     current_user: User = Depends(deps.get_current_active_user),
     service: NotificationChannelService = Depends(deps.get_notification_channel_service),
 ) -> ApiResponse:
-    updated = await service.update_channel(current_user.id, channel_id, payload)
+    try:
+        updated = await service.update_channel(current_user.id, channel_id, payload)
+    except ValueError as exc:
+        await service.session.rollback()
+        raise HTTPException(422, str(exc))
     if not updated:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="通知渠道不存在")
     return ApiResponse(success=True, message="通知渠道已更新")
@@ -69,65 +76,23 @@ async def test_notification_channel(
     current_user: User = Depends(deps.get_current_active_user),
     service: NotificationChannelService = Depends(deps.get_notification_channel_service),
 ) -> ApiResponse:
-    """测试通知渠道"""
+    from common.services.notification_delivery_service import NotificationDeliveryService
+    from common.services.notification_template_service import NotificationTemplateService
+    from common.models.notification_delivery import NotificationEvent, NotificationDelivery
+    from uuid import uuid4
     import time
-    from loguru import logger
-    from common.utils.notification_utils import (
-        parse_notification_config,
-        send_dingtalk_notification,
-        send_feishu_notification,
-        send_bark_notification,
-        send_email_notification,
-        send_webhook_notification,
-        send_wechat_notification,
-        send_telegram_notification,
-        send_pushplus_notification
-    )
-    
-    # 获取渠道信息
     channel = await service.get_channel(current_user.id, channel_id)
     if not channel:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="通知渠道不存在")
-    
-    channel_type = channel.channel_type
-    channel_config = channel.config_payload
-    
-    # 构造测试消息
-    test_message = f"🔔 通知渠道测试\n\n" \
-                   f"渠道名称: {channel.name}\n" \
-                   f"渠道类型: {channel_type}\n" \
-                   f"测试时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n" \
-                   f"如果您收到此消息，说明通知渠道配置正确！"
-    
-    try:
-        config_data = parse_notification_config(channel_config)
-        logger.info(f"📱 测试通知渠道: {channel_type}, 配置: {config_data}")
-        
-        if channel_type in ('ding_talk', 'dingtalk'):
-            await send_dingtalk_notification(config_data, test_message)
-        elif channel_type in ('feishu', 'lark'):
-            await send_feishu_notification(config_data, test_message)
-        elif channel_type == 'bark':
-            await send_bark_notification(config_data, test_message)
-        elif channel_type == 'email':
-            await send_email_notification(config_data, test_message)
-        elif channel_type == 'webhook':
-            await send_webhook_notification(config_data, test_message)
-        elif channel_type == 'wechat':
-            await send_wechat_notification(config_data, test_message)
-        elif channel_type == 'telegram':
-            await send_telegram_notification(config_data, test_message)
-        elif channel_type == 'pushplus':
-            await send_pushplus_notification(config_data, test_message)
-        else:
-            return ApiResponse(success=False, message=f"不支持的通知渠道类型: {channel_type}")
-        
-        logger.info(f"📱 测试通知发送成功: {channel.name}")
-        return ApiResponse(success=True, message="测试消息发送成功")
-        
-    except Exception as e:
-        logger.error(f"📱 测试通知发送失败: {str(e)}")
-        return ApiResponse(success=False, message=f"发送失败: {str(e)}")
+        raise HTTPException(404, "通知渠道不存在")
+    event_id = str(uuid4())
+    payload = {'summary': '通知渠道测试', 'account_id': '-'}
+    rendered, failed = await NotificationTemplateService(service.session).render_event(current_user.id, 'test', payload)
+    event = NotificationEvent(id=event_id, owner_id=current_user.id, account_id='-', event_type='test', generation=event_id, payload=payload, first_seen=time.time(), last_seen=time.time())
+    delivery = NotificationDelivery(event_id=event_id, owner_id=current_user.id, channel_id=channel_id, rendered=rendered, template_failed=failed, due_at=time.time())
+    service.session.add_all([event, delivery]); await service.session.commit()
+    await NotificationDeliveryService(service.session).dispatch_due(current_user.id,event_id=event_id)
+    await service.session.refresh(delivery)
+    return ApiResponse(success=delivery.status == 'accepted', message={'accepted':'渠道已受理','not_accepted':'渠道明确未受理，将按计划重试','unknown':'受理结果待核实，不自动重发','cancelled':'渠道已停用'}.get(delivery.status,delivery.status), data={'status':delivery.status,'delivery_id':delivery.id})
 
 
 @messages_router.get("")
@@ -182,3 +147,44 @@ async def delete_account_notifications(
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="账号不存在或没有通知配置")
     return ApiResponse(success=True, message="账号通知配置已清理")
+
+
+from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
+
+class TemplatePayload(BaseModel):
+    body: str = Field(min_length=1,max_length=4000)
+    variables: dict = Field(default_factory=dict)
+
+@channels_router.get('/templates')
+async def list_templates(user: User = Depends(deps.get_current_active_user), session: AsyncSession = Depends(deps.get_db_session)):
+    from common.services.notification_template_service import NotificationTemplateService
+    return {'success':True,'data':await NotificationTemplateService(session).list(user.id)}
+
+@channels_router.put('/templates/{event_type}')
+async def save_template(event_type: str, payload: TemplatePayload, user: User = Depends(deps.get_current_active_user), session: AsyncSession = Depends(deps.get_db_session)):
+    from common.services.notification_template_service import NotificationTemplateService
+    try: await NotificationTemplateService(session).save(user.id,event_type,payload.body)
+    except ValueError as exc: raise HTTPException(422,str(exc))
+    return {'success':True}
+
+@channels_router.delete('/templates/{event_type}')
+async def reset_template(event_type: str, user: User = Depends(deps.get_current_active_user), session: AsyncSession = Depends(deps.get_db_session)):
+    from common.services.notification_template_service import NotificationTemplateService
+    try: await NotificationTemplateService(session).reset(user.id,event_type)
+    except ValueError as exc: raise HTTPException(422,str(exc))
+    return {'success':True}
+
+@channels_router.post('/templates/{event_type}/preview')
+async def preview_template(event_type: str, payload: TemplatePayload, user: User = Depends(deps.get_current_active_user), session: AsyncSession = Depends(deps.get_db_session)):
+    from common.services.notification_template_service import NotificationTemplateService
+    svc=NotificationTemplateService(session)
+    text,failed=svc.render(event_type,payload.body,payload.variables)
+    return {'success':not failed,'text':text,'template_failed':failed}
+
+@channels_router.get('/deliveries')
+async def list_deliveries(limit: int = 50, offset: int = 0, user: User = Depends(deps.get_current_active_user), session: AsyncSession = Depends(deps.get_db_session)):
+    from common.models.notification_delivery import NotificationDelivery, NotificationEvent
+    from sqlalchemy import select
+    rows=(await session.execute(select(NotificationDelivery,NotificationEvent).join(NotificationEvent,NotificationEvent.id==NotificationDelivery.event_id).where(NotificationDelivery.owner_id==user.id).order_by(NotificationDelivery.created_at.desc()).limit(max(1,min(limit,100))).offset(max(0,offset)))).all()
+    return {'success':True,'data':[{'id':d.id,'event_id':e.id,'account_id':e.account_id,'event_type':e.event_type,'merged_count':e.merged_count,'channel_id':d.channel_id,'status':d.status,'attempts':d.attempts,'due_at':d.due_at,'template_failed':d.template_failed} for d,e in rows]}

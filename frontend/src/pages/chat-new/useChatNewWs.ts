@@ -5,7 +5,7 @@
  * 每个已连接账号维护一条独立的 WebSocket，支持自动重连和心跳保活。
  */
 import { useEffect, useRef, useCallback } from 'react'
-import { createChatNewWebSocket, type WsPushMessage, type ChatMessage } from '@/api/chatNew'
+import { createChatNewWebSocket, getReplyEvents, type WsPushMessage, type ChatMessage } from '@/api/chatNew'
 
 /** 心跳间隔（毫秒） */
 const HEARTBEAT_INTERVAL = 20000
@@ -36,6 +36,8 @@ interface UseChatNewWsOptions {
  * 新增账号自动建连，移除的账号自动断开，已有账号保持不变。
  */
 export function useChatNewWs({ accountIds, onNewMessage, onDisconnect }: UseChatNewWsOptions) {
+  const cursorsRef = useRef<Map<string, number>>(new Map())
+  const versionsRef = useRef<Map<string, number>>(new Map())
   const connectionsRef = useRef<Map<string, WsConnection>>(new Map())
   const onNewMessageRef = useRef(onNewMessage)
   const onDisconnectRef = useRef(onDisconnect)
@@ -69,10 +71,34 @@ export function useChatNewWs({ accountIds, onNewMessage, onDisconnect }: UseChat
     const conn: WsConnection = { ws, heartbeat: null, reconnect: null, closed: false }
     connectionsRef.current.set(aid, conn)
 
+    let replaying = false
+    const catchUp = async () => {
+      if (replaying || conn.closed) return
+      replaying = true
+      try {
+        let more = true
+        while (more && !conn.closed) {
+          const page = await getReplyEvents(aid, cursorsRef.current.get(aid) || 0)
+          if (conn.closed) return
+          for (const event of page.events) {
+            const key = `${aid}:${event.cid}:${event.message?.messageId}`
+            const version = event.version || 1
+            if (event.cid && event.message && version > (versionsRef.current.get(key) || 0)) {
+              versionsRef.current.set(key, version)
+              onNewMessageRef.current(aid, event.cid, event.message)
+            }
+          }
+          cursorsRef.current.set(aid, page.nextCursor)
+          more = page.hasMore
+        }
+      } catch { /* 保留游标，下个心跳继续补拉 */ } finally { replaying = false }
+    }
     ws.onopen = () => {
+      void catchUp()
       conn.heartbeat = setInterval(() => {
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: 'ping' }))
+          void catchUp()
         }
       }, HEARTBEAT_INTERVAL)
     }
@@ -82,6 +108,7 @@ export function useChatNewWs({ accountIds, onNewMessage, onDisconnect }: UseChat
         const data: WsPushMessage = JSON.parse(event.data)
         if (data.event === 'new_message' && data.cid && data.message) {
           onNewMessageRef.current(aid, data.cid, data.message)
+          void catchUp()
         }
       } catch {
         // 解析失败，忽略

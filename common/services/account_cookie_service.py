@@ -25,6 +25,8 @@ async def merge_account_cookie_fields(
     account_id: str,
     cookie_updates: Mapping[str, object],
     *,
+    owner_id: int | None = None,
+    expected: tuple | None = None,
     max_attempts: int = 3,
     retry_delay_seconds: float = 0.5,
 ) -> str | None:
@@ -40,6 +42,15 @@ async def merge_account_cookie_fields(
     Returns:
         成功返回合并后的 Cookie 字符串；账号不存在或写入失败返回 ``None``。
     """
+    from common.services import account_policy as policy
+    if owner_id is None or expected is None:
+        # 旧业务调用只从当前派发上下文继承，不在响应到达后猜测当前版本。
+        from common.services.account_dispatch import CURRENT_OPERATION
+        context = CURRENT_OPERATION.get()
+        if context is None or context.request.account_id != account_id: return None
+        await context.check()
+        owner_id = context.request.owner_id
+        expected = tuple(getattr(context.request,k) for k in ('credential_version','config_version','generation'))
     updates = {
         str(name).strip(): "" if value is None else str(value)
         for name, value in (cookie_updates or {}).items()
@@ -58,6 +69,7 @@ async def merge_account_cookie_fields(
                     .where(
                         XYAccount.id == account_row_id,
                         XYAccount.account_id == account_id,
+                        XYAccount.owner_id == owner_id,
                     )
                     .with_for_update()
                 )
@@ -69,12 +81,14 @@ async def merge_account_cookie_fields(
                     )
                     return None
 
+                state=policy.snapshot(account)
+                if tuple(state[k] for k in ('credential_version','config_version','generation')) != tuple(expected): return None
                 merged_cookies = trans_cookies(account.cookie or "")
                 merged_cookies.update(updates)
                 merged_cookies_str = "; ".join(
                     f"{name}={value}" for name, value in merged_cookies.items()
                 )
-                account.cookie = merged_cookies_str
+                policy.replace_credentials(account,merged_cookies_str,expected_version=expected[0])
                 account.metadata_json = clear_cookie_refresh_snapshot(
                     account.metadata_json
                 )
@@ -90,3 +104,24 @@ async def merge_account_cookie_fields(
         f"【{account_id}】合并Cookie字段失败，已重试{attempts}次: {last_error}"
     )
     return None
+
+
+async def write_account_credentials(account_id, owner_id, cookie, *, expected, job_id=None):
+    """所有常规写回比较请求发出时版本；资料与停用保持不变。"""
+    from common.services import account_policy as policy
+    if expected is None or owner_id is None:
+        return False
+    async with async_session_maker() as db:
+        account = (await db.execute(select(XYAccount).where(
+            XYAccount.account_id == account_id, XYAccount.owner_id == owner_id
+        ).with_for_update())).scalar_one_or_none()
+        if not account: return False
+        state = policy.snapshot(account)
+        if tuple(state[k] for k in ('credential_version','config_version','generation')) != tuple(expected):
+            return False
+        if job_id:
+            accepted = policy.complete_job(account, job_id, cookie)
+        else:
+            policy.replace_credentials(account, cookie, expected_version=expected[0]); accepted=True
+        await db.commit()
+        return accepted

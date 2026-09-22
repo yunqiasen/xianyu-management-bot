@@ -72,6 +72,7 @@ export function ProductSpecificationsEditor({
     const nextRows: SkuRow[] = generatedRows.map(({ key, specs }) => ({
       key,
       specs,
+      source_id: previous.get(key)?.source_id,
       price: previous.get(key)?.price || '',
       stock: previous.get(key)?.stock ?? '',
     }))

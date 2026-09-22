@@ -102,16 +102,12 @@ class XianyuSearchClient:
         self.cookies_str = result.get("cookies_str", self.cookies_str)
 
         res_json = result.get("res")
-        if res_json is not None:
-            # 打印搜索接口完整返回结果（便于排查风控/验证等问题）
-            logger.info(
-                f"【{self.cookie_id}】搜索接口返回（关键字={keyword}，第{page_number}页）: "
-                f"{json.dumps(res_json, ensure_ascii=False)}"
-            )
-
         if result.get("success"):
             data_node = (res_json or {}).get("data", {}) or {}
-            result_list = data_node.get("resultList", []) or []
+            result_list = data_node.get("resultList")
+            if not isinstance(result_list, list):
+                return {'success':False, 'items':[], 'error':'search_schema_error',
+                        'has_next_page':False, 'account_invalid':False}
             result_info = data_node.get("resultInfo", {}) or {}
             has_next = bool(result_info.get("hasNextPage"))
             return {"success": True, "items": result_list, "has_next_page": has_next,

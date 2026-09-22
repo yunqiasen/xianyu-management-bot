@@ -46,8 +46,9 @@ SELLER_EXTRA_HEADERS = {
 # 因此回落个人版发布页得出的「普通卖家」结论不可信：
 # - FAIL_SYS_*：mtop 系统级失败（限流 FAIL_SYS_FLOW_LIMITED、服务不可用、非法访问、令牌问题等）
 # - VALIDATE_MARKERS：风控/验证/机器检测类标志，直接复用 mtop 的判定元组，避免两处维护漂移
-# 只有闲鱼以业务原因（非以下标志）拒绝访问卖家后台，才能证明该账号确实没有鱼小铺后台。
+# 未知业务错误同样没有账号类型结论；仅明确的无卖家工作台错误码支持个人版探测。
 _UNTRUSTED_FAILURE_MARKERS = ("FAIL_SYS_",) + VALIDATE_MARKERS
+_NO_SELLER_WORKSPACE_CODES = frozenset({"FAIL_BIZ_NO_SHOP"})
 
 
 def _fallback_trust(backend: dict[str, Any]) -> tuple[bool, str]:
@@ -79,6 +80,9 @@ def _fallback_trust(backend: dict[str, Any]) -> tuple[bool, str]:
         return False, "鱼小铺后台接口未返回错误码（响应中缺少 ret）"
     if any(marker in ret_msg for marker in _UNTRUSTED_FAILURE_MARKERS):
         return False, f"鱼小铺后台接口系统级失败（{ret_msg}）"
+    error_code = ret_msg.partition("::")[0].strip()
+    if error_code not in _NO_SELLER_WORKSPACE_CODES:
+        return False, "鱼小铺后台业务错误未确定账号类型"
     return True, ""
 
 
@@ -259,6 +263,7 @@ class PublishAccountCapabilityService:
                     "success": False,
                     "message": "账号发布能力检测失败：账号登录状态已失效，请重新登录",
                     "account_invalid": True,
+                    "error": "invalid_credentials",
                     "cookies_str": latest_cookie,
                 }
         # 普通卖家没有鱼小铺卖家后台，后台接口调不通属预期情况，回落个人版发布页判定。
@@ -267,6 +272,13 @@ class PublishAccountCapabilityService:
         # 从而被误判成普通卖家。这类情况标记为判定不可信，由发布链路拒绝发布；
         # 编辑与商品同步仍按回落结果处理（误判只会拒绝操作，不会把商品按个人版写到平台）。
         fallback_reliable, unreliable_reason = _fallback_trust(backend)
+        if not fallback_reliable:
+            return {'success':False, 'message':backend.get('error') or 'capability_schema_error',
+                    'error':backend.get('error') or 'capability_schema_error',
+                    'account_invalid':bool(backend.get('account_invalid')), 'cookies_str':latest_cookie,
+                    'detection_reliable':False, 'detection_unreliable_reason':unreliable_reason,
+                    'retry_after':backend.get('retry_after'),
+                    '_request_status_unknown':bool(backend.get('_request_status_unknown'))}
         logger.info(
             f"账号[{account_id}]鱼小铺后台发布配置不可用，回落个人版发布页判定账号类型"
             f"（判定可信={fallback_reliable}）: "
@@ -287,12 +299,16 @@ class PublishAccountCapabilityService:
                     "success": False,
                     "message": "账号发布能力检测失败：账号登录状态已失效，请重新登录",
                     "account_invalid": True,
+                    "error": "invalid_credentials",
                     "cookies_str": latest_cookie,
                 }
             return {
                 "success": False,
                 "message": f"账号发布能力检测失败：{response.get('error') or '闲鱼接口调用失败'}",
                 "account_invalid": bool(response.get("account_invalid")),
+                "error": response.get("error") or "capability_unverified",
+                "retry_after": response.get("retry_after"),
+                "_request_status_unknown": bool(response.get("_request_status_unknown")),
                 "cookies_str": latest_cookie,
             }
 

@@ -19,6 +19,16 @@ class AIReplySettings(BaseModel):
     ai_time_range_end: str = ""
     manual_reply_ai_pause_enabled: bool = False
     manual_reply_ai_pause_minutes: int = Field(default=10, ge=1, le=1440)
+    azure_deployment: str = ""
+    azure_api_version: str = ""
+    azure_auth_mode: str = "api_key"
+    app_id: str = ""
+    timeout_seconds: float = 60
+    max_tokens: int = 512
+    temperature: float = 0.7
+    max_context_chars: int = 24000
+    config_version: int = 0
+    api_key_configured: bool = False
 
 
 class AIReplySettingsUpdate(BaseModel):
@@ -40,9 +50,35 @@ class AIReplySettingsUpdate(BaseModel):
     # 不在更新入参上限制取值范围：前端清空输入会传 0，若在此用 ge/le 校验会触发
     # FastAPI 422（非统一 200 格式）。取值范围统一由 service 层 clamp 到 1-1440。
     manual_reply_ai_pause_minutes: int | None = None
+    azure_deployment: str | None = None
+    azure_api_version: str | None = None
+    azure_auth_mode: str | None = None
+    app_id: str | None = None
+    timeout_seconds: float | None = None
+    max_tokens: int | None = None
+    temperature: float | None = None
+    max_context_chars: int | None = None
+    config_version: int | None = None
+    clear_api_key: bool = False
 
 
 class AIModelListRequest(BaseModel):
+    account_id: str | None = None
     provider_type: str = "openai_compatible"
     base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     api_key: str = ""
+
+
+class AIPresetCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    settings: AIReplySettingsUpdate
+    source_account_id: str | None = None
+
+
+class AIPresetUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    settings: AIReplySettingsUpdate | None = None
+
+
+class AIPresetApply(BaseModel):
+    account_ids: list[str] = Field(min_length=1, max_length=100)

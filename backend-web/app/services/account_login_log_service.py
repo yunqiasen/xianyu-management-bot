@@ -116,24 +116,34 @@ class AccountLoginLogService:
             }
             for log in logs
         ]
-        return items, total
+        from common.utils.logging_utils import redact_secrets
+        return redact_secrets(items), total
 
-    async def cleanup_logs_older_than_days(self, days: int = 10) -> int:
+    async def cleanup_logs_older_than_days(self, days: int = 30) -> int:
         """删除 N 天前的历史登录日志，返回受影响行数。
 
         默认保留最近 10 天，便于「日志管理」界面一键清理过期数据。
         """
-        if days < 1:
-            days = 1
+        days = max(days, 30)
         cutoff = get_beijing_now_naive() - timedelta(days=days)
         stmt = delete(XYAccountLoginLog).where(XYAccountLoginLog.created_at < cutoff)
-        result = await self.session.execute(stmt)
+        from app.services.admin_log_archive_service import archive_log_delete
+        result = await archive_log_delete(self.session, stmt)
         await self.session.commit()
         return int(result.rowcount or 0)
 
     async def cleanup_all_logs(self) -> int:
         """清空全部登录日志（管理员手动触发），返回受影响行数。"""
         stmt = delete(XYAccountLoginLog)
-        result = await self.session.execute(stmt)
+        from app.services.admin_log_archive_service import archive_log_delete
+        result = await archive_log_delete(self.session, stmt)
         await self.session.commit()
         return int(result.rowcount or 0)
+
+    async def event_summary(self, owner_id, start, end):
+        from sqlalchemy import select, func
+        stmt=select(XYAccountLoginLog.failure_reason,XYAccountLoginLog.login_status,func.count().label('count')).where(XYAccountLoginLog.created_at>=start,XYAccountLoginLog.created_at<end).group_by(XYAccountLoginLog.failure_reason,XYAccountLoginLog.login_status)
+        if owner_id is not None:stmt=stmt.where(XYAccountLoginLog.owner_id==owner_id)
+        rows=(await self.session.execute(stmt)).all()
+        categories={'rate_limited':'rate_limit','rate_limit':'rate_limit','throttled':'rate_limit','bad_credentials':'credentials','no_credentials':'credentials','session_expired':'credentials','token_expired':'credentials','baxia_punish_captcha':'manual_verification','human_verification':'manual_verification','captcha_timeout':'manual_verification'}
+        return [{'category':categories.get(r.failure_reason,'other'),'reason':r.failure_reason or 'unspecified','status':r.login_status,'count':r.count} for r in rows]

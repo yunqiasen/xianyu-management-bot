@@ -139,10 +139,10 @@ async def export_keywords(
     workbook = Workbook()
     worksheet = workbook.active
     worksheet.title = "关键词数据"
-    worksheet.append(["关键词", "商品ID", "关键词内容", "回复类型", "定位名称", "经度", "纬度", "位置标题", "位置副标题"])
+    worksheet.append(["关键词", "商品ID", "关键词内容", "回复类型", "定位名称", "经度", "纬度", "位置标题", "位置副标题", "图片地址"])
 
     for kw in keywords:
-        if kw.get("type", "text") in {"text", "external_contact"}:
+        if kw.get("type", "text") in {"text", "image", "external_contact"}:
             worksheet.append([
                 kw["keyword"],
                 kw.get("item_id") or "",
@@ -153,6 +153,7 @@ async def export_keywords(
                 kw.get("location_latitude") or "",
                 kw.get("location_title") or "",
                 kw.get("location_subtitle") or "",
+                kw.get("image_url") or "",
             ])
 
     output = io.BytesIO()
@@ -210,13 +211,13 @@ async def import_keywords(
     column_index = {name: header.index(name) for name in required_columns}
     optional_columns = {
         name: header.index(name) for name in (
-            "回复类型", "定位名称", "经度", "纬度", "位置标题", "位置副标题"
+            "回复类型", "定位名称", "经度", "纬度", "位置标题", "位置副标题", "图片地址"
         ) if name in header
     }
 
     # 处理导入数据
     import_data = []
-    for row in rows[1:]:
+    for row_number, row in enumerate(rows[1:], 2):
         keyword_cell = row[column_index["关键词"]] if len(row) > column_index["关键词"] else None
         item_id_cell = row[column_index["商品ID"]] if len(row) > column_index["商品ID"] else None
         reply_cell = row[column_index["关键词内容"]] if len(row) > column_index["关键词内容"] else None
@@ -234,10 +235,10 @@ async def import_keywords(
         if item_id.endswith(".0"):
             item_id = item_id[:-2]
 
-        if not keyword:
+        if not any(cell is not None for cell in row):
             continue
 
-        import_data.append({
+        import_data.append((row_number, {
             "keyword": keyword,
             "reply": reply,
             "item_id": item_id,
@@ -247,22 +248,14 @@ async def import_keywords(
             "location_latitude": optional_value("纬度"),
             "location_title": optional_value("位置标题"),
             "location_subtitle": optional_value("位置副标题"),
-        })
+            "image_url": optional_value("图片地址"),
+        }))
     
     if not import_data:
         raise HTTPException(status_code=400, detail="Excel文件中没有有效的关键词数据")
     
-    # 保存到数据库
-    await keyword_service.replace_text_keywords(account, import_data)
-    
-    return ApiResponse(
-        success=True,
-        message="导入成功",
-        data={
-            "added": len(import_data),
-            "updated": 0
-        }
-    )
+    result = await keyword_service.import_rows(account, import_data)
+    return ApiResponse(success=not result['errors'], message='导入结束' if not result['errors'] else '部分行未导入', data=result)
 
 
 @router.post("/{account_id}/image")
@@ -290,19 +283,19 @@ async def add_image_keyword(
 
     # 使用统一的上传目录
     from app.core.paths import get_upload_path
-    upload_dir = get_upload_path("keywords")
+    upload_dir = get_upload_path("keywords") / str(account.owner_id)
 
     try:
-        # 保留原行为：只校验类型，不限制文件大小
+        # 统一图片类型、大小与资源归属限制
         filepath, filename, _ = await save_uploaded_image(
             image,
             upload_dir,
-            validate_size=False,
+            validate_size=True,
         )
     except ImageUploadError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.message)
 
-    image_url = f"/static/uploads/keywords/{filename}"
+    image_url = f"/static/uploads/keywords/{account.owner_id}/{filename}"
 
     # 保存图片关键词到数据库
     # 空字符串统一转为 None，与 service 层保持一致

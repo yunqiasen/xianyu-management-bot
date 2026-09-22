@@ -18,7 +18,8 @@ import threading
 import time
 from typing import Any, Callable, Dict, Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
+from app.api.deps import require_internal_auth
 from loguru import logger
 from pydantic import BaseModel
 from sqlalchemy import update
@@ -26,7 +27,8 @@ from sqlalchemy import update
 from common.models.token_cache import TokenCache
 from common.utils.time_utils import get_beijing_now_naive
 
-router = APIRouter(prefix="/password-login", tags=["密码登录"])
+router = APIRouter(prefix="/password-login", tags=["密码登录"],
+                   dependencies=[Depends(require_internal_auth)])
 
 
 # ==================== 请求/响应模型 ====================

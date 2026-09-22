@@ -24,6 +24,8 @@ from sqlalchemy import select, text, exists
 from sqlalchemy.ext.asyncio import AsyncSession
 from loguru import logger
 
+from common.services.reply_state import ReplyState, identity
+from common.services.reply_policy import ReplyDecision, select_reply, evaluate_filters
 from common.models.xy_account import XYAccount
 from common.models.xy_keyword_rule import XYKeywordRule
 from common.models.xy_catalog_item import XYCatalogItem
@@ -121,6 +123,7 @@ class AutoReplyService:
             xianyu_instance: XianyuAsync实例(用于发送消息)
         """
         self.cookie_id = cookie_id
+        self.reply_state = ReplyState()
         self.xianyu_instance = xianyu_instance
         self.auto_reply_log_service = AutoReplyLogService(cookie_id)
         self._account: Optional[XYAccount] = None
@@ -628,6 +631,20 @@ class AutoReplyService:
             item_id = parsed_message.get("item_id", "")
             msg_time = parsed_message.get("msg_time", "")
             
+            event_id = parsed_message.get('event_id') or self._extract_source_message_id(parsed_message.get('raw_message'))
+            if not event_id:
+                event_id = identity(chat_id, send_user_id, msg_time, send_message, parsed_message.get('raw_message'))
+            log_payload['source_message_id'] = event_id
+            if not parsed_message.get('_history_recorded'):
+                _, fresh = await self.reply_state.record_message(
+                    self.cookie_id, chat_id, event_id,
+                    'assistant' if send_user_id == getattr(self.xianyu_instance, 'myid', self.cookie_id) else 'user',
+                    send_message, send_user_id, sender_name=send_user_name, item_id=item_id,
+                    origin='manual' if send_user_id == getattr(self.xianyu_instance, 'myid', self.cookie_id) else 'platform')
+                if not fresh:
+                    log_payload.update(process_status='skipped', decision_reason='duplicate_event')
+                    return
+
             # 1. 检查是否是自己发出的消息（手动发出）
             # 使用myid判断（参照旧框架）
             myid = getattr(self.xianyu_instance, 'myid', self.cookie_id)
@@ -641,9 +658,27 @@ class AutoReplyService:
                     chat_id, item_id, log_payload
                 )
                 if not ai_pause_enabled:
-                    pause_manager.pause_chat(chat_id, self.cookie_id)
+                    async with async_session_maker() as pause_session:
+                        account = await self._get_account(pause_session)
+                        duration = getattr(account, 'pause_duration', 10)
+                    await self.reply_state.pause(self.cookie_id, chat_id, duration)
                 return
             
+            message_source = 'system' if self.is_system_message_to_skip(send_message) else 'user'
+            advanced = await self.reply_state.filter_decision(self.cookie_id, chat_id, send_message, message_source, item_id or '')
+            log_payload.setdefault('context_snapshot', {})['filter_rule_ids'] = list(advanced.rule_ids)
+            log_payload['_suppress_notification'] = 'skip_notify' in advanced.actions
+            async with async_session_maker() as blacklist_session:
+                account = await self._get_account(blacklist_session)
+            if account and await self.reply_state.reply_blocked(account.owner_id, self.cookie_id, send_user_id, item_id):
+                log_payload.update(process_status='skipped', decision_reason='blacklist')
+                return
+            if advanced.blocks_reply:
+                log_payload.update(process_status='skipped', decision_reason='advanced_filter')
+                if 'notify' in advanced.actions and 'skip_notify' not in advanced.actions:
+                    await self._send_notification(send_user_name, send_user_id, send_message, chat_id, item_id, msg_time)
+                return
+
             # 2. 检查是否是系统消息（参照旧框架message_handler_core.py）
             # 这些系统消息不需要自动回复
             if self.is_system_message_to_skip(send_message):
@@ -761,7 +796,8 @@ class AutoReplyService:
                         await asyncio.sleep(reply_delay)
                     
                     # 延迟结束后再次检测是否被人工介入暂停
-                    if pause_manager.is_chat_paused(chat_id, self.cookie_id):
+                    if (pause_manager.is_chat_paused(chat_id, self.cookie_id)
+                            or await self.reply_state.pause_remaining(self.cookie_id, chat_id)):
                         logger.info(f"【{self.cookie_id}】自动回复延迟结束，但检测到会话 {chat_id} 已被人工介入暂停，放弃发送回复")
                         log_payload["process_status"] = "skipped"
                         if isinstance(reply, dict) and reply.get("_reply_mode") == "external_contact":
@@ -769,15 +805,31 @@ class AutoReplyService:
                         log_payload["decision_reason"] = "chat_paused_after_delay"
                         return
                     
+                    inbound_now = await self.reply_state.filter_decision(self.cookie_id, chat_id, send_message, 'user', item_id or '')
+                    if inbound_now.blocks_reply or (account and await self.reply_state.reply_blocked(account.owner_id, self.cookie_id, send_user_id, item_id)):
+                        log_payload.update(process_status='skipped', decision_reason='rules_changed_before_send')
+                        return
+                    outbound_source = 'ai' if log_payload.get('reply_strategy') == 'ai' else 'assistant'
+                    outbound_filter = await self.reply_state.filter_decision(self.cookie_id, chat_id,
+                        reply if isinstance(reply, str) else '', outbound_source, item_id or '')
+                    if (outbound_filter.blocks_reply or (outbound_source == 'ai' and ('skip_ai' in outbound_filter.actions or 'skip_ai' in inbound_now.actions or pause_manager.is_ai_reply_paused(self.cookie_id, send_user_id, item_id or '')))):
+                        await self._unmark_chat_processed(chat_id, send_message)
+                        log_payload.update(process_status='skipped', decision_reason='outbound_filter')
+                        return
+                    if log_payload.get('default_reply_once') and log_payload.get('reply_strategy') == 'default':
+                        scope = log_payload.get('context_snapshot', {}).get('default_reply_setting_item_id') or ''
+                        if not await self.reply_state.reserve_once(self.cookie_id, chat_id, scope, event_id):
+                            log_payload.update(process_status='skipped', decision_reason='default_reply_once')
+                            return
+                        log_payload['_once_reservation'] = (chat_id, scope, event_id)
+
                     # 检查是否是图片发送指令
                     # 格式：__IMAGE_SEND__|类型标识|image_url
                     # 类型标识：KW:keyword（关键词）、DR:item_id（默认回复）、空（不需要更新）
                     if isinstance(reply, dict) and reply.get("_reply_mode") == "external_contact":
                         try:
-                            external_result = await self.xianyu_instance.send_raw_message(
-                                websocket=websocket,
-                                message=reply.get("message"),
-                            )
+                            external_result = await self._send_tracked_part(chat_id, send_user_id, "[位置卡片]", "card",
+                                lambda: self.xianyu_instance.send_raw_message(websocket=websocket, message=reply.get("message")))
                         except Exception as send_exc:  # noqa: BLE001
                             external_result = {
                                 "success": False,
@@ -790,28 +842,6 @@ class AutoReplyService:
                         )
                         if not external_result or not external_result.get("success"):
                             await self._unmark_chat_processed(chat_id, send_message)
-                        if (
-                            external_result
-                            and external_result.get("success")
-                            and reply.get("reply_once")
-                            and chat_id
-                        ):
-                            try:
-                                async with async_session_maker() as record_session:
-                                    await self._record_user_replied(
-                                        record_session,
-                                        self.cookie_id,
-                                        chat_id,
-                                        reply.get("settings_item_id"),
-                                    )
-                                logger.info(
-                                    f"【{self.cookie_id}】记录站外联系方式默认回复: "
-                                    f"chat_id={chat_id}, item_id={reply.get('settings_item_id')}"
-                                )
-                            except Exception as record_exc:  # noqa: BLE001
-                                logger.warning(
-                                    f"【{self.cookie_id}】记录站外联系方式 reply_once 失败: {record_exc}"
-                                )
                     elif reply.startswith("__IMAGE_SEND__"):
                         # 解析图片发送指令：去掉前缀后格式为 |类型标识|image_url
                         content = reply.replace("__IMAGE_SEND__", "")
@@ -843,32 +873,16 @@ class AutoReplyService:
                             # 兼容旧格式（只有image_url）
                             image_url = parts[0] if parts else content
                         
-                        # 根据类型传递不同参数
-                        if update_type == "KW":
-                            image_result = await self.xianyu_instance.send_image_msg(
-                                websocket=websocket,
-                                chat_id=chat_id,
-                                send_user_id=send_user_id,
-                                image_url=image_url,
-                                keyword=update_key,  # 传递关键词用于更新
-                            )
-                        elif update_type == "DR":
-                            image_result = await self.xianyu_instance.send_image_msg(
-                                websocket=websocket,
-                                chat_id=chat_id,
-                                send_user_id=send_user_id,
-                                image_url=image_url,
-                                default_reply_item_id=update_key,  # 传递默认回复item_id用于更新
-                            )
-                        else:
-                            image_result = await self.xianyu_instance.send_image_msg(
-                                websocket=websocket,
-                                chat_id=chat_id,
-                                send_user_id=send_user_id,
-                                image_url=image_url,
-                            )
+                        kwargs = dict(websocket=websocket, chat_id=chat_id,
+                            send_user_id=send_user_id, image_url=image_url)
+                        if update_type == 'KW':
+                            kwargs['keyword'] = update_key
+                        elif update_type == 'DR':
+                            kwargs['default_reply_item_id'] = update_key
+                        image_result = await self._send_tracked_part(chat_id, send_user_id, image_url, 'image',
+                            lambda: self.xianyu_instance.send_image_msg(**kwargs))
                         send_results.append(image_result or self._build_empty_send_result("image", image_url))
-                        logger.info(f"【{self.cookie_id}】发送图片回复: {image_url}")
+                        logger.info(f"【{self.cookie_id}】图片回复已提交")
                         
                         # 如果有待发送的文本，继续发送（支持分隔符拆分）
                         pending_text_reply = log_payload.pop("pending_text_reply", None)
@@ -898,22 +912,25 @@ class AutoReplyService:
                 log_payload["send_result_json"] = send_results
                 failed_results = [result for result in send_results if not result.get("success", False)]
                 if not failed_results:
-                    log_payload["process_status"] = "success"
-                    log_payload["decision_reason"] = "reply_sent"
+                    log_payload["process_status"] = "processing"
+                    log_payload["decision_reason"] = "reply_submitted"
                     # 消息已发出 WebSocket，但是否被服务端接收需异步等待响应确认，
                     # 先置为 unknown，由后台任务在拿到响应后回写 success/failed
                     log_payload["send_status"] = "unknown"
                     # 收集本次发出消息的 (future, mid)，供异步检测发送结果
                     log_payload["_pending_send_waiters"] = [
-                        (result.get("send_future"), result.get("mid"))
+                        (result.get("send_future"), result.get("mid"), result.get("outbox_request_id"), chat_id)
                         for result in send_results
-                        if result.get("send_future") is not None
                     ]
                 else:
                     log_payload["process_status"] = "failed"
                     log_payload["decision_reason"] = "send_failed"
                     # 发送层（WebSocket 发送）就失败，直接判定发送失败
-                    log_payload["send_status"] = "failed"
+                    definite_failure = all(r.get("definitely_not_sent") is True for r in send_results)
+                    log_payload["send_status"] = "failed" if definite_failure else "unknown"
+                    if not definite_failure:
+                        log_payload["process_status"] = "processing"
+                        log_payload["decision_reason"] = "send_unknown"
                     error_messages = [
                         str(result.get("error_message") or "").strip()
                         for result in failed_results
@@ -954,6 +971,17 @@ class AutoReplyService:
             try:
                 # 取出待检测的发送 (future, mid)（临时键，不写入数据库）
                 pending_send_waiters = log_payload.pop("_pending_send_waiters", None)
+                reservation = log_payload.pop('_once_reservation', None)
+                outbound_history = log_payload.pop('_outbound_history', None)
+                if outbound_history:
+                    await self.reply_state.update_message_status(self.cookie_id, *outbound_history, 'unknown')
+                if reservation:
+                    results = log_payload.get('send_result_json') or []
+                    # 分段中任何一段可能已送出都保留名额；只在全部明确未送出时释放。
+                    definitely_failed = bool(results) and all(r.get('success') is False and r.get('definitely_not_sent') is True for r in results)
+                    await self.reply_state.settle_once(self.cookie_id, *reservation, 'failed' if definitely_failed else 'unknown')
+                log_payload.pop('_suppress_notification', None)
+                log_payload.pop('_part_index', None)
                 ai_pause_log_recorded = log_payload.pop("_manual_reply_ai_pause_log_recorded", False)
                 # AI 暂停后没有其他规则实际回复时，AI 暂停日志已单独写入，无需重复记录“未匹配规则”。
                 should_skip_final_log = (
@@ -963,12 +991,12 @@ class AutoReplyService:
                 )
                 log_id = None if should_skip_final_log else await self._record_auto_reply_log(log_payload)
                 # 若消息已发出且日志写入成功，起后台任务异步等待发送结果并回写状态
-                if log_id and pending_send_waiters:
-                    self._spawn_send_status_writeback(log_id, pending_send_waiters)
+                if pending_send_waiters:
+                    self._spawn_send_status_writeback(log_id, pending_send_waiters, reservation, outbound_history)
             finally:
                 self._reply_trace_var.reset(reply_trace_token)
 
-    def _spawn_send_status_writeback(self, log_id: int, waiters: list) -> None:
+    def _spawn_send_status_writeback(self, log_id: int, waiters: list, reservation=None, outbound_history=None) -> None:
         """起后台任务：异步等待发送结果并回写日志的发送状态
 
         不阻塞自动回复主流程。优先用实例的任务追踪器创建任务，
@@ -979,7 +1007,7 @@ class AutoReplyService:
             waiters: 本次发出消息的 (send_future, mid) 列表
         """
         try:
-            coro = self._writeback_send_status(log_id, waiters)
+            coro = self._writeback_send_status(log_id, waiters, reservation, outbound_history)
             tracker = getattr(self.xianyu_instance, "_create_tracked_task", None)
             if callable(tracker):
                 tracker(coro)
@@ -989,11 +1017,11 @@ class AutoReplyService:
         except Exception as e:
             logger.warning(f"【{self.cookie_id}】启动发送状态回写任务失败 log_id={log_id}: {e}")
 
-    async def _writeback_send_status(self, log_id: int, waiters: list) -> None:
+    async def _writeback_send_status(self, log_id: int, waiters: list, reservation=None, outbound_history=None) -> None:
         """等待各发送响应，按结果回写日志发送状态
 
         - 任一消息被服务端拦截（返回 reason）→ send_status=failed，记录失败原因
-        - 全部无拦截响应（含正常发送、超时）→ send_status=success
+        - 全部收到确认才成功；超时和空响应保持 unknown
 
         Args:
             log_id: 日志主键ID
@@ -1004,10 +1032,38 @@ class AutoReplyService:
             if not callable(wait_fn):
                 return
             reasons: List[str] = []
-            for send_future, mid in waiters:
+            confirmed = 0
+            for waiter in waiters:
+                send_future, mid = waiter[:2]
+                request_id, chat_id = waiter[2:] if len(waiter) == 4 else (None, None)
+                if send_future is None:
+                    continue
                 reason = await wait_fn(send_future, mid)
+                part_status = 'unknown'
+                if reason:
+                    part_status = 'failed'
+                elif send_future.done() and not send_future.cancelled() and send_future.exception() is None:
+                    response = send_future.result()
+                    if isinstance(response, dict) and response.get('code') == 200:
+                        part_status = 'confirmed'
+                if request_id:
+                    await self.reply_state.settle_outbound(self.cookie_id, chat_id, request_id, part_status,
+                        {'messageId': str((send_future.result().get('body') or {}).get('messageId') or '')}
+                        if part_status == 'confirmed' else None)
                 if reason:
                     reasons.append(reason)
+                elif send_future.done() and not send_future.cancelled() and send_future.exception() is None:
+                    response = send_future.result()
+                    if isinstance(response, dict) and response.get('code') == 200:
+                        confirmed += 1
+            status = 'confirmed' if confirmed == len(waiters) else 'failed' if len(reasons) == len(waiters) else 'unknown'
+            if outbound_history:
+                await self.reply_state.update_message_status(self.cookie_id, *outbound_history, status)
+            if reservation:
+                status = 'confirmed' if confirmed == len(waiters) else 'failed' if len(reasons) == len(waiters) else 'unknown'
+                await self.reply_state.settle_once(self.cookie_id, *reservation, status)
+            if not log_id:
+                return
             if reasons:
                 await self.auto_reply_log_service.safe_update_send_status(
                     log_id, "failed", "；".join(reasons)
@@ -1016,58 +1072,84 @@ class AutoReplyService:
                     f"【{self.cookie_id}】自动回复发送被拦截 log_id={log_id}: {'；'.join(reasons)}"
                 )
             else:
-                await self.auto_reply_log_service.safe_update_send_status(log_id, "success", None)
+                await self.auto_reply_log_service.safe_update_send_status(log_id, "success" if confirmed == len(waiters) else "unknown", None)
         except Exception as e:
             logger.warning(f"【{self.cookie_id}】回写发送状态异常 log_id={log_id}: {e}")
 
-    async def _send_text_with_separator(
-        self,
-        websocket,
-        chat_id: str,
-        send_user_id: str,
-        text: str,
-    ) -> List[Dict[str, Any]]:
-        """发送文本消息，支持 ###### 分隔符拆分为多条消息（参照旧框架）
-        
-        Args:
-            websocket: WebSocket连接
-            chat_id: 会话ID
-            send_user_id: 接收者用户ID
-            text: 消息内容
-        """
-        import asyncio
-        send_results: List[Dict[str, Any]] = []
-         
-        # 检查是否包含分隔符
-        if '######' in text:
-            messages = [msg.strip() for msg in text.split('######') if msg.strip()]
-            logger.info(f"【{self.cookie_id}】检测到分隔符，拆分为 {len(messages)} 条消息")
-             
-            for i, msg in enumerate(messages):
-                result = await self.xianyu_instance.send_msg(
-                    websocket=websocket,
-                    chat_id=chat_id,
-                    send_user_id=send_user_id,
-                    content=msg,
-                )
-                send_results.append(result or self._build_empty_send_result("text", msg))
-                logger.info(f"【{self.cookie_id}】发送文本回复 {i+1}/{len(messages)}: {msg[:50]}...")
-                 
-                # 多条消息之间添加短暂延迟
-                if i < len(messages) - 1:
-                    await asyncio.sleep(0.5)
-        else:
-            # 单条消息直接发送
-            result = await self.xianyu_instance.send_msg(
-                websocket=websocket,
-                chat_id=chat_id,
-                send_user_id=send_user_id,
-                content=text,
-            )
-            send_results.append(result or self._build_empty_send_result("text", text))
-            logger.info(f"【{self.cookie_id}】发送文本回复: {text[:50]}...")
+    async def _part_allowed(self, chat_id, buyer_id, content):
+        """每段发送前重读暂停/过滤/名单，前一段发出不授权后续段。"""
+        from app.services.xianyu.resource_manager import pause_manager
+        if (pause_manager.is_chat_paused(chat_id, self.cookie_id)
+                or await self.reply_state.pause_remaining(self.cookie_id, chat_id)):
+            return False
+        trace = self._reply_trace_var.get() or {}
+        item_id = trace.get('item_id') or ''
+        inbound = await self.reply_state.filter_decision(self.cookie_id, chat_id, trace.get('source_message', ''), 'user', item_id)
+        source = 'ai' if trace.get('reply_strategy') == 'ai' else 'assistant'
+        outbound = await self.reply_state.filter_decision(self.cookie_id, chat_id, content, source, item_id)
+        if inbound.blocks_reply or outbound.blocks_reply:
+            return False
+        if source == 'ai' and ('skip_ai' in inbound.actions | outbound.actions
+                or pause_manager.is_ai_reply_paused(self.cookie_id, buyer_id, item_id)):
+            return False
+        account = getattr(self, '_account', None)
+        if account and await self.reply_state.reply_blocked(account.owner_id, self.cookie_id, buyer_id, item_id):
+            return False
+        return True
 
-        return send_results
+    async def _send_tracked_part(self, chat_id, buyer_id, content, content_type, transport):
+        trace = self._reply_trace_var.get()
+        if not await self._part_allowed(chat_id, buyer_id, content):
+            return {'success': False, 'definitely_not_sent': True, 'error_message': '会话接管或规则已变化'}
+        trace = trace if trace is not None else {}
+        index = trace.get('_part_index', 0)
+        trace['_part_index'] = index + 1
+        request_id = 'auto:' + identity(trace.get('source_message_id'), chat_id, index, content_type)
+        raw = {}
+        async def submit():
+            nonlocal raw
+            from common.services.account_execution import OUTBOUND_GUARD
+            from common.services.account_dispatch import DispatchError
+            async def recheck():
+                if not await self._part_allowed(chat_id, buyer_id, content):
+                    raise DispatchError('reply_policy_changed')
+            guard_token = OUTBOUND_GUARD.set(recheck)
+            try:
+                raw = await transport() or {}
+            finally:
+                OUTBOUND_GUARD.reset(guard_token)
+            # 帧写出仅算提交，回执由既有后台任务核实。
+            return {'status': 'failed' if raw.get('definitely_not_sent') else 'unknown',
+                'messageId': raw.get('messageId') or '', 'protocol_mid': raw.get('mid') or ''}
+        result = await self.reply_state.send(self.cookie_id, chat_id, request_id, content, submit,
+            origin='auto', content_type=content_type, sender_id=getattr(self.xianyu_instance, 'myid', ''),
+            item_id=trace.get('item_id') or '',
+            correlation={'source_event_id': trace.get('source_message_id'), 'part': index,
+                'once': list(trace.get('_once_reservation') or [])})
+        if not raw:
+            raw = {'success': result['status'] != 'failed', 'mid': result.get('messageId')}
+            if result['status'] in {'confirmed', 'failed'}:
+                future = asyncio.get_running_loop().create_future()
+                future.set_result({'code': 200 if result['status'] == 'confirmed' else 400,
+                    'body': {} if result['status'] == 'confirmed' else {'reason': '明确未发送'}})
+                raw['send_future'] = future
+        return {**raw, 'outbox_request_id': request_id}
+
+    async def _send_text_with_separator(self, websocket, chat_id: str, send_user_id: str, text: str) -> List[Dict[str, Any]]:
+        messages = [msg.strip() for msg in text.split('######') if msg.strip()]
+        results = []
+        for index, msg in enumerate(messages):
+            if not await self._part_allowed(chat_id, send_user_id, msg):
+                break
+            result = await self._send_tracked_part(chat_id, send_user_id, msg, 'text',
+                lambda: self.xianyu_instance.send_msg(websocket=websocket, chat_id=chat_id,
+                    send_user_id=send_user_id, content=msg))
+            results.append(result)
+            if not result.get('success'):
+                break
+            if index < len(messages) - 1:
+                await asyncio.sleep(0.5)
+        return results
 
     async def _send_notification(
         self,
@@ -1088,6 +1170,9 @@ class AutoReplyService:
             item_id: 商品ID
             msg_time: 消息时间
         """
+        trace = self._reply_trace_var.get()
+        if trace and trace.get('_suppress_notification'):
+            return
         try:
             from common.db.compat import db_manager
             
@@ -1204,35 +1289,58 @@ class AutoReplyService:
                     reply_trace.setdefault("context_snapshot", {})["pause_remaining_seconds"] = remaining
                 return None
             
+            if await self.reply_state.pause_remaining(self.cookie_id, chat_id):
+                if reply_trace is not None:
+                    reply_trace.update(process_status="skipped", decision_reason="chat_paused")
+                return None
+            policy = await self.reply_state.policy(self.cookie_id)
+            filters = await self.reply_state.filter_decision(self.cookie_id, chat_id, send_message, 'user', item_id or '')
+            if filters.blocks_reply:
+                if reply_trace is not None:
+                    reply_trace.update(process_status='skipped', decision_reason='advanced_filter')
+                return None
             async with async_session_maker() as session:
-                keyword_reply = await self.get_keyword_reply(
-                    session, send_user_name, send_user_id, send_message, item_id, chat_id
-                )
-                if keyword_reply:
-                    if keyword_reply == "EMPTY_REPLY":
+                async def provide(source):
+                    if source == 'exclusive':
+                        rule = await self.reply_state.exclusive(self.cookie_id, item_id)
+                        if not rule:
+                            return ReplyDecision('unmatched', source)
+                        content = rule['content']
+                        if rule['image_url']:
+                            content = '__IMAGE_SEND__||' + rule['image_url']
+                            if reply_trace is not None and rule['content']:
+                                reply_trace['pending_text_reply'] = rule['content']
+                        return ReplyDecision('body' if content else 'skip', source, content, rule['id'], rule['version'])
+                    if source == 'keyword':
+                        content = await self.get_keyword_reply(session, send_user_name, send_user_id, send_message, item_id, chat_id)
+                    elif source == 'ai':
+                        if 'skip_ai' in filters.actions:
+                            return ReplyDecision('unmatched', source)
+                        content = await self.get_ai_reply(session, send_user_name, send_user_id, send_message, item_id, chat_id)
+                    else:
+                        content = await self.get_default_reply(session, send_user_name, send_user_id, send_message, chat_id, item_id, msg_time)
+                    if isinstance(content, ReplyDecision):
                         if reply_trace is not None:
-                            reply_trace["process_status"] = "skipped"
-                            reply_trace["decision_reason"] = "empty_reply"
-                        return None
-                    return keyword_reply
-                
-                ai_reply = await self.get_ai_reply(
-                    session, send_user_name, send_user_id, send_message, item_id, chat_id
-                )
-                if ai_reply:
-                    return ai_reply
-                
-                default_reply = await self.get_default_reply(
-                    session, send_user_name, send_user_id, send_message, chat_id, item_id, msg_time
-                )
-                if default_reply:
-                    if default_reply == "EMPTY_REPLY":
-                        if reply_trace is not None:
-                            reply_trace["process_status"] = "skipped"
-                            reply_trace["decision_reason"] = "empty_reply"
-                        return None
-                    return default_reply
-            
+                            reply_trace.setdefault('context_snapshot', {}).setdefault('reply_decisions', []).append(
+                                {'source': content.source, 'kind': content.kind})
+                        return content
+                    if content == 'EMPTY_REPLY':
+                        return ReplyDecision('skip', source)
+                    return ReplyDecision('body' if content else 'unmatched', source, content)
+                decision = await select_reply(policy['strategy'], provide)
+                if reply_trace is not None:
+                    reply_trace.setdefault('context_snapshot', {}).update(
+                        reply_policy=policy['strategy'], policy_version=policy['version'],
+                        decision_kind=decision.kind, rule_id=decision.rule_id, rule_version=decision.version)
+                    if decision.kind in {'body', 'skip'}:
+                        reply_trace['reply_strategy'] = decision.source
+                    if decision.kind == 'skip':
+                        reply_trace.update(process_status='skipped', decision_reason='empty_reply')
+                if decision.kind == 'body':
+                    return decision.content
+                if decision.kind == 'skip':
+                    return None
+
             if reply_trace is not None:
                 reply_trace["process_status"] = "skipped"
                 reply_trace["decision_reason"] = "no_rule_matched"
@@ -1308,6 +1416,7 @@ class AutoReplyService:
                         if reply_trace is not None:
                             reply_trace["reply_strategy"] = "keyword"
                             reply_trace["matched_keyword"] = matched_keyword
+                            reply_trace.setdefault("context_snapshot", {}).update(rule_id=kw.get("id"), rule_version=kw.get("version"))
                             reply_trace["matched_rule_type"] = "keyword_item"
                             reply_trace.setdefault("context_snapshot", {})["matched_item_title"] = kw.get("item_title") or None
                         
@@ -1383,6 +1492,7 @@ class AutoReplyService:
                     if reply_trace is not None:
                         reply_trace["reply_strategy"] = "keyword"
                         reply_trace["matched_keyword"] = matched_keyword
+                        reply_trace.setdefault("context_snapshot", {}).update(rule_id=kw.get("id"), rule_version=kw.get("version"))
                         reply_trace["matched_rule_type"] = "keyword_common"
 
                     if kw_type == "image" and image_url:
@@ -1459,7 +1569,7 @@ class AutoReplyService:
                 XYKeywordRule.account_pk == account.id,
                 XYKeywordRule.is_active == True,  # 参照旧框架，只查询启用的关键词
             )
-            .order_by(XYKeywordRule.keyword, XYKeywordRule.item_id)
+            .order_by(XYKeywordRule.keyword, XYKeywordRule.item_id, XYKeywordRule.id)
         )
         rows = await session.execute(stmt)
         keywords: list[dict] = []
@@ -1467,6 +1577,8 @@ class AutoReplyService:
             rule_type = (rule.reply_type or "text").lower()
             keywords.append(
                 {
+                    "id": rule.id,
+                    "version": str(rule.updated_at),
                     "keyword": rule.keyword,
                     "reply": rule.reply_content or "",
                     "item_id": rule.item_id or "",
@@ -1615,10 +1727,6 @@ class AutoReplyService:
                 reply_trace.setdefault("context_snapshot", {})["default_reply_api_url"] = api_url
             return None
 
-        # 调用成功后再记录 reply_once
-        if settings.get("reply_once", False) and chat_id:
-            await self._record_user_replied(session, self.cookie_id, chat_id, settings_item_id)
-            logger.info(f"【{self.cookie_id}】记录默认回复(API): chat_id={chat_id}, item_id={settings_item_id}")
 
         logger.info(f"【{self.cookie_id}】使用API默认回复: {api_reply[:50]}")
         if reply_trace is not None:
@@ -1789,7 +1897,7 @@ class AutoReplyService:
                     if reply_trace is not None:
                         reply_trace["process_status"] = "skipped"
                         reply_trace["decision_reason"] = "default_reply_once"
-                    return None
+                    return "EMPTY_REPLY"
 
             reply_type = settings.get("reply_type", "text") or "text"
             reply_content = settings.get("reply_content", "")
@@ -1917,7 +2025,7 @@ class AutoReplyService:
                     )
 
             if reply_image and reply_image.strip():
-                logger.info(f"【{self.cookie_id}】默认回复包含图片: {reply_image}")
+                logger.info(f"【{self.cookie_id}】默认回复包含图片")
                 pending_text_reply = None
                 if reply_content and reply_content.strip():
                     try:
@@ -1932,9 +2040,6 @@ class AutoReplyService:
                         if reply_trace is not None:
                             reply_trace.setdefault("context_snapshot", {})["default_reply_format_error"] = str(e)
 
-                if settings.get("reply_once", False) and chat_id:
-                    await self._record_user_replied(session, self.cookie_id, chat_id, settings_item_id)
-                    logger.info(f"【{self.cookie_id}】记录默认回复: chat_id={chat_id}, item_id={settings_item_id}")
 
                 if reply_trace is not None:
                     reply_trace["reply_mode"] = "text_image" if pending_text_reply else "image"
@@ -1964,9 +2069,6 @@ class AutoReplyService:
                     item_id=item_id or "",
                 )
 
-                if settings.get("reply_once", False) and chat_id:
-                    await self._record_user_replied(session, self.cookie_id, chat_id, settings_item_id)
-                    logger.info(f"【{self.cookie_id}】记录默认回复: chat_id={chat_id}, item_id={settings_item_id}")
 
                 logger.info(f"【{self.cookie_id}】使用默认回复: {formatted}")
                 if reply_trace is not None:
@@ -2203,6 +2305,8 @@ class AutoReplyService:
             if reply_trace is not None:
                 reply_trace.setdefault("context_snapshot", {})["ai_item_info"] = item_info
             
+            shared_history = await self.reply_state.history(self.cookie_id, chat_id, limit=100)
+            ai_diagnostics = {}
             reply = await ai_engine.generate_reply(
                 message=send_message,
                 item_info=item_info,
@@ -2212,8 +2316,18 @@ class AutoReplyService:
                 item_id=item_id or "",
                 db_session=session,
                 skip_wait=True,
+                history=shared_history,
+                diagnostics=ai_diagnostics,
             )
             
+            if reply_trace is not None:
+                reply_trace.setdefault('context_snapshot', {})['ai_diagnostics'] = ai_diagnostics
+            if not reply and ai_diagnostics.get('stage') == 'skipped' and ai_diagnostics.get('reason') in {'configuration_changed', 'manual_pause'}:
+                return ReplyDecision('skip', 'ai')
+            if not reply and ai_diagnostics.get('stage') not in {None, 'success', 'skipped'}:
+                return ReplyDecision('error', 'ai')
+            if isinstance(reply, ReplyDecision):
+                return reply
             if reply:
                 logger.info(f"【{self.cookie_id}】AI回复生成成功: {reply[:50]}...")
                 if reply_trace is not None:

@@ -44,10 +44,13 @@ async def get_current_user(
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
-        payload = TokenPayload(**decode_token(token))
+        decoded = decode_token(token)
+        if decoded.get("type") != "access":
+            raise credentials_exception
+        payload = TokenPayload(**decoded)
     except (JWTError, ValueError):
         raise credentials_exception
-    if payload.sub is None:
+    if payload.sub is None or not str(payload.sub).isdigit():
         raise credentials_exception
 
     # 查询用户
@@ -55,7 +58,7 @@ async def get_current_user(
     result = await session.execute(select(User).where(User.id == int(payload.sub)))
     user = result.scalar_one_or_none()
     
-    if not user:
+    if not user or user.status != UserStatus.ACTIVE or decoded.get("token_version", 0) != (user.token_version or 0):
         raise credentials_exception
     return user
 

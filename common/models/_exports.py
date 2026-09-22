@@ -143,3 +143,27 @@ __all__ = [
     "AutoRelistEvent",
     "RelistAssociationMigration",
 ]
+
+# Fork additions share the same metadata as the upstream models.
+from common.models.ai_preset import AIPreset
+from common.models.product_polish_schedule import ProductPolishSchedule
+from common.models import reply_state as _reply_state
+__all__ += ["AIPreset", "ProductPolishSchedule"]
+
+from common.models.delivery_intent import DeliveryIntent
+from common.models.order_sync_job import OrderSyncJob
+from common.models.admin_control import LoginProtection, LoginProtectionConfig, AdminAudit, BackupVerification, DataPreview, AdminLogArchive
+from common.models.notification_delivery import NotificationEvent, NotificationDelivery, NotificationTemplate
+__all__ += ["DeliveryIntent", "OrderSyncJob", "LoginProtection", "LoginProtectionConfig", "AdminAudit", "BackupVerification", "DataPreview", "NotificationEvent", "NotificationDelivery", "NotificationTemplate", "AdminLogArchive"]
+
+from common.models.account_operation import AccountOperation
+from common.models.product_operation import ProductPublishBatch, ProductOperationEvidence
+from common.models.product_feedback import ProductFeedbackAttempt, ProductRateTemplate
+from common.models.product_polish_run import ProductPolishRun
+__all__ += ["AccountOperation", "ProductPublishBatch", "ProductOperationEvidence", "ProductFeedbackAttempt", "ProductRateTemplate", "ProductPolishRun"]
+
+from common.models.delivery_rule import DeliveryRule
+__all__ += ['DeliveryRule']
+
+from common.models.admin_control import AdminAuditArchive
+__all__ += ['AdminAuditArchive']

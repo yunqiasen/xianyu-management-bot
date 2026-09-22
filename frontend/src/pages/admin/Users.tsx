@@ -1,3 +1,4 @@
+import { LoginProtection } from './LoginProtection'
 import { useEffect, useState } from 'react'
 import { Users as UsersIcon, RefreshCw, Plus, ChevronLeft, ChevronRight, Loader2, Pencil, Power, PowerOff, Wallet, Search, X } from 'lucide-react'
 import { getUsers, deleteUser, updateUser } from '@/api/admin'
@@ -162,6 +163,7 @@ export function Users() {
 
   return (
     <div className="space-y-4">
+      <LoginProtection />
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
           <h1 className="page-title">用户管理</h1>

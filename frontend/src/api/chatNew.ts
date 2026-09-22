@@ -58,6 +58,9 @@ export interface Conversation {
 
 /** 聊天消息 */
 export interface ChatMessage {
+  status?: 'submitted' | 'confirmed' | 'failed' | 'unknown'
+  version?: number
+  requestId?: string
   messageId: string
   senderId: string
   senderName: string
@@ -127,11 +130,13 @@ export const sendTextMessage = async (
   cid: string,
   toUserId: string,
   text: string,
-): Promise<{ success: boolean; message: string; data?: { messageId: string } }> => {
-  return post<{ success: boolean; message: string; data?: { messageId: string } }>(`${PREFIX}/send-message/${accountId}`, {
+  requestId = crypto.randomUUID(),
+): Promise<{ success: boolean; message: string; data?: { messageId: string; status?: ChatMessage['status']; requestId?: string } }> => {
+  return post<{ success: boolean; message: string; data?: { messageId: string; status?: ChatMessage['status']; requestId?: string } }>(`${PREFIX}/send-message/${accountId}`, {
     cid,
     toUserId,
     text,
+    requestId,
   })
 }
 
@@ -141,12 +146,14 @@ export const sendImageMessage = async (
   cid: string,
   toUserId: string,
   file: File,
-): Promise<{ success: boolean; message: string; data?: { messageId: string; imageUrl: string } }> => {
+  requestId = crypto.randomUUID(),
+): Promise<{ success: boolean; message: string; data?: { messageId: string; imageUrl: string; status?: ChatMessage['status']; requestId?: string } }> => {
   const formData = new FormData()
+  formData.append('requestId', requestId)
   formData.append('cid', cid)
   formData.append('toUserId', toUserId)
   formData.append('image', file)
-  return post<{ success: boolean; message: string; data?: { messageId: string; imageUrl: string } }>(
+  return post<{ success: boolean; message: string; data?: { messageId: string; imageUrl: string; status?: ChatMessage['status']; requestId?: string } }>(
     `${PREFIX}/send-image/${accountId}`,
     formData,
   )
@@ -181,9 +188,10 @@ export const recallMessage = (
 export const getOfficialBlacklistStatus = async (
   accountId: string,
   cid: string,
+  buyerId = '',
 ): Promise<boolean> => {
   const res = await get<{ success: boolean; message?: string; data?: { blocked: boolean } }>(
-    `${PREFIX}/official-blacklist/${accountId}/${encodeURIComponent(cid)}`,
+    `${PREFIX}/official-blacklist/${accountId}/${encodeURIComponent(cid)}?buyer_id=${encodeURIComponent(buyerId)}`,
   )
   if (!res.success) throw new Error(res.message || '查询黑名单状态失败')
   return !!res.data?.blocked
@@ -193,9 +201,10 @@ export const changeOfficialBlacklist = async (
   accountId: string,
   cid: string,
   action: 'add' | 'remove',
+  buyerId = '',
 ): Promise<{ success: boolean; message: string; data?: { blocked: boolean } }> => {
   const res = await post<{ success: boolean; message: string; data?: { blocked: boolean } }>(
-    `${PREFIX}/official-blacklist/${accountId}/${encodeURIComponent(cid)}/${action}`,
+    `${PREFIX}/official-blacklist/${accountId}/${encodeURIComponent(cid)}/${action}?buyer_id=${encodeURIComponent(buyerId)}`,
   )
   if (!res.success) throw new Error(res.message || '操作失败')
   return res
@@ -278,6 +287,9 @@ export const deleteQuickPhrase = async (id: number): Promise<{ success: boolean;
 /** WebSocket 推送消息（新消息事件） */
 export interface WsPushMessage {
   event: 'new_message' | 'connected' | 'pong'
+  event_id?: string
+  version?: number
+  cursor?: number
   cid?: string
   account_id?: string
   message?: ChatMessage
@@ -307,4 +319,10 @@ export function createChatNewWebSocket(accountId: string): WebSocket {
   const token = localStorage.getItem('auth_token') || ''
   const url = `${wsBase}/api/v1/chat-new/ws/${encodeURIComponent(accountId)}?token=${encodeURIComponent(token)}`
   return new WebSocket(url)
+}
+
+export const getReplyEvents = async (accountId: string, after: number) => {
+  const response = await get<{ success: boolean; data: { events: WsPushMessage[]; nextCursor: number; hasMore: boolean } }>(`${PREFIX}/reply-controls/${encodeURIComponent(accountId)}/events?after=${after}`)
+  if (!response.success) throw new Error('补拉失败')
+  return response.data
 }

@@ -7,10 +7,12 @@ import { useUIStore } from '@/store/uiStore'
 import { useAuthStore } from '@/store/authStore'
 import { PageLoading } from '@/components/common/Loading'
 import { ConfirmModal } from '@/components/common/ConfirmModal'
-import type { NotificationChannel } from '@/types'
+import type { NotificationChannel } from '@/api/notifications'
+import { NotificationTemplates } from './NotificationTemplates'
 
 // 所有支持的渠道类型配置
 const channelTypes = [
+  {type: 'qq', label: 'QQ / OneBot', desc: 'QQ私聊或群消息', icon: MessageCircle, placeholder: '{"base_url":"http://127.0.0.1:3000","user_id":"123","access_token":""}', defaultConfig: {base_url:'http://127.0.0.1:3000',user_id:'123',access_token:''}},
   { 
     type: 'dingtalk', 
     label: '钉钉通知', 
@@ -448,6 +450,7 @@ export function NotificationChannels() {
         </div>
       )}
 
+      <NotificationTemplates />
       {/* 配置弹窗 */}
       {isModalOpen && selectedType && (
         <div className="modal-overlay">

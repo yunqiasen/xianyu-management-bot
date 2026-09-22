@@ -1,3 +1,4 @@
+import { BackupVerification } from './BackupVerification'
 /**
  * 数据库备份日志页面
  *
@@ -279,7 +280,7 @@ export function DbBackupLogs() {
               ) : (
                 logs.map((log) => (
                   <tr key={log.id}>
-                    <td className="whitespace-nowrap">{renderStatus(log.status)}</td>
+                    <td className="whitespace-nowrap">{renderStatus(log.status)}<BackupVerification logId={log.id} /></td>
                     <td className="font-medium text-blue-600 dark:text-blue-400 max-w-[300px]">
                       <span className="block truncate" title={log.file_name || ''}>
                         {log.file_name || '-'}

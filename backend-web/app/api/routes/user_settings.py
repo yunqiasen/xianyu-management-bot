@@ -18,6 +18,7 @@ from app.services.card_dock_service import CARD_SECRET_KEY_SETTING, CardDockServ
 from app.services.card_secret_key_service import CardSecretKeyService
 from common.models.user import User
 from common.models.user_setting import UserSetting
+from common.services.typed_settings import SETTINGS_KEY
 from common.schemas.common import ApiResponse
 from common.utils.image_utils import image_manager
 from common.services.remote_location_message_api import (
@@ -110,7 +111,7 @@ async def get_user_settings(
             "description": setting.description,
             "updated_at": safe_isoformat(setting.updated_at),
         }
-        for setting in settings
+        for setting in settings if setting.key != SETTINGS_KEY
     }
 
 
@@ -152,6 +153,8 @@ async def update_user_setting(
     session: AsyncSession = Depends(deps.get_db_session),
 ) -> ApiResponse:
     """更新用户设置"""
+    if key == SETTINGS_KEY:
+        raise HTTPException(409, "请在账号配置继承面板修改")
     stmt = select(UserSetting).where(
         UserSetting.user_id == current_user.id,
         UserSetting.key == key,
@@ -190,6 +193,8 @@ async def delete_user_setting(
     session: AsyncSession = Depends(deps.get_db_session),
 ) -> ApiResponse:
     """删除用户设置"""
+    if key == SETTINGS_KEY:
+        raise HTTPException(409, "请在账号配置继承面板修改")
     stmt = delete(UserSetting).where(
         UserSetting.user_id == current_user.id,
         UserSetting.key == key,
@@ -265,11 +270,11 @@ async def upload_payment_qrcode(
     if payment_type not in ('alipay', 'wechat'):
         return {'success': False, 'message': '收款方式无效，必须是 alipay 或 wechat'}
 
-    image_data = await file.read()
+    image_data = await file.read(image_manager.max_size + 1)
     if not image_data:
         return {'success': False, 'message': '上传文件为空'}
 
-    image_url = image_manager.save_image(image_data, file.filename)
+    image_url = image_manager.save_image(image_data, file.filename, owner_id=current_user.id)
     if not image_url:
         return {'success': False, 'message': '图片保存失败，请检查格式是否为 JPG/PNG/WEBP'}
 

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 from typing import Any
@@ -15,6 +15,23 @@ from common.schemas.notification import (
     NotificationChannelUpdate,
 )
 from app.services.account_service import AccountService
+
+
+def _mask_channel_config(config):
+    from common.utils.logging_utils import redact_secrets
+    masked = redact_secrets(config or {})
+    for key in ('webhook_url', 'server_url', 'base_url', 'headers'):
+        if masked.get(key): masked[key] = '[REDACTED]'
+    return masked
+
+
+def _merge_channel_config(existing, submitted):
+    merged = dict(existing or {})
+    for key, value in (submitted or {}).items():
+        if value == '[REDACTED]':
+            if key not in merged: raise ValueError('掩码字段缺少原配置')
+        else: merged[key] = value
+    return merged
 
 
 class NotificationChannelService:
@@ -38,6 +55,8 @@ class NotificationChannelService:
         payload: NotificationChannelCreate,
     ) -> dict[str, Any]:
         config = self._parse_config(payload.config)
+        from common.services.notification_transport import validate_config
+        validate_config(payload.type.strip(), config)
         channel = NotificationChannel(
             owner_id=owner_id,
             name=payload.name.strip(),
@@ -73,10 +92,12 @@ class NotificationChannelService:
         if payload.type is not None:
             channel.channel_type = payload.type.strip()
         if payload.config is not None:
-            channel.config_payload = self._parse_config(payload.config)
+            channel.config_payload = _merge_channel_config(channel.config_payload, self._parse_config(payload.config))
         if payload.enabled is not None:
             channel.enabled = bool(payload.enabled)
 
+        from common.services.notification_transport import validate_config
+        validate_config(channel.channel_type, channel.config_payload)
         self.session.add(channel)
         await self.session.commit()
         await self.session.refresh(channel)
@@ -95,7 +116,7 @@ class NotificationChannelService:
             "id": channel.id,
             "name": channel.name,
             "type": channel.channel_type,
-            "config": channel.config_payload or {},
+            "config": _mask_channel_config(channel.config_payload),
             "enabled": channel.enabled,
             "created_at": channel.created_at,
             "updated_at": channel.updated_at,
@@ -218,6 +239,8 @@ class MessageNotificationService:
             .join(XYAccount, XYAccount.id == MessageNotification.account_pk)
             .where(
                 MessageNotification.owner_id == owner_id,
+                NotificationChannel.owner_id == owner_id,
+                XYAccount.owner_id == owner_id,
                 NotificationChannel.enabled.is_(True),
             )
             .order_by(XYAccount.account_id, MessageNotification.id)
@@ -240,7 +263,7 @@ class MessageNotificationService:
                     "enabled": subscription.enabled and channel.enabled,
                     "channel_name": channel.name,
                     "channel_type": channel.channel_type,
-                    "channel_config": channel.config_payload or {},
+                    "channel_config": _mask_channel_config(channel.config_payload),
                 }
             )
         return aggregated

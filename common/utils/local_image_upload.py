@@ -112,7 +112,7 @@ async def read_image_with_size_check(
     Raises:
         ImageUploadError: 字节数超过 ``max_size``。
     """
-    content = await image.read()
+    content = await image.read(max_size + 1) if max_size and max_size > 0 else await image.read()
     if max_size and max_size > 0 and len(content) > max_size:
         size_mb = max_size / (1024 * 1024)
         # 对 5MB 这类整数做整型展示，避免 "5.0MB"
@@ -142,6 +142,8 @@ def build_unique_filename(
     ext = safe_image_ext(original_filename)
     uid = uuid.uuid4().hex[:8] if short_uuid else uuid.uuid4().hex
     if prefix:
+        import re
+        prefix = re.sub(r"[^A-Za-z0-9_.-]", "_", str(prefix))[:120]
         return f"{prefix}_{uid}{ext}"
     return f"{uid}{ext}"
 

@@ -7,9 +7,11 @@
 3. 用户注册
 4. 用户登出
 """
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from app.services.private_media import set_media_cookie, clear_media_cookie
 
 from app.api import deps
 from app.api.routes.captcha import check_email_code
@@ -34,6 +36,8 @@ class ResetPasswordRequest(BaseModel):
 @router.post("/login", response_model=LoginResponse)
 async def login_user(
     payload: LoginRequest,
+    request: Request,
+    response: Response,
     auth_service: AuthService = Depends(deps.get_auth_service),
     session: AsyncSession = Depends(deps.get_db_session),
 ) -> LoginResponse:
@@ -60,7 +64,7 @@ async def login_user(
             if not geetest_ok:
                 return LoginResponse(success=False, message=geetest_msg)
         
-        user, error_message = await auth_service.authenticate_by_username(payload.username, payload.password)
+        user, error_message = await auth_service.authenticate_by_username(payload.username, payload.password, ip=request.client.host if request.client else None)
     elif payload.email and payload.password:
         # 邮箱密码登录 - 需要滑动验证（如果开启）
         if captcha_enabled:
@@ -73,19 +77,22 @@ async def login_user(
             if not geetest_ok:
                 return LoginResponse(success=False, message=geetest_msg)
         
-        user, error_message = await auth_service.authenticate_by_email(payload.email, payload.password)
+        user, error_message = await auth_service.authenticate_by_email(payload.email, payload.password, ip=request.client.host if request.client else None)
     elif payload.email and payload.verification_code:
-        # 邮箱验证码登录
-        # 验证验证码
-        code_valid, code_msg = check_email_code(payload.email, payload.verification_code, "login")
-        if not code_valid:
-            return LoginResponse(success=False, message=code_msg)
-        
-        # 根据邮箱查找用户
+        from app.services.login_protection_service import LoginProtectionService
         user_service = UserService(session)
         user = await user_service.get_by_email(payload.email)
-        if not user:
-            return LoginResponse(success=False, message="该邮箱未注册")
+        identity = user.username if user else payload.email
+        ip = request.client.host if request.client else None
+        guard = LoginProtectionService(session)
+        if await guard.check(identity, ip):
+            await session.commit()
+            return LoginResponse(success=False,message="登录信息有误或暂时受限，请稍后重试")
+        code_valid, _ = check_email_code(payload.email, payload.verification_code, "login")
+        accepted = bool(code_valid and user and user.status == UserStatus.ACTIVE)
+        await guard.record(identity, ip, success=accepted)
+        if not accepted:
+            return LoginResponse(success=False,message="登录信息有误或暂时受限，请稍后重试")
     else:
         return LoginResponse(success=False, message="请提供有效的登录信息")
 
@@ -96,6 +103,7 @@ async def login_user(
         return LoginResponse(success=False, message="账号已禁用，请联系管理员")
 
     await auth_service.mark_login(user)
+    set_media_cookie(response, request, user)
     return LoginResponse(
         success=True,
         message="登录成功",
@@ -111,6 +119,7 @@ async def login_user(
 @router.get("/verify", response_model=VerifyResponse)
 async def verify_token(
     request: Request,
+    response: Response,
     session: AsyncSession = Depends(deps.get_db_session),
 ) -> VerifyResponse:
     auth_header = request.headers.get("Authorization")
@@ -124,13 +133,14 @@ async def verify_token(
         return VerifyResponse(authenticated=False)
 
     sub = payload.get("sub")
-    if not sub:
+    if not sub or not str(sub).isdigit() or payload.get("type") != "access":
         return VerifyResponse(authenticated=False)
 
     user = await session.get(User, int(sub))
-    if not user or user.status != UserStatus.ACTIVE:
+    if not user or user.status != UserStatus.ACTIVE or payload.get("token_version", 0) != (user.token_version or 0):
         return VerifyResponse(authenticated=False)
 
+    set_media_cookie(response, request, user)
     return VerifyResponse(
         authenticated=True,
         user_id=user.id,
@@ -141,13 +151,24 @@ async def verify_token(
 
 
 @router.post("/logout", response_model=ApiResponse)
-async def logout_user() -> ApiResponse:
+async def logout_user(
+    response: Response,
+    current_user: User = Depends(deps.get_current_active_user),
+    session: AsyncSession = Depends(deps.get_db_session),
+) -> ApiResponse:
+    user = await session.scalar(select(User).where(User.id == current_user.id)
+                                .with_for_update().execution_options(populate_existing=True))
+    if user:
+        user.token_version = (user.token_version or 0) + 1
+        await session.commit()
+    clear_media_cookie(response)
     return ApiResponse(success=True, message="已退出登录")
 
 
 @router.post("/refresh", response_model=LoginResponse)
 async def refresh_token(
     request: Request,
+    response: Response,
     session: AsyncSession = Depends(deps.get_db_session),
     auth_service: AuthService = Depends(deps.get_auth_service),
 ) -> LoginResponse:
@@ -167,14 +188,15 @@ async def refresh_token(
         return LoginResponse(success=False, message="令牌类型错误")
 
     sub = payload.get("sub")
-    if not sub:
+    if not sub or not str(sub).isdigit():
         return LoginResponse(success=False, message="刷新令牌无效")
 
     user = await session.get(User, int(sub))
-    if not user or user.status != UserStatus.ACTIVE:
+    if not user or user.status != UserStatus.ACTIVE or payload.get("token_version", 0) != (user.token_version or 0):
         return LoginResponse(success=False, message="用户不存在或已被禁用")
 
     # 生成新的access token和refresh token
+    set_media_cookie(response, request, user)
     return LoginResponse(
         success=True,
         message="令牌刷新成功",
@@ -209,6 +231,9 @@ async def register_user(
     payload: UserCreate,
     user_service: UserService = Depends(deps.get_user_service),
 ) -> ApiResponse:
+    if not await user_service.registration_enabled():
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="注册已关闭")
+
     # 验证邮箱验证码
     if payload.email and payload.verification_code:
         code_valid, code_msg = check_email_code(payload.email, payload.verification_code, "register")
@@ -259,6 +284,7 @@ async def reset_password(
 
     # 更新密码（直接操作 ORM 对象后 commit）
     user.password_hash = get_password_hash(payload.new_password)
+    user.token_version = (user.token_version or 0) + 1
     await session.commit()
 
     return ApiResponse(success=True, message="密码重置成功")

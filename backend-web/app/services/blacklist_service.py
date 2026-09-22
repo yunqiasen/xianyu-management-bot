@@ -195,15 +195,17 @@ class BlacklistService:
 
     async def list_platform(
         self,
+        owner_id: int,
         page: int = 1,
         page_size: int = 20,
     ) -> tuple[list[dict], int]:
         """查询闲鱼黑名单列表（含用户名）"""
-        count_stmt = select(func.count(XYPlatformBlacklist.id))
+        count_stmt = select(func.count(XYPlatformBlacklist.id)).where(XYPlatformBlacklist.owner_id == owner_id)
         total = (await self.session.execute(count_stmt)).scalar() or 0
 
         stmt = (
             select(XYPlatformBlacklist, User.username)
+            .where(XYPlatformBlacklist.owner_id == owner_id)
             .outerjoin(User, XYPlatformBlacklist.owner_id == User.id)
             .order_by(XYPlatformBlacklist.created_at.desc())
             .offset((page - 1) * page_size)
@@ -227,3 +229,21 @@ class BlacklistService:
             })
 
         return items, total
+
+    async def sync_platform_member(self, owner_id: int, buyer_id: str, blocked: bool, buyer_nick: str = ''):
+        """平台明确结果与聊天按钮共用同一张名单；未知结果不调用此入口。"""
+        from sqlalchemy import insert, delete
+        from common.services.reply_state import ReplyState, identity
+        if not buyer_id or len(buyer_id) > 64:
+            raise ValueError('买家身份无效')
+        # 按后台用户串行，不让两个账号对同一用户池产生重复记录。
+        await ReplyState()._stream_lock(self.session, 'blacklist-owner:' + str(owner_id))
+        table = XYPlatformBlacklist.__table__
+        existing = (await self.session.execute(select(table.c.id).where(table.c.owner_id == owner_id,
+            table.c.buyer_id == buyer_id))).first()
+        if blocked and not existing:
+            await self.session.execute(insert(table).values(id=int(identity(owner_id, buyer_id)[:15], 16),
+                owner_id=owner_id, buyer_id=buyer_id, buyer_nick=buyer_nick))
+        elif not blocked:
+            await self.session.execute(delete(table).where(table.c.owner_id == owner_id, table.c.buyer_id == buyer_id))
+        await self.session.commit()

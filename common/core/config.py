@@ -30,13 +30,17 @@ class BaseConfig(BaseSettings):
         extra="ignore",
     )
 
+    # P5 candidate code remains disabled until the GuDong coverage gate passes.
+    xymb_enable_bargaining_v2: bool = Field(default=False, alias="XYMB_ENABLE_BARGAINING_V2")
+    xymb_enable_monitor_v2: bool = Field(default=False, alias="XYMB_ENABLE_MONITOR_V2")
+
     # 环境配置
     environment: str = Field(default="development")
     log_level: str = Field(default="INFO")
 
     # SQL 日志开关：开启后会在每条 SQL 执行前打印拼接好参数的完整 SQL。
-    # 默认开启，便于开发与 Docker 环境排查；高并发生产环境如需降低开销可设为 false。
-    sql_echo: bool = Field(default=True)
+    # 默认关闭，避免业务凭据经 SQL 参数进入日志。
+    sql_echo: bool = Field(default=False)
 
     # 数据库配置
     mysql_host: str = Field(default="localhost")

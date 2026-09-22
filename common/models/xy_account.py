@@ -25,6 +25,7 @@ class XYAccount(TimestampMixin, Base):
     __table_args__ = (
         # account_id 全局唯一：闲鱼账号ID不允许重复（业务大量代码仅按 account_id 查询）
         Index("uk_account_id", "account_id", unique=True),
+        Index("uk_account_unb", "unb", unique=True),
         Index("idx_account_created", "created_at"),
     )
 

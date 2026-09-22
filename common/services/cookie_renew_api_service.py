@@ -91,38 +91,14 @@ class CookieRenewApiService:
         Returns:
             CookieRenewApiResult: 续期结果
         """
-        log_prefix = f"【Cookie续期】账号 {account_id}" if account_id else "【Cookie续期】"
-
-        if not cookies_str or not cookies_str.strip():
-            return CookieRenewApiResult(
-                success=False,
-                new_cookies_str=cookies_str or "",
-                api_message="Cookie为空，无法调用续期接口",
-                renew_method="none",
-                need_password_login=True,
-                step_details="Cookie为空，跳过所有续期",
-            )
-
-        # 定时任务触发：固定走 接口续期 → 浏览器续期 → 密码登录
-        if source == "scheduled_task":
-            logger.info(f"{log_prefix} 定时任务触发，按顺序: 接口续期 → 浏览器续期 → 密码登录")
-            return await self._renew_api_first(cookies_str, account_id, log_prefix)
-
-        # 非定时任务：根据 havana_lgc2_77 判断
-        has_long_login_token = False
-        try:
-            cookie_dict = trans_cookies(cookies_str)
-            lgc2_value = cookie_dict.get("havana_lgc2_77", "").strip()
-            has_long_login_token = bool(lgc2_value)
-        except Exception:
-            pass
-
-        if has_long_login_token:
-            logger.info(f"{log_prefix} 检测到 havana_lgc2_77，优先使用浏览器续期")
-            return await self._renew_browser_first(cookies_str, account_id, log_prefix)
-        else:
-            logger.info(f"{log_prefix} 未检测到 havana_lgc2_77，优先使用接口续期")
-            return await self._renew_api_first(cookies_str, account_id, log_prefix)
+        # Legacy callers have neither a version snapshot nor the executor lease.
+        # Actual renewal is owned by CookieTokenManager -> AccountRecovery.run.
+        return CookieRenewApiResult(
+            success=False, new_cookies_str=cookies_str or '',
+            api_message='请通过账号执行方提交续期任务',
+            renew_method='none', need_password_login=False,
+            step_details='account_executor_required',
+        )
 
     async def _renew_browser_first(
         self, cookies_str: str, account_id: str, log_prefix: str

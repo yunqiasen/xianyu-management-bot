@@ -209,6 +209,11 @@ class RedFlowerTask:
         account: XYAccount,
     ) -> None:
         """处理单个账号"""
+        from common.services.product_admission import product_admission
+        admission = product_admission(account)
+        if not admission['allowed']:
+            logger.info("账号运营任务跳过: {} {}", account.account_id, admission['status'])
+            return
         account_id = account.account_id
 
         # 检查账号是否处于Session过期冷却期内
@@ -232,8 +237,12 @@ class RedFlowerTask:
 
         # 处理每个订单
         for order in orders:
-            if is_order_in_cooldown(order.order_no):
-                logger.info(f"[求小红花] 订单 {order.order_no} 在冷却期内，跳过")
+            from common.services.product_feedback_policy import feedback_eligibility
+            eligibility = feedback_eligibility(account, order, kind='red_flower',
+                                               cooling=False)
+            if eligibility != 'ready':
+                await self._log_result(session, batch_id, account_id, order.order_no,
+                                       False, f"skipped:{eligibility}")
                 continue
 
             try:
@@ -250,7 +259,7 @@ class RedFlowerTask:
                     # 更新订单 is_red_flower 字段
                     await session.execute(
                         sql_update(XYOrder)
-                        .where(XYOrder.order_no == order.order_no)
+                        .where(XYOrder.id == order.id, XYOrder.account_id == account_id, XYOrder.owner_id == account.owner_id)
                         .values(is_red_flower=True)
                     )
                     await session.commit()
@@ -295,179 +304,16 @@ class RedFlowerTask:
                 )
                 continue
 
-    async def _request_red_flower(
-        self,
-        session: AsyncSession,
-        account_id: str,
-        cookie_str: str,
-        order: XYOrder,
-        is_retry: bool = False,
-    ) -> tuple[bool, Optional[str], str]:
-        """
-        调用闲鱼求小红花API
-
-        支持：
-        - 处理响应中的Set-Cookie，合并更新到数据库
-        - 令牌过期时从Set-Cookie提取新Cookie，更新数据库后自动重试一次
-        - Session过期时标记冷却并触发后台密码登录
-
-        Args:
-            session: 数据库会话
-            account_id: 账号ID
-            cookie_str: 当前Cookie字符串
-            order: 订单对象
-            is_retry: 是否为令牌过期后的重试请求
-
-        Returns:
-            (是否成功, 错误信息, 最新cookie字符串)
-        """
-        order_no = order.order_no
-
-        if not cookie_str:
-            return False, "账号Cookie为空", cookie_str
-
-        try:
-            # 解析Cookie
-            cookies = trans_cookies(cookie_str)
-
-            # 获取token
-            m_h5_tk = cookies.get("_m_h5_tk", "")
-            token = m_h5_tk.split("_")[0] if m_h5_tk else ""
-
-            if not token:
-                return False, "Cookie中没有找到_m_h5_tk令牌", cookie_str
-
-            # 生成时间戳
-            t = str(int(time.time() * 1000))
-
-            # 构造请求数据
-            data = {
-                "orderId": order_no,
-                "channel": "list",
-            }
-            data_val = json.dumps(data, separators=(",", ":"))
-
-            # 生成签名
-            sign = generate_sign(t, token, data_val)
-
-            # 构造请求参数
-            params = {
-                "jsv": "2.7.2",
-                "appKey": "34839810",
-                "t": t,
-                "sign": sign,
-                "v": "4.0",
-                "type": "originaljson",
-                "accountSite": "xianyu",
-                "dataType": "json",
-                "timeout": "20000",
-                "api": "mtop.taobao.idlemessage.red.flower",
-                "sessionOption": "AutoLoginOnly",
-            }
-
-            # 构造请求头
-            headers = {
-                "accept": "application/json",
-                "content-type": "application/x-www-form-urlencoded",
-                "cookie": cookie_str,
-                "Referer": "https://www.goofish.com/",
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-            }
-
-            retry_tag = "[令牌过期重试] " if is_retry else ""
-
-            # 发送请求
-            async with aiohttp.ClientSession() as http_session:
-                async with http_session.post(
-                    "https://h5api.m.goofish.com/h5/mtop.taobao.idlemessage.red.flower/1.0/",
-                    params=params,
-                    data={"data": data_val},
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=self.REQUEST_TIMEOUT),
-                ) as response:
-                    result = await response.json()
-                    ret_list = result.get("ret", [])
-                    ret_msg = ret_list[0] if ret_list else "未知错误"
-
-                    # ---- 处理响应中的 Set-Cookie，更新到数据库 ----
-                    new_resp_cookies = extract_cookies_from_response(response)
-                    if new_resp_cookies:
-                        cookie_str = merge_cookies(cookie_str, new_resp_cookies)
-                        await update_account_cookies_in_db(account_id, cookie_str)
-                        logger.info(
-                            f"[求小红花] {retry_tag}账号 {account_id} "
-                            f"从Set-Cookie合并了 {len(new_resp_cookies)} 个字段并更新数据库"
-                        )
-
-                    # ---- 成功 ----
-                    if ret_msg == "SUCCESS::调用成功":
-                        logger.info(f"[求小红花] {retry_tag}订单 {order_no} 求小红花成功")
-                        return True, None, cookie_str
-
-                    # ---- 令牌过期处理 ----
-                    if is_token_expired_error(ret_list):
-                        if is_retry:
-                            # 重试后仍令牌过期，放弃并标记冷却
-                            logger.warning(
-                                f"[求小红花] 账号 {account_id} 订单 {order_no} "
-                                f"令牌过期重试仍失败: {ret_msg}，标记冷却并触发密码登录"
-                            )
-                            mark_account_session_expired(account_id)
-                            trigger_password_login_async(account_id)
-                            return False, f"TOKEN_RETRY_FAILED: {ret_msg}", cookie_str
-                        else:
-                            # 首次令牌过期，尝试用Set-Cookie刷新后重试
-                            logger.warning(
-                                f"[求小红花] 账号 {account_id} 订单 {order_no} "
-                                f"令牌过期: {ret_msg}，准备用Set-Cookie刷新后重试"
-                            )
-                            has_new, refreshed_cookie = handle_token_expired_response(
-                                response, cookie_str
-                            )
-                            if has_new:
-                                # 更新数据库
-                                await update_account_cookies_in_db(account_id, refreshed_cookie)
-                                # 使用新Cookie重试一次
-                                return await self._request_red_flower(
-                                    session, account_id, refreshed_cookie, order, is_retry=True,
-                                )
-                            else:
-                                # 响应中没有Set-Cookie，标记冷却并触发密码登录
-                                logger.warning(
-                                    f"[求小红花] 账号 {account_id} 令牌过期但Set-Cookie为空，"
-                                    f"标记冷却并触发密码登录"
-                                )
-                                mark_account_session_expired(account_id)
-                                trigger_password_login_async(account_id)
-                                return False, f"TOKEN_RETRY_FAILED: {ret_msg}", cookie_str
-
-                    # ---- Session过期 → 标记冷却 + 触发密码登录 ----
-                    if is_session_expired_error(ret_list):
-                        logger.warning(
-                            f"[求小红花] 账号 {account_id} 订单 {order_no} "
-                            f"Session过期: {ret_msg}，标记冷却并触发密码登录"
-                        )
-                        mark_account_session_expired(account_id)
-                        trigger_password_login_async(account_id)
-                        return False, f"SESSION_EXPIRED: {ret_msg}", cookie_str
-
-                    logger.warning(
-                        f"[求小红花] {retry_tag}订单 {order_no} 求小红花失败: {ret_msg}"
-                    )
-                    return False, ret_msg, cookie_str
-
-        except aiohttp.ClientError as e:
-            error_msg = f"网络请求失败: {e}"
-            logger.error(f"[求小红花] 订单 {order_no} {error_msg}")
-            return False, error_msg, cookie_str
-        except Exception as e:
-            error_msg = f"请求异常: {e}"
-            logger.error(f"[求小红花] 订单 {order_no} {error_msg}")
-            return False, error_msg, cookie_str
+    async def _request_red_flower(self, session, account_id, cookie_str, order, is_retry=False):
+        from common.services.product_feedback_service import ProductFeedbackService
+        account = (await session.execute(select(XYAccount).where(XYAccount.account_id == account_id,
+            XYAccount.owner_id == order.owner_id))).scalar_one_or_none()
+        if not account:
+            return False, 'skipped:identity_mismatch', cookie_str
+        result = await ProductFeedbackService(session).run_order(account, order, 'red_flower')
+        message = ('skipped:' + str(result.get('reason'))) if result['status'] == 'skipped' else result.get('message')
+        if result['status'] == 'unknown': message = 'unknown:' + str(message)
+        return result['success'], message, cookie_str
 
     async def _log_result(
         self,
@@ -484,7 +330,7 @@ class RedFlowerTask:
                 batch_id=batch_id,
                 account_id=account_id,
                 order_no=order_no,
-                status="success" if success else "failed",
+                status="unknown" if error_message and error_message.startswith("unknown:") else "skipped" if error_message and error_message.startswith("skipped:") else ("success" if success else "failed"),
                 error_message=error_message[:500] if error_message else None,
             )
             session.add(log)

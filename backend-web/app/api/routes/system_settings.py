@@ -10,7 +10,7 @@
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from loguru import logger
 
 from app.api import deps
@@ -301,6 +301,9 @@ async def update_system_setting(
     current_user: User = Depends(deps.get_current_admin_user),
     service: SystemSettingService = Depends(deps.get_system_setting_service),
 ) -> ApiResponse:
+    from common.services.typed_settings import SETTINGS_KEY
+    if key == SETTINGS_KEY:
+        raise HTTPException(409, '请在账号配置继承面板修改')
     if key in SENSITIVE_KEYS:
         return ApiResponse(success=False, message="该设置需要使用专用接口修改")
 

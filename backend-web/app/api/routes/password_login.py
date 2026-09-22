@@ -13,8 +13,9 @@
 """
 from __future__ import annotations
 
+import time
 import httpx
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from loguru import logger
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -27,11 +28,19 @@ from app.services.password_login import password_login_manager
 from app.services.password_login.manager import SESSION_PREFIX
 from common.models.system_setting import SystemSetting
 from common.models.user import User
+from common.utils.internal_auth import build_internal_auth_headers
 from common.services.account_limit_service import AccountLimitExceededError, AccountLimitService
 
 router = APIRouter(prefix="/password-login", tags=["密码登录"])
 
 settings = get_settings()
+_BROWSER_OWNERS: dict[str, tuple[int, float]] = {}
+
+
+def _require_browser_owner(session_id: str, user_id: int):
+    owner, expires = _BROWSER_OWNERS.get(session_id, (None, 0))
+    if owner != user_id or time.time() >= expires:
+        raise HTTPException(404, '登录会话不存在或已过期')
 
 
 # ==================== 请求模型 ====================
@@ -79,6 +88,10 @@ async def password_login(
     if not request.account_id or not request.account or not request.password:
         return {"success": False, "message": "账号ID、登录账号和密码不能为空"}
 
+    bound = await account_service.get_account_by_identifier(request.account_id)
+    if bound and bound.owner_id != current_user.id:
+        raise HTTPException(409, "账号归属冲突")
+
     # 新账号先做限额校验（快速失败）
     existing = await account_service.get_account_for_user(current_user.id, request.account_id)
     if not existing:
@@ -108,6 +121,11 @@ async def password_login(
             "message": "登录任务已启动，请等待...",
         }
 
+    if existing:
+        job = await verification_sessions.open(existing.account_id,current_user.id,request.account,request.password)
+        return {'success':True,'session_id':job['id'],'status':'verification_required',
+                'verification_session':True,'expires_at':job['expires_at']}
+
     # 浏览器方式：代理到 websocket（现状不变）
     return await _proxy_ws_login(request, current_user.id)
 
@@ -115,7 +133,8 @@ async def password_login(
 async def _proxy_ws_login(request: PasswordLoginRequest, user_id: int) -> dict:
     """代理浏览器登录到 websocket 服务。"""
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=30.0, trust_env=False,
+                headers=build_internal_auth_headers(settings.internal_api_token)) as client:
             resp = await client.post(
                 f"{settings.websocket_service_url}/password-login",
                 json={
@@ -127,7 +146,11 @@ async def _proxy_ws_login(request: PasswordLoginRequest, user_id: int) -> dict:
                 },
             )
             if resp.status_code == 200:
-                return resp.json()
+                result = resp.json()
+                sid = result.get('session_id')
+                if sid and result.get('success'):
+                    _BROWSER_OWNERS[sid] = (user_id, time.time() + 900)
+                return result
             logger.error(f"WebSocket服务返回错误: {resp.status_code}")
             return {"success": False, "message": f"登录服务异常: {resp.status_code}"}
     except httpx.ConnectError:
@@ -144,6 +167,10 @@ async def check_login_status(
     current_user: User = Depends(deps.get_current_active_user),
 ):
     """查询登录状态：pl_ 前缀→本地协议会话（校验归属）；否则→代理 websocket。"""
+    if session_id in verification_sessions.sessions:
+        job=await _verification_call(verification_sessions.status,session_id,current_user.id)
+        return {'status': 'success' if job['status']=='verified' else 'failed' if job['status'] in {'cancelled','expired','superseded','invalid'} else 'verification_required',
+                'account_id':verification_sessions.sessions[session_id]['account_id'], 'verification_session':True}
     # 本地协议会话
     if session_id.startswith(SESSION_PREFIX):
         result = password_login_manager.get_status(session_id, current_user.id)
@@ -152,8 +179,10 @@ async def check_login_status(
         return result
 
     # 浏览器会话：代理 websocket
+    _require_browser_owner(session_id, current_user.id)
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=10.0, trust_env=False,
+                headers=build_internal_auth_headers(settings.internal_api_token)) as client:
             resp = await client.get(
                 f"{settings.websocket_service_url}/password-login/check/{session_id}"
             )
@@ -173,12 +202,16 @@ async def cancel_login(
     current_user: User = Depends(deps.get_current_active_user),
 ):
     """取消登录会话：pl_ 前缀→本地协议会话（校验归属）；否则→代理 websocket。"""
+    if session_id in verification_sessions.sessions:
+        return await verification_cancel(session_id,current_user)
     if session_id.startswith(SESSION_PREFIX):
         ok = password_login_manager.cancel(session_id, current_user.id)
         return {"success": ok, "message": "登录会话已取消" if ok else "会话不存在"}
 
+    _require_browser_owner(session_id, current_user.id)
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=10.0, trust_env=False,
+                headers=build_internal_auth_headers(settings.internal_api_token)) as client:
             resp = await client.delete(
                 f"{settings.websocket_service_url}/password-login/cancel/{session_id}"
             )
@@ -190,3 +223,68 @@ async def cancel_login(
     except Exception as e:
         logger.error(f"取消登录会话异常: {e}")
         return {"success": False, "message": str(e)}
+
+# 人工验证使用同一进程的异步浏览器，无公开静态截图，无任意 URL 控制。
+from fastapi import Response
+from common.services.account_browser import AccountBrowserSessions
+verification_sessions = AccountBrowserSessions()
+
+
+class VerificationRequest(BaseModel):
+    account_id: str
+
+
+@router.post('/verification')
+async def start_verification(request: VerificationRequest,
+        current_user: User = Depends(deps.get_current_active_user),
+        account_service: AccountService = Depends(deps.get_account_service)):
+    account = await account_service.get_account_for_user(current_user.id,request.account_id)
+    if not account: raise HTTPException(404,'账号不存在')
+    if not account.username or not account.login_password:
+        raise HTTPException(422,'请先保存账号账密')
+    job = await verification_sessions.open(account.account_id,current_user.id,account.username,account.login_password)
+    return {'success':True,'session_id':job['id'],'status':'verification_required','expires_at':job['expires_at']}
+
+
+async def _verification_call(action, *args):
+    try: return await action(*args)
+    except PermissionError: raise HTTPException(404,'账号会话不存在')
+    except ValueError as exc: raise HTTPException(409,str(exc))
+
+
+@router.get('/verification/{session_id}')
+async def verification_status(session_id: str,current_user: User=Depends(deps.get_current_active_user)):
+    return await _verification_call(verification_sessions.status,session_id,current_user.id)
+
+
+@router.get('/verification/{session_id}/screenshot')
+async def verification_screenshot(session_id: str,current_user: User=Depends(deps.get_current_active_user)):
+    image=await _verification_call(verification_sessions.screenshot,session_id,current_user.id)
+    return Response(image,media_type='image/png',headers={'Cache-Control':'no-store','Pragma':'no-cache'})
+
+
+@router.post('/verification/{session_id}/control')
+async def verification_control(session_id: str,command: dict,current_user: User=Depends(deps.get_current_active_user)):
+    await _verification_call(verification_sessions.control,session_id,current_user.id,command)
+    return {'success':True}
+
+
+@router.delete('/verification/{session_id}')
+async def verification_cancel(session_id: str,current_user: User=Depends(deps.get_current_active_user)):
+    await _verification_call(verification_sessions.cancel,session_id,current_user.id)
+    return {'success':True}
+
+
+@router.post('/verification/{session_id}/complete')
+async def verification_complete(session_id: str,current_user: User=Depends(deps.get_current_active_user)):
+    accepted=await _verification_call(verification_sessions.finish_browser,session_id,current_user.id)
+    if accepted:
+        from app.services.account_jobs import restart_account
+        row=verification_sessions.sessions[session_id]
+        async with verification_sessions.db_sessions() as db:
+            account=await verification_sessions._account(db,row['account_id'],current_user.id)
+            enabled=account.status=='active'
+        if enabled:
+            try: await restart_account(row['account_id'])
+            except Exception: pass
+    return {'success':accepted,'status':'verified' if accepted else 'superseded'}

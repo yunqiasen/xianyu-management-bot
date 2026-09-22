@@ -23,7 +23,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
+from app.services.private_media import PrivateMediaFiles
 from loguru import logger
 from fastapi.responses import JSONResponse
 
@@ -84,7 +84,13 @@ async def lifespan(app: FastAPI):
         await init_database()
     except Exception as e:
         logger.error(f"数据库初始化失败: {e}")
+        raise
     
+    # Optional isolated restore target is operator-configured, never supplied by a request.
+    if settings.admin_restore_database_url:
+        from sqlalchemy.ext.asyncio import create_async_engine
+        app.state.admin_restore_engine = create_async_engine(settings.admin_restore_database_url, pool_size=2, max_overflow=0)
+
     # 自检 JWT 密钥：弱/默认值时自动生成强随机密钥并持久化（源码启动兜底）
     try:
         from app.services.jwt_secret_service import ensure_jwt_secret_key
@@ -142,6 +148,8 @@ async def lifespan(app: FastAPI):
     yield
     
     logger.info(f"{settings.project_name} 关闭中...")
+    if getattr(app.state, "admin_restore_engine", None) is not None:
+        await app.state.admin_restore_engine.dispose()
     
     # 停止所有在线聊天IM会话
     try:
@@ -236,7 +244,7 @@ app.add_middleware(
 # 挂载静态文件目录
 static_path = Path(settings.static_dir)
 if static_path.exists():
-    app.mount("/static", StaticFiles(directory=str(static_path)), name="static")
+    app.mount("/static", PrivateMediaFiles(directory=str(static_path)), name="static")
     logger.info(f"静态文件路径已挂载: /static -> {static_path.absolute()}")
 
 
@@ -246,38 +254,16 @@ from app.api import api_router
 app.include_router(api_router, prefix="/api/v1")
 
 
+from common.middleware.correlation import CorrelationMiddleware
+app.add_middleware(CorrelationMiddleware)
+
+
 @app.get("/health")
 async def health_check():
-    """
-    健康检查接口
-    
-    Returns:
-        服务健康状态
-    """
-    from common.db.session import async_engine
-    from sqlalchemy import text
-    
-    # 检查数据库连接
-    db_status = "unknown"
-    try:
-        async with async_engine.connect() as conn:
-            await conn.execute(text("SELECT 1"))
-            db_status = "connected"
-    except Exception as e:
-        logger.error(f"数据库连接检查失败: {str(e)}")
-        db_status = "disconnected"
-    
-    return {
-        "success": True,
-        "code": 200,
-        "message": "服务运行正常",
-        "data": {
-            "service": settings.project_name,
-            "version": settings.version,
-            "status": "running",
-            "database": db_status,
-        },
-    }
+    from common.runtime_health import service_health
+    from fastapi.responses import JSONResponse
+    result = await service_health(settings.project_name, settings.auto_start_crawl_jobs)
+    return JSONResponse(result, status_code=result["code"])
 
 
 @app.exception_handler(HTTPException)
@@ -338,22 +324,17 @@ async def global_exception_handler(request, exc):
     
     捕获所有未处理的异常,返回统一格式的错误响应
     """
-    # 记录错误日志
-    # 注意：loguru 默认对 message 调用 str.format(*args, **kwargs)。
-    # 如果用 f-string 把 str(exc) 拼进 message，且 str(exc) 中含有 '{xxx}' 字面量
-    # （例如 ResponseValidationError 的报错里就含有 dict repr），
-    # loguru 会把这些 '{xxx}' 误认为是 format 占位符，进而抛 KeyError，
-    # 让全局异常处理器自身崩溃，掩盖原始错误。
-    # 解决：把动态值通过位置参数传入，message 里用 '{}' 占位（args 内的 '{' 不会被二次 format）。
-    # 同时用 logger.opt(exception=exc) 让 loguru 自动附带 traceback，替代旧的 exc_info=True。
-    logger.opt(exception=exc).error(
-        "全局异常捕获: {}: {}\n请求路径: {}\n请求方法: {}",
-        type(exc).__name__,
-        str(exc),
-        request.url.path,
-        request.method,
+    # Exception text/locals may contain credentials or delivery content. Keep
+    # only the type and frame locations; the request correlation ID joins logs.
+    import traceback
+    frames = [f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}"
+              for frame in traceback.extract_tb(exc.__traceback__)[-8:]]
+    identifier = getattr(request.state, 'correlation_id', '-')
+    logger.bind(correlation_id=identifier).error(
+        "全局异常捕获: type={} frames={} method={}",
+        type(exc).__name__, frames, request.method,
     )
-    
+
     # 处理HTTPException
     if isinstance(exc, HTTPException):
         return JSONResponse(
@@ -371,11 +352,12 @@ async def global_exception_handler(request, exc):
 
     # 其他异常
     return JSONResponse(
-        status_code=200,  # 统一返回200
+        status_code=200,  # 保留旧Web业务错误契约
+        headers={"X-Correlation-ID": identifier},
         content={
             "success": False,
             "code": 500,
-            "message": public_error_message or f"服务器内部错误: {str(exc)}",
+            "message": public_error_message or "服务器内部错误",
             "data": None,
         },
     )

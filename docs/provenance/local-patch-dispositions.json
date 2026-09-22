@@ -1,0 +1,242 @@
+[
+  {
+    "path": ".dockerignore",
+    "category": "modified-tracked",
+    "sha256": "f766a19d8a4b58d73c862b4001b5e3b91717cadd5b7c3310a8934c181c3f29e7",
+    "unchanged_since_baseline": true,
+    "in_pinned_gudong": true,
+    "identical_to_pinned_gudong": false,
+    "disposition": "部署适配留档；按原版多服务架构重新生成环境配置与浏览器依赖，不搬用旧端口/网段/整目录挂载。"
+  },
+  {
+    "path": "Dockerfile-cn",
+    "category": "modified-tracked",
+    "sha256": "d2af8e5a014f97a8531985f75dfdc90964370984408cc098f7863093f003ae2b",
+    "unchanged_since_baseline": true,
+    "in_pinned_gudong": true,
+    "identical_to_pinned_gudong": false,
+    "disposition": "部署适配留档；按原版多服务架构重新生成环境配置与浏览器依赖，不搬用旧端口/网段/整目录挂载。"
+  },
+  {
+    "path": "XianyuAutoAsync.py",
+    "category": "modified-tracked",
+    "sha256": "922bf6049da8f737af61f9316d141041e0232277cded0f66522f5ecb288ad8d8",
+    "unchanged_since_baseline": true,
+    "in_pinned_gudong": true,
+    "identical_to_pinned_gudong": false,
+    "changed_functions": [
+      {
+        "name": "pause_chat_for",
+        "line": 169,
+        "kind": "changed"
+      },
+      {
+        "name": "is_chat_paused",
+        "line": 190,
+        "kind": "changed"
+      },
+      {
+        "name": "get_remaining_pause_time",
+        "line": 205,
+        "kind": "changed"
+      },
+      {
+        "name": "cleanup_expired_pauses",
+        "line": 216,
+        "kind": "changed"
+      },
+      {
+        "name": "_refresh_token_impl",
+        "line": 7277,
+        "kind": "changed"
+      },
+      {
+        "name": "_handle_captcha_verification",
+        "line": 7963,
+        "kind": "changed"
+      },
+      {
+        "name": "_process_chat_message_reply",
+        "line": 16023,
+        "kind": "changed"
+      }
+    ],
+    "removed_functions": [
+      "_get_local_token_browser_identity",
+      "_probe_token_request_outbound_ip"
+    ],
+    "disposition": "现用版本落后于固定GuDong：缺账号维度暂停、AI出站过滤及部分浏览器/出口一致性逻辑。以新底座逐项核对，避免旧文件覆盖新实现。"
+  },
+  {
+    "path": "db_manager.py",
+    "category": "modified-tracked",
+    "sha256": "130321e2eeefb7cb9d5f3b77c939fc1c1fdce3b6228a3c7c7a7df09e18c1d0d0",
+    "unchanged_since_baseline": true,
+    "in_pinned_gudong": true,
+    "identical_to_pinned_gudong": true,
+    "changed_functions": [],
+    "removed_functions": [],
+    "disposition": "与固定GuDong逐字节相同，归入对应上游能力，不作为本地独有补丁重复移植。"
+  },
+  {
+    "path": "docker-compose-cn.yml",
+    "category": "modified-tracked",
+    "sha256": "7af31120873c5a4cc4c3928dae3080fe6ab8ffdf887ed40564d26919eeae2c58",
+    "unchanged_since_baseline": true,
+    "in_pinned_gudong": true,
+    "identical_to_pinned_gudong": false,
+    "disposition": "部署适配留档；按原版多服务架构重新生成环境配置与浏览器依赖，不搬用旧端口/网段/整目录挂载。"
+  },
+  {
+    "path": "docker-compose.yml",
+    "category": "modified-tracked",
+    "sha256": "ba703b2ec133d8fac8b97f2fb9a208b2f8e2154342b31a4efa23203f09fa29c6",
+    "unchanged_since_baseline": true,
+    "in_pinned_gudong": true,
+    "identical_to_pinned_gudong": false,
+    "disposition": "部署适配留档；按原版多服务架构重新生成环境配置与浏览器依赖，不搬用旧端口/网段/整目录挂载。"
+  },
+  {
+    "path": "reply_server.py",
+    "category": "modified-tracked",
+    "sha256": "a61b4ab6e8d0fa5e8501e10a3c7f01610098da7e37d19cb55d2618f676f4ccfb",
+    "unchanged_since_baseline": true,
+    "in_pinned_gudong": true,
+    "identical_to_pinned_gudong": true,
+    "changed_functions": [],
+    "removed_functions": [],
+    "disposition": "与固定GuDong逐字节相同，归入对应上游能力，不作为本地独有补丁重复移植。"
+  },
+  {
+    "path": "static/css/items.css",
+    "category": "modified-tracked",
+    "sha256": "1dc2b2de445ce060db9a36d5a147a1d6707d584a22040f09604175bc9db9be2a",
+    "unchanged_since_baseline": true,
+    "in_pinned_gudong": true,
+    "identical_to_pinned_gudong": true,
+    "disposition": "与固定GuDong逐字节相同，归入对应上游能力，不作为本地独有补丁重复移植。"
+  },
+  {
+    "path": "static/index.html",
+    "category": "modified-tracked",
+    "sha256": "5925c92199c998029ade14f76059cbbed063bee81dd6aa7a22c9a082dfcfe355",
+    "unchanged_since_baseline": true,
+    "in_pinned_gudong": true,
+    "identical_to_pinned_gudong": false,
+    "disposition": "与固定GuDong的差异涉及缺失AI消息来源选项/标签；在原版React页面补齐实际需求，不搬运旧HTML/JS整文件。"
+  },
+  {
+    "path": "static/js/app.js",
+    "category": "modified-tracked",
+    "sha256": "94652bd75f8d83774c01fe699c5473b3400f5ee9afa055bde3fac806a96ad1ee",
+    "unchanged_since_baseline": true,
+    "in_pinned_gudong": true,
+    "identical_to_pinned_gudong": false,
+    "disposition": "与固定GuDong的差异涉及缺失AI消息来源选项/标签；在原版React页面补齐实际需求，不搬运旧HTML/JS整文件。"
+  },
+  {
+    "path": "static/update_log.txt",
+    "category": "modified-tracked",
+    "sha256": "e23fe40ff2b2dccc129b2028f479461f41bda55622cf5c51bff2c7129320b90f",
+    "unchanged_since_baseline": true,
+    "in_pinned_gudong": true,
+    "identical_to_pinned_gudong": false,
+    "disposition": "仅作为历史版本元数据归档；新仓库版本及变更记录独立生成。"
+  },
+  {
+    "path": "static/version.txt",
+    "category": "modified-tracked",
+    "sha256": "8bc6c2b44da8626884c5f7d75d80c810f41ead8bd9aad93e1e12aef0d8a7a063",
+    "unchanged_since_baseline": true,
+    "in_pinned_gudong": true,
+    "identical_to_pinned_gudong": false,
+    "disposition": "仅作为历史版本元数据归档；新仓库版本及变更记录独立生成。"
+  },
+  {
+    "path": "tests/test_slider_verification_guards.py",
+    "category": "modified-tracked",
+    "sha256": "851adb6590aa991e6a65689a185b8d180c8a797d7641a007186510c5a4e36bbf",
+    "unchanged_since_baseline": true,
+    "in_pinned_gudong": true,
+    "identical_to_pinned_gudong": false,
+    "changed_functions": [
+      {
+        "name": "test_finalize_logged_in_cookies_fails_when_session_still_unready",
+        "line": 287,
+        "kind": "changed"
+      },
+      {
+        "name": "test_build_browser_mtop_probe_requests_url_encodes_business_probes",
+        "line": 992,
+        "kind": "new"
+      },
+      {
+        "name": "test_extract_browser_pid_falls_back_to_playwright_driver_process",
+        "line": 1011,
+        "kind": "new"
+      }
+    ],
+    "removed_functions": [],
+    "disposition": "保留URL编码/PID回退测试意图和mock关键字参数兼容修补，适配新模块后重跑；测试存在不等于新应用已验证。"
+  },
+  {
+    "path": "utils/item_publisher.py",
+    "category": "modified-tracked",
+    "sha256": "bd6e04b49928a6bfd39c3fec348ae2e5e2ddb400133e5e97a887c52c90636080",
+    "unchanged_since_baseline": true,
+    "in_pinned_gudong": true,
+    "identical_to_pinned_gudong": true,
+    "changed_functions": [],
+    "removed_functions": [],
+    "disposition": "与固定GuDong逐字节相同，归入对应上游能力，不作为本地独有补丁重复移植。"
+  },
+  {
+    "path": "Dockerfile-runtime",
+    "category": "untracked",
+    "sha256": "f95437c79a7de33614765a32eac100502e994cc7ec06cf1cc623eeab926966c6",
+    "unchanged_since_baseline": true,
+    "in_pinned_gudong": false,
+    "identical_to_pinned_gudong": false,
+    "disposition": "部署适配留档；按原版多服务架构重新生成环境配置与浏览器依赖，不搬用旧端口/网段/整目录挂载。"
+  },
+  {
+    "path": "docker-compose-cn.yml.bak-network-20260627-102032",
+    "category": "untracked",
+    "sha256": "cb6756a3842de0f83e60132af0b88322d1f94157852767d40967425bee12feed",
+    "unchanged_since_baseline": true,
+    "in_pinned_gudong": false,
+    "identical_to_pinned_gudong": false,
+    "disposition": "历史部署备份，仅归档；不是运行配置或功能补丁。"
+  },
+  {
+    "path": "docker-compose.yml.bak-netnorm-20260627-121659",
+    "category": "untracked",
+    "sha256": "1747bdb8d9efa66c8aca8efcbc4650b8747596e4b754d6aef3f534d1ac77d3c4",
+    "unchanged_since_baseline": true,
+    "in_pinned_gudong": false,
+    "identical_to_pinned_gudong": false,
+    "disposition": "历史部署备份，仅归档；不是运行配置或功能补丁。"
+  },
+  {
+    "path": "utils/item_pagination.py",
+    "category": "untracked",
+    "sha256": "826e7169187d6c689e09daf5ed43b18ed357461002675eb56e252a2542c9d43a",
+    "unchanged_since_baseline": true,
+    "in_pinned_gudong": true,
+    "identical_to_pinned_gudong": true,
+    "changed_functions": [],
+    "removed_functions": [],
+    "disposition": "与固定GuDong逐字节相同，归入对应上游能力，不作为本地独有补丁重复移植。"
+  },
+  {
+    "path": "utils/product_sku.py",
+    "category": "untracked",
+    "sha256": "276e7f71da02940a9369ee706bf23559985d5fe458440c062e929d96803135f7",
+    "unchanged_since_baseline": true,
+    "in_pinned_gudong": true,
+    "identical_to_pinned_gudong": true,
+    "changed_functions": [],
+    "removed_functions": [],
+    "disposition": "与固定GuDong逐字节相同，归入对应上游能力，不作为本地独有补丁重复移植。"
+  }
+]

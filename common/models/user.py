@@ -1,4 +1,4 @@
-﻿"""
+"""
 用户模型
 
 功能：
@@ -44,6 +44,7 @@ class User(TimestampMixin, Base):
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True, comment="邮箱")
     phone: Mapped[str | None] = mapped_column(String(32), comment="手机号")
     password_hash: Mapped[str] = mapped_column(String(255), comment="密码哈希")
+    token_version: Mapped[int] = mapped_column(default=0, server_default="0", comment="密码变更后的会话撤销版本")
     status: Mapped[UserStatus] = mapped_column(
         Enum(UserStatus),
         default=UserStatus.ACTIVE,

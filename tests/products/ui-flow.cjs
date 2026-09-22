@@ -1,0 +1,60 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const Module = require('node:module');
+const root = path.resolve(__dirname, '../../frontend');
+const fromFrontend = Module.createRequire(root + '/package.json');
+const ts = fromFrontend('typescript');
+const React = fromFrontend('react');
+const calls = [];
+let nextResponse=null;
+const http = Object.fromEntries(['get','post','put','del'].map(method => [method, async (url,body) => {
+  calls.push({method,url,body}); return nextResponse || {success:true,message:'已保存',data:[]};
+}]));
+const load = Module._load;
+Module._load = function(id, parent, main) {
+  if (id === '@/utils/request') return http;
+  if (id.startsWith('@/')) id = path.join(root,'src',id.slice(2));
+  if (id === 'react' || id.startsWith('react/')) id = fromFrontend.resolve(id);
+  return load.call(this,id,parent,main);
+};
+for (const ext of ['.ts','.tsx']) require.extensions[ext] = (mod, file) => {
+  const js=ts.transpileModule(fs.readFileSync(file,'utf8'), {compilerOptions:{jsx:ts.JsxEmit.ReactJSX,module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020}}).outputText;
+  mod._compile(js,file);
+};
+function nodes(node) { return !node || typeof node !== 'object' ? [] : [node,...React.Children.toArray(node.props?.children).flatMap(nodes)]; }
+(async () => {
+  const {ProductBatchControls, PublishReconcileControls}=require(root+'/src/pages/product-publish/ProductBatchControls.tsx');
+  let changed=0;
+  let tree=ProductBatchControls({batchId:'fixture',pending:2,failed:1,onChanged:()=>changed++});
+  const buttons=nodes(tree).filter(n=>n.type==='button');
+  assert.equal(buttons.length,3);
+  for (const button of buttons) await button.props.onClick();
+  assert.deepEqual(calls.map(c=>c.url.split('/').at(-1)),['cancel','retry-failed','resume']);
+  assert.equal(changed,3);
+  let prompts=['platform-123','平台商品列表已核对'];
+  global.window={prompt:()=>prompts.shift(),confirm:()=>true};
+  tree=PublishReconcileControls({logId:8,status:'unknown',onChanged:()=>changed++,onEvidence:()=>{}});
+  await nodes(tree).find(n=>n.type==='button' && n.props.children==='核对已发布').props.onClick();
+  assert.equal(calls.at(-1).url,'/api/v1/product-publish/logs/8/reconcile');
+  assert.deepEqual(calls.at(-1).body,{outcome:'published',item_id:'platform-123',evidence:'平台商品列表已核对'});
+  prompts=['确认未发布的截图和操作说明'];
+  await nodes(tree).find(n=>n.type==='button' && n.props.children==='核对未发布').props.onClick();
+  assert.equal(calls.at(-1).body.outcome,'not_published');
+  tree=PublishReconcileControls({logId:8,status:'success',onChanged:()=>{},onEvidence:()=>{}});
+  assert.equal(nodes(tree).filter(n=>n.type==='button').length,1);
+  const {FeedbackTaskControls}=require(root+'/src/pages/product-feedback/FeedbackTaskControls.tsx');
+  tree=FeedbackTaskControls({accountId:'a1',kind:'red_flower',orderNos:'o1,o2',startDate:'2026-09-01',endDate:'2026-09-02',onDone:()=>{},onError:()=>{}});
+  const feedbackButtons=nodes(tree).filter(n=>n.type==='button');
+  await feedbackButtons[0].props.onClick(); assert.deepEqual(calls.at(-1).body.order_nos,['o1','o2']);
+  assert.equal(calls.at(-1).body.kind,'red_flower');
+  await feedbackButtons[1].props.onClick(); assert.equal(calls.at(-1).body.start_date,'2026-09-01');
+  assert.equal(calls.at(-1).body.order_nos,undefined);
+  await feedbackButtons[2].props.onClick(); assert.ok(calls.at(-1).url.endsWith('history?account_id=a1'));
+  const {searchItems}=require(root+'/src/api/search.ts');
+  nextResponse={success:false,data:[{item_id:'confirmed'}],status:'rate_limited',failed_page:3,retry_after:125,retry_action:'wait_budget'};
+  const search=await searchItems('fixture',1,20,3,'a1');
+  assert.equal(search.retry_after,125); assert.equal(search.failed_page,3); assert.equal(search.data.length,1);
+  nextResponse=null;
+  console.log('PASS UI: page retry hint + feedback immediate/history/list + 3 batch actions, reconcile payload/evidence, success hides reconciliation');
+})().catch(e=>{console.error(e);process.exitCode=1});

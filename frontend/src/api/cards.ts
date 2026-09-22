@@ -29,6 +29,8 @@ export interface CardData {
     headers?: string
     params?: string
     response_field?: string
+    idempotency_header?: string
+    query_url?: string
   }
   text_content?: string
   data_content?: string

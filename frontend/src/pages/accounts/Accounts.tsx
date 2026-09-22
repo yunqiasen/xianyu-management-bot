@@ -1,8 +1,12 @@
+import { VerificationPointerSurface } from './VerificationPointerSurface'
+import { renewalToast, type RenewalCounts } from './renewalResult'
+import { startAccountVerification, controlAccountVerification, finishAccountVerification, cancelAccountVerification, statusAccountVerification, screenshotAccountVerification } from '@/api/account-runtime'
+import AISettingsPanel from './AISettingsPanel'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Plus, RefreshCw, QrCode, Key, Edit2, Trash2, Power, PowerOff, X, Loader2, Clock, CheckCircle, MessageSquare, Bot, Globe, Timer, ScanFace, ChevronLeft, ChevronRight, ChevronDown, ImagePlus, Filter, Repeat, MoreHorizontal, PackageCheck, Star, ShieldCheck, Flower2, Eye, EyeOff, Ban, Download, Upload, Send, Ticket, AlertCircle, Truck } from 'lucide-react'
-import { getAccountDetailsPaginated, deleteAccount, updateAccountCookie, updateAccountStatus, updateAccountsStatusBatch, closeAccountsNoticeBatch, clearTokenCacheBatch, updateAccountRemark, addAccount, generateQRLogin, checkQRLoginStatus, passwordLogin, checkPasswordLoginStatus, cancelPasswordLogin, updateAccountAutoConfirm, updateAccountPauseDuration, updateAccountMessageExpireTime, updateAccountReplyDelay, updateAccountLoginInfo, updateAccountScheduledRedelivery, updateAccountScheduledRate, updateAccountAutoPolish, updateAccountConfirmBeforeSend, updateAccountSendBeforeConfirm, updateAccountOnlySendCard, updateAccountAutoRedFlower, updateAccountAiReplyBlockOrderedUsers, getAIReplySettings, updateAIReplySettings, testAIConnection, fetchAIModels, AI_PROVIDER_OPTIONS, AI_PROVIDER_DEFAULT_BASE_URLS, getProxyConfig, updateProxyConfig, getFaceVerificationScreenshot, deleteFaceVerificationScreenshot, getConfirmReceiptMessage, updateConfirmReceiptMessage, uploadConfirmReceiptImage, exportAccountsExcel, importAccountsExcel, type AIProviderType, type AIModelOption, type ProxyConfig, type FaceVerificationScreenshot, type AccountFilterParams } from '@/api/accounts'
+import { Plus, RefreshCw, QrCode, Key, Edit2, Trash2, Power, PowerOff, X, Loader2, Clock, CheckCircle, MessageSquare, Bot, Globe, Timer, ScanFace, ChevronLeft, ChevronRight, ImagePlus, Filter, Repeat, MoreHorizontal, PackageCheck, Star, ShieldCheck, Flower2, Eye, EyeOff, Ban, Download, Upload, Send, Ticket, AlertCircle, Truck } from 'lucide-react'
+import { getAccountDetailsPaginated, deleteAccount, updateAccountCookie, updateAccountStatus, updateAccountsStatusBatch, closeAccountsNoticeBatch, clearTokenCacheBatch, updateAccountRemark, addAccount, generateQRLogin, checkQRLoginStatus, passwordLogin, checkPasswordLoginStatus, cancelPasswordLogin, updateAccountAutoConfirm, updateAccountPauseDuration, updateAccountMessageExpireTime, updateAccountReplyDelay, updateAccountLoginInfo, updateAccountScheduledRedelivery, updateAccountScheduledRate, updateAccountAutoPolish, updateAccountConfirmBeforeSend, updateAccountSendBeforeConfirm, updateAccountOnlySendCard, updateAccountAutoRedFlower, updateAccountAiReplyBlockOrderedUsers, getAIReplySettings, updateAIReplySettings, getProxyConfig, updateProxyConfig, getFaceVerificationScreenshot, deleteFaceVerificationScreenshot, getConfirmReceiptMessage, updateConfirmReceiptMessage, uploadConfirmReceiptImage, exportAccountsExcel, importAccountsExcel, type AIProviderType, type ProxyConfig, type FaceVerificationScreenshot, type AccountFilterParams } from '@/api/accounts'
 import { getDefaultReply, updateDefaultReply, uploadDefaultReplyImage } from '@/api/keywords'
 import { getAutoRateConfig, updateAutoRateConfig } from '@/api/autoRate'
 import { checkAdminDefaultPassword } from '@/api/auth'
@@ -17,6 +21,8 @@ import { getUserSetting } from '@/api/settings'
 import { DeliveryBlockRulesModal } from './DeliveryBlockRulesModal'
 import { RefundCancelModal } from './RefundCancelModal'
 import { AgreeDeliverModal } from './AgreeDeliverModal'
+import { AccountRuntimePanel } from './AccountRuntimePanel'
+import { previewAccountDeletion } from '@/api/account-runtime'
 import type { AccountDetail } from '@/types'
 
 type ModalType = 'qrcode' | 'password' | 'manual' | 'edit' | 'default-reply' | 'ai-settings' | 'proxy-settings' | 'message-expire-time' | 'reply-delay' | 'face-verification' | 'confirm-receipt' | 'auto-rate' | 'delivery-disabled' | 'refund-cancel' | 'agree-deliver' | null
@@ -89,6 +95,47 @@ const getAIConfigMissingItems = (config: AIConfigSnapshot): string[] => {
 const getAIConfigIncompleteMessage = (missingItems: string[]): string => (
   `AI配置未填写完整，请先补全：${missingItems.join('、')}`
 )
+
+function AccountVerification({ sessionId, onClose }: { sessionId: string; onClose: () => void }) {
+  const [image, setImage] = useState('')
+  const [text, setText] = useState('')
+  const [message, setMessage] = useState('查看同一浏览器完成验证，最长15分钟。')
+  const [busy, setBusy] = useState(false)
+  const [ended, setEnded] = useState(false)
+  const imageRef = useRef('')
+  const refresh = useCallback(async () => {
+    const state = await statusAccountVerification(sessionId)
+    if (['expired', 'cancelled', 'superseded', 'invalid', 'verified'].includes(state.status)) {
+      setEnded(true); setImage(''); setMessage(`会话已结束：${state.status}`); return
+    }
+    const blob = await screenshotAccountVerification(sessionId)
+    if (imageRef.current) URL.revokeObjectURL(imageRef.current)
+    imageRef.current = URL.createObjectURL(blob); setImage(imageRef.current)
+  }, [sessionId])
+  useEffect(() => {
+    let active = true
+    const tick = async () => { try { if (active) await refresh() } catch (e) { if (active) setMessage(getApiErrorMessage(e, '读取验证页面失败')) } }
+    void tick(); const timer = setInterval(() => { void tick() }, 3000)
+    return () => { active = false; clearInterval(timer); if (imageRef.current) URL.revokeObjectURL(imageRef.current) }
+  }, [refresh])
+  const action = async (call: () => Promise<unknown>) => {
+    setBusy(true)
+    try { await call(); await refresh() } catch (e) { setMessage(getApiErrorMessage(e, '操作失败')) }
+    finally { setBusy(false) }
+  }
+  return <div className="modal-overlay"><div className="modal-content max-w-3xl p-4 space-y-3" role="dialog" aria-label="账号人工验证">
+    <h2 className="font-semibold">账号人工验证</h2><p role="status" className="text-sm">{message}</p>
+    {image && <VerificationPointerSurface src={image} disabled={busy || ended}
+      onCommand={command => { void action(() => controlAccountVerification(sessionId, command)) }} />}
+    <fieldset disabled={busy || ended} className="flex flex-wrap gap-2">
+      <input aria-label="浏览器输入" value={text} onChange={e => setText(e.target.value)} className="input-ios" maxLength={2048} />
+      <button className="btn-ios-secondary" onClick={() => { void action(() => controlAccountVerification(sessionId, { action: 'text', text })); setText('') }}>输入</button>
+      <button className="btn-ios-secondary" onClick={() => { void action(() => controlAccountVerification(sessionId, { action: 'key', key: 'Enter' })) }}>回车</button>
+      <button className="btn-ios-primary" onClick={() => { void action(async () => { const result = await finishAccountVerification(sessionId); setMessage(result.success ? '凭据已复验保存，等待连接确认' : '结果已过期') }) }}>验证完成并复验</button>
+    </fieldset>
+    <button disabled={busy} className="btn-ios-secondary" onClick={() => { if (ended) onClose(); else void action(async () => { await cancelAccountVerification(sessionId); onClose() }) }}>取消并关闭</button>
+  </div></div>
+}
 
 export function Accounts() {
   const { addToast } = useUIStore()
@@ -193,31 +240,8 @@ export function Accounts() {
   const [editSaving, setEditSaving] = useState(false)
 
   // AI设置状态
+  const [verificationSession, setVerificationSession] = useState('')
   const [aiSettingsAccount, setAiSettingsAccount] = useState<AccountWithKeywordCount | null>(null)
-  const [aiEnabled, setAiEnabled] = useState(false)
-  const [aiProviderType, setAiProviderType] = useState<AIProviderType>('openai_compatible')
-  const [aiApiUrl, setAiApiUrl] = useState('')
-  const [aiApiKey, setAiApiKey] = useState('')
-  const [aiModelName, setAiModelName] = useState('')
-  const [aiMaxDiscountPercent, setAiMaxDiscountPercent] = useState(10)
-  const [aiMaxDiscountAmount, setAiMaxDiscountAmount] = useState(100)
-  const [aiMaxBargainRounds, setAiMaxBargainRounds] = useState(3)
-  const [aiCustomPrompts, setAiCustomPrompts] = useState('')
-  const [aiTimeRangeStart, setAiTimeRangeStart] = useState('')
-  const [aiTimeRangeEnd, setAiTimeRangeEnd] = useState('')
-  const [aiManualReplyPauseEnabled, setAiManualReplyPauseEnabled] = useState(false)
-  const [aiManualReplyPauseMinutes, setAiManualReplyPauseMinutes] = useState(10)
-  const [aiSettingsSaving, setAiSettingsSaving] = useState(false)
-  const [aiSettingsLoading, setAiSettingsLoading] = useState(false)
-  const [aiTesting, setAiTesting] = useState(false)
-  const [aiModelOptions, setAiModelOptions] = useState<AIModelOption[]>([])
-  const [aiModelsLoading, setAiModelsLoading] = useState(false)
-  const [showAiModelDropdown, setShowAiModelDropdown] = useState(false)
-  // 是否按当前输入过滤模型列表：用户主动键入时为 true，点击展开按钮时为 false（显示全部）
-  const [aiModelFilterByInput, setAiModelFilterByInput] = useState(false)
-  // API Key 显示/隐藏切换
-  const [showAiApiKey, setShowAiApiKey] = useState(false)
-
   // 代理设置状态
   const [proxySettingsAccount, setProxySettingsAccount] = useState<AccountWithKeywordCount | null>(null)
   const [proxyType, setProxyType] = useState<'none' | 'http' | 'https' | 'socks5'>('none')
@@ -518,10 +542,6 @@ export function Accounts() {
     setManualCookie('')
     setManualLoading(false)
     setEditPasswordVisible(false)
-    setAiTimeRangeStart('')
-    setAiTimeRangeEnd('')
-    setAiManualReplyPauseEnabled(false)
-    setAiManualReplyPauseMinutes(10)
   }, [activeModal, cancelPwdSession, clearPwdCheck, clearPwdSuccessCloseTimer, clearQrCheck, pwdSessionId, pwdStatus])
 
   // ==================== 管理员默认密码检查 ====================
@@ -687,6 +707,7 @@ export function Accounts() {
             break
           case 'verification_required':
             setPwdStatus('verification_required')
+            if (result.verification_session) setVerificationSession(sessionId)
             clearPwdSuccessCloseTimer()
             // 协议登录：人脸二维码；浏览器兜底路：截图/验证链接（保持兼容）
             if (result.face_qr_url) setPwdFaceQrUrl(result.face_qr_url)
@@ -811,7 +832,7 @@ export function Accounts() {
       })
       // 后端返回 {msg: 'success'} 或 {success: true}
       if (result.success || result.msg === 'success') {
-        addToast({ type: 'success', message: '账号添加成功' })
+        addToast({ type: 'success', message: result.message || '账号已创建，凭据检查已提交' })
         closeModal()
         loadAccounts()
       } else {
@@ -950,14 +971,7 @@ export function Accounts() {
       const { renewAccountLoginBatch } = await import('@/api/accounts')
       const result = await renewAccountLoginBatch(selectedAccountIds)
       if (result.success) {
-        const data = result.data as { success_count?: number; failed_count?: number; results?: Array<{ account_name?: string; success: boolean; message: string }> } | undefined
-        const failedCount = data?.failed_count || 0
-        if (failedCount > 0) {
-          const failedMessages = (data?.results || []).filter(r => !r.success).map(r => `${r.account_name || '未知'}: ${r.message}`).join('；')
-          addToast({ type: 'warning', message: `${result.message}${failedMessages ? '。' + failedMessages : ''}` })
-        } else {
-          addToast({ type: 'success', message: result.message || '批量账号续期成功' })
-        }
+        addToast(renewalToast(result.data as RenewalCounts | undefined))
       } else {
         addToast({ type: 'error', message: result.message || '批量账号续期失败' })
       }
@@ -1060,6 +1074,11 @@ export function Accounts() {
   const handleDelete = async (id: string) => {
     setDeleting(true)
     try {
+      const preview = await previewAccountDeletion(id)
+      if (!preview.success || !preview.data?.can_delete) {
+        addToast({ type: 'error', message: `账号保留：订单 ${preview.data?.unfinished_orders ?? '-'}，履约 ${preview.data?.unfinished_deliveries ?? '-'}，待核实消息 ${preview.data?.pending_replies ?? '-'}，在途操作 ${preview.data?.pending_operations ?? '-'}，凭据任务 ${preview.data?.active_jobs ?? '-'}` })
+        return
+      }
       await deleteAccount(id)
       addToast({ type: 'success', message: '删除成功' })
       setDeleteAccountConfirm({ open: false, id: null })
@@ -1426,203 +1445,9 @@ export function Accounts() {
     }
   }
 
-  // ==================== AI设置管理 ====================
-  const openAISettings = async (account: AccountWithKeywordCount) => {
+  const openAISettings = (account: AccountWithKeywordCount) => {
     setAiSettingsAccount(account)
     setActiveModal('ai-settings')
-    setAiSettingsLoading(true)
-    setAiModelOptions([])
-    try {
-      const settings = await getAIReplySettings(account.id)
-      const providerType = (settings.provider_type as AIProviderType) || 'openai_compatible'
-      setAiProviderType(providerType)
-      setAiEnabled(settings.ai_enabled ?? settings.enabled ?? false)
-      setAiApiUrl(settings.base_url ?? AI_PROVIDER_DEFAULT_BASE_URLS[providerType])
-      setAiApiKey(settings.api_key ?? '')
-      setAiModelName(settings.model_name ?? 'qwen-plus')
-      setAiMaxDiscountPercent(settings.max_discount_percent ?? 10)
-      setAiMaxDiscountAmount(settings.max_discount_amount ?? 100)
-      setAiMaxBargainRounds(settings.max_bargain_rounds ?? 3)
-      setAiCustomPrompts(settings.custom_prompts ?? '')
-      const formatTime = (t: string | undefined | null) => {
-        if (!t) return ''
-        const parts = t.split(':')
-        return parts.length >= 2 ? `${parts[0].padStart(2, '0')}:${parts[1].padStart(2, '0')}` : t
-      }
-      setAiTimeRangeStart(formatTime(settings.ai_time_range_start))
-      setAiTimeRangeEnd(formatTime(settings.ai_time_range_end))
-      setAiManualReplyPauseEnabled(settings.manual_reply_ai_pause_enabled ?? false)
-      setAiManualReplyPauseMinutes(settings.manual_reply_ai_pause_minutes ?? 10)
-    } catch (error) {
-      const detail = getApiErrorMessage(error, '加载AI设置失败')
-      addToast({ type: 'error', message: detail })
-    } finally {
-      setAiSettingsLoading(false)
-    }
-  }
-
-  // 切换AI服务商类型时，自动联动默认API地址（如果当前地址为空或仍是其他服务商默认地址）
-  const handleAIProviderChange = (next: AIProviderType) => {
-    setAiProviderType(next)
-    setAiModelOptions([])
-    const isPreviousDefault = !aiApiUrl
-      || Object.values(AI_PROVIDER_DEFAULT_BASE_URLS).includes(aiApiUrl)
-    if (isPreviousDefault) {
-      setAiApiUrl(AI_PROVIDER_DEFAULT_BASE_URLS[next])
-    }
-  }
-
-  const getCurrentAIConfigMissingItems = () => getAIConfigMissingItems({
-    provider_type: aiProviderType,
-    base_url: aiApiUrl,
-    api_key: aiApiKey,
-    model_name: aiModelName,
-  })
-
-  const handleToggleAIEnabledInModal = () => {
-    if (aiEnabled) {
-      setAiEnabled(false)
-      return
-    }
-    const missingItems = getCurrentAIConfigMissingItems()
-    if (missingItems.length > 0) {
-      addToast({ type: 'warning', message: getAIConfigIncompleteMessage(missingItems) })
-      return
-    }
-    setAiEnabled(true)
-  }
-
-  // 手动获取模型列表
-  const handleFetchAIModels = async () => {
-    if (!aiApiKey) {
-      addToast({ type: 'warning', message: '请先填写API Key' })
-      return
-    }
-    if (aiProviderType === 'dashscope_app') {
-      addToast({ type: 'warning', message: 'DashScope应用API不支持自动获取模型列表，请手动填写模型名称' })
-      return
-    }
-    try {
-      setAiModelsLoading(true)
-      const result = await fetchAIModels({
-        provider_type: aiProviderType,
-        base_url: aiApiUrl || AI_PROVIDER_DEFAULT_BASE_URLS[aiProviderType],
-        api_key: aiApiKey,
-      })
-      const models = result.data?.models ?? []
-      // 不论成功失败，都按返回结果设置（失败时为空数组，前端自动回退为普通文本框输入）
-      setAiModelOptions(models)
-      setShowAiModelDropdown(false)
-      if (result.success && models.length > 0) {
-        addToast({ type: 'success', message: result.message || `获取到 ${models.length} 个模型` })
-        if (!models.some(m => m.id === aiModelName)) {
-          setAiModelName(models[0].id)
-        }
-      } else {
-        // 失败或空列表：提示用户改用手动输入
-        addToast({
-          type: 'warning',
-          message: result.message || '未获取到模型列表，请直接在文本框输入模型名称',
-        })
-      }
-    } catch (error) {
-      // 异常时同样清空选项，让 UI 回到文本框输入模式
-      setAiModelOptions([])
-      setShowAiModelDropdown(false)
-      const detail = getApiErrorMessage(error, '获取模型列表失败，请直接在文本框输入模型名称')
-      addToast({ type: 'error', message: detail })
-    } finally {
-      setAiModelsLoading(false)
-    }
-  }
-
-  const handleSaveAISettings = async () => {
-    if (!aiSettingsAccount) return
-    if (aiEnabled) {
-      const missingItems = getCurrentAIConfigMissingItems()
-      if (missingItems.length > 0) {
-        addToast({ type: 'warning', message: getAIConfigIncompleteMessage(missingItems) })
-        return
-      }
-    }
-    try {
-      setAiSettingsSaving(true)
-      const result = await updateAIReplySettings(aiSettingsAccount.id, {
-        ai_enabled: aiEnabled,
-        provider_type: aiProviderType,
-        base_url: aiApiUrl,
-        api_key: aiApiKey,
-        model_name: aiModelName,
-        max_discount_percent: aiMaxDiscountPercent,
-        max_discount_amount: aiMaxDiscountAmount,
-        max_bargain_rounds: aiMaxBargainRounds,
-        custom_prompts: aiCustomPrompts,
-        ai_time_range_start: aiTimeRangeStart,
-        ai_time_range_end: aiTimeRangeEnd,
-        manual_reply_ai_pause_enabled: aiManualReplyPauseEnabled,
-        manual_reply_ai_pause_minutes: aiManualReplyPauseMinutes,
-      })
-      if (!result.success) {
-        addToast({ type: 'warning', message: result.message || 'AI配置未填写完整，无法开启AI回复' })
-        return
-      }
-      // 更新本地状态
-      setAccounts(prev => prev.map(a =>
-        a.id === aiSettingsAccount.id ? { ...a, aiEnabled } : a,
-      ))
-      addToast({ type: 'success', message: 'AI设置已保存' })
-      closeModal()
-      await loadAccounts()
-    } catch (error) {
-      const detail = getApiErrorMessage(error, '保存失败')
-      addToast({ type: 'error', message: detail })
-    } finally {
-      setAiSettingsSaving(false)
-    }
-  }
-
-  // 测试AI连接
-  const handleTestAI = async () => {
-    if (!aiSettingsAccount) return
-    const missingItems = getCurrentAIConfigMissingItems()
-    if (missingItems.length > 0) {
-      addToast({ type: 'warning', message: getAIConfigIncompleteMessage(missingItems) })
-      return
-    }
-    // 先保存设置再测试
-    try {
-      setAiTesting(true)
-      const saveResult = await updateAIReplySettings(aiSettingsAccount.id, {
-        ai_enabled: aiEnabled,
-        provider_type: aiProviderType,
-        base_url: aiApiUrl,
-        api_key: aiApiKey,
-        model_name: aiModelName,
-        max_discount_percent: aiMaxDiscountPercent,
-        max_discount_amount: aiMaxDiscountAmount,
-        max_bargain_rounds: aiMaxBargainRounds,
-        custom_prompts: aiCustomPrompts,
-        ai_time_range_start: aiTimeRangeStart,
-        ai_time_range_end: aiTimeRangeEnd,
-        manual_reply_ai_pause_enabled: aiManualReplyPauseEnabled,
-        manual_reply_ai_pause_minutes: aiManualReplyPauseMinutes,
-      })
-      if (!saveResult.success) {
-        addToast({ type: 'warning', message: saveResult.message || 'AI配置未填写完整，无法测试AI连接' })
-        return
-      }
-      const result = await testAIConnection(aiSettingsAccount.id)
-      if (result.success) {
-        addToast({ type: 'success', message: result.message || 'AI连接测试成功' })
-      } else {
-        addToast({ type: 'error', message: result.message || 'AI连接测试失败' })
-      }
-    } catch (error) {
-      const detail = getApiErrorMessage(error, 'AI连接测试失败')
-      addToast({ type: 'error', message: detail })
-    } finally {
-      setAiTesting(false)
-    }
   }
 
   // ==================== 代理设置管理 ====================
@@ -2436,6 +2261,7 @@ export function Accounts() {
                     </td>
                     <td className="font-medium text-blue-600 dark:text-blue-400">
                       {account.note ? `${account.id} (${account.note})` : account.id}
+                      <AccountRuntimePanel accountId={account.id} />
                     </td>
                     {isAdmin && (
                       <td className="text-sm text-slate-600 dark:text-slate-400 whitespace-nowrap">
@@ -2715,6 +2541,11 @@ export function Accounts() {
                 if (!account) return null
                 return (
                   <>
+                    <button className="w-full px-4 py-2 text-left text-sm hover:bg-slate-100" onClick={async () => {
+                      setMoreMenuAccountId(null)
+                      try { const result = await startAccountVerification(account.id); setVerificationSession(result.session_id) }
+                      catch (e) { addToast({ type: 'error', message: getApiErrorMessage(e, '启动验证失败') }) }
+                    }}>人工验证（查看 / 操作）</button>
                     <button
                       onClick={() => { openAISettings(account); setMoreMenuAccountId(null) }}
                       className="w-full flex items-center gap-2 px-3 py-2 text-xs hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors"
@@ -3532,459 +3363,15 @@ export function Accounts() {
         </div>
       )}
 
-      {/* AI设置弹窗 */}
+      {verificationSession && <AccountVerification sessionId={verificationSession} onClose={() => { setVerificationSession(''); void loadAccounts() }} />}
+
+      {/* AI设置只由统一版本化编辑器保存 */}
       {activeModal === 'ai-settings' && aiSettingsAccount && (
-        <div className="modal-overlay">
-          <div className="modal-content max-w-lg">
-            <div className="modal-header">
-              <h2 className="modal-title">AI回复设置</h2>
-              <button onClick={closeModal} className="modal-close">
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-            <div className="modal-body space-y-4">
-              {aiSettingsLoading ? (
-                <div className="flex items-center justify-center py-8">
-                  <Loader2 className="w-6 h-6 animate-spin text-blue-500" />
-                </div>
-              ) : (
-                <>
-                  <div className="input-group">
-                    <label className="input-label">账号</label>
-                    <input
-                      type="text"
-                      value={aiSettingsAccount.id}
-                      disabled
-                      className="input-ios bg-slate-100 dark:bg-slate-700"
-                    />
-                  </div>
-
-                  {/* AI开关 */}
-                  <div className="flex items-center justify-between py-3 border-b border-slate-100 dark:border-slate-700">
-                    <div>
-                      <p className="font-medium text-slate-900 dark:text-slate-100">启用AI回复</p>
-                      <p className="text-xs text-slate-500 dark:text-slate-400">开启后将使用AI自动回复消息</p>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={handleToggleAIEnabledInModal}
-                      className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                        aiEnabled ? 'bg-blue-600' : 'bg-slate-300 dark:bg-slate-600'
-                      }`}
-                    >
-                      <span
-                        className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                          aiEnabled ? 'translate-x-6' : 'translate-x-1'
-                        }`}
-                      />
-                    </button>
-                  </div>
-
-                  {/* 启用时间段选择 */}
-                  {aiEnabled && (
-                    <div className="bg-slate-50 dark:bg-slate-800/40 rounded-xl p-3.5 border border-slate-100 dark:border-slate-800 space-y-3 transition-all duration-300">
-                      <div className="flex items-center justify-between">
-                        <label className="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider">启用时间范围</label>
-                        {(aiTimeRangeStart || aiTimeRangeEnd) && (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setAiTimeRangeStart('')
-                              setAiTimeRangeEnd('')
-                            }}
-                            className="text-xs text-rose-500 hover:text-rose-600 dark:text-rose-400 dark:hover:text-rose-300 font-medium transition-colors"
-                          >
-                            重置为全天
-                          </button>
-                        )}
-                      </div>
-                      <div className="flex items-center gap-3">
-                        <div className="flex-1 relative">
-                          <input
-                            type="time"
-                            value={aiTimeRangeStart}
-                            onChange={(e) => setAiTimeRangeStart(e.target.value)}
-                            className="input-ios w-full pl-3 pr-10 text-sm font-medium"
-                          />
-                          <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[10px] font-bold text-slate-400 dark:text-slate-500 pointer-events-none uppercase">
-                            开始
-                          </span>
-                        </div>
-                        <span className="text-slate-400 dark:text-slate-600 text-xs font-medium">至</span>
-                        <div className="flex-1 relative">
-                          <input
-                            type="time"
-                            value={aiTimeRangeEnd}
-                            onChange={(e) => setAiTimeRangeEnd(e.target.value)}
-                            className="input-ios w-full pl-3 pr-10 text-sm font-medium"
-                          />
-                          <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[10px] font-bold text-slate-400 dark:text-slate-500 pointer-events-none uppercase">
-                            结束
-                          </span>
-                        </div>
-                      </div>
-                      <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
-                        {aiTimeRangeStart && aiTimeRangeEnd ? (
-                          <span>
-                            当前配置：每天 <strong className="text-blue-600 dark:text-blue-400">{aiTimeRangeStart}</strong> 到 <strong className="text-blue-600 dark:text-blue-400">{aiTimeRangeEnd}</strong>
-                            {aiTimeRangeStart > aiTimeRangeEnd ? <span className="text-amber-500 dark:text-amber-400 font-medium">（跨天至次日）</span> : ''} 启用AI自动回复。其余时间将使用普通规则回复。
-                          </span>
-                        ) : (
-                          <span className="text-slate-400 dark:text-slate-500">
-                            未设置时间范围，默认全天 24 小时启用AI自动回复。
-                          </span>
-                        )}
-                      </p>
-                    </div>
-                  )}
-
-                  {aiEnabled && (
-                    <div className="bg-slate-50 dark:bg-slate-800/40 rounded-xl p-3.5 border border-slate-100 dark:border-slate-800 space-y-3">
-                      <div className="flex items-center justify-between gap-4">
-                        <div>
-                          <p className="text-sm font-medium text-slate-900 dark:text-slate-100">人工回复后暂停 AI</p>
-                          <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">仅暂停相同商品 ID 和买家 ID 的 AI 回复，关键词和默认回复仍正常执行。</p>
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => setAiManualReplyPauseEnabled(value => !value)}
-                          className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ${
-                            aiManualReplyPauseEnabled ? 'bg-blue-600' : 'bg-slate-300 dark:bg-slate-600'
-                          }`}
-                          aria-label="切换人工回复后暂停 AI"
-                        >
-                          <span
-                            className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                              aiManualReplyPauseEnabled ? 'translate-x-6' : 'translate-x-1'
-                            }`}
-                          />
-                        </button>
-                      </div>
-                      {aiManualReplyPauseEnabled && (
-                        <div className="flex items-center gap-3">
-                          <label className="input-label mb-0 shrink-0">暂停时长</label>
-                          <input
-                            type="number"
-                            value={aiManualReplyPauseMinutes}
-                            onChange={(e) => setAiManualReplyPauseMinutes(Number(e.target.value))}
-                            className="input-ios w-28"
-                            min="1"
-                            max="1440"
-                          />
-                          <span className="text-sm text-slate-500 dark:text-slate-400">分钟（1–1440）</span>
-                        </div>
-                      )}
-                    </div>
-                  )}
-
-                  {/* API配置 */}
-                  <div className="border-t border-slate-200 dark:border-slate-700 pt-4">
-                    <h3 className="text-sm font-medium text-slate-700 dark:text-slate-300 mb-3 flex items-center gap-2">
-                      <Bot className="w-4 h-4" />
-                      API配置
-                    </h3>
-                    <div className="space-y-3">
-                      <div className="input-group">
-                        <label className="input-label">服务商类型</label>
-                        <select
-                          value={aiProviderType}
-                          onChange={(e) => handleAIProviderChange(e.target.value as AIProviderType)}
-                          className="input-ios"
-                        >
-                          {AI_PROVIDER_OPTIONS.map(opt => (
-                            <option key={opt.value} value={opt.value}>{opt.label}</option>
-                          ))}
-                        </select>
-                        <p className="text-xs text-slate-400 mt-1">
-                          {AI_PROVIDER_OPTIONS.find(opt => opt.value === aiProviderType)?.description}
-                        </p>
-                      </div>
-                      <div className="input-group">
-                        <label className="input-label">API地址</label>
-                        <input
-                          type="text"
-                          value={aiApiUrl}
-                          onChange={(e) => setAiApiUrl(e.target.value)}
-                          className="input-ios"
-                          placeholder={AI_PROVIDER_DEFAULT_BASE_URLS[aiProviderType]}
-                        />
-                        <p className="text-xs text-slate-400 mt-1">
-                          {aiProviderType === 'openai_compatible' && '无需补全 /chat/completions'}
-                          {aiProviderType === 'anthropic' && '无需补全 /v1/messages'}
-                          {aiProviderType === 'gemini' && '无需补全 /v1beta/models'}
-                          {aiProviderType === 'dashscope_app' && '请填入完整的 .../apps/{app_id}/completion 地址'}
-                        </p>
-                        <p className="text-xs text-red-500 dark:text-red-400 mt-1">
-                          推荐AI：{' '}
-                          <a
-                            href="https://api.momentsofus.cn/sign-up?aff=dAM9"
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="underline hover:text-red-600 dark:hover:text-red-300"
-                          >
-                            https://api.momentsofus.cn/sign-up?aff=dAM9
-                          </a>
-                        </p>
-                      </div>
-                      <div className="input-group">
-                        <label className="input-label">API Key</label>
-                        <div className="relative">
-                          <input
-                            type={showAiApiKey ? 'text' : 'password'}
-                            value={aiApiKey}
-                            onChange={(e) => setAiApiKey(e.target.value)}
-                            className="input-ios pr-9"
-                            placeholder="sk-..."
-                          />
-                          <button
-                            type="button"
-                            onClick={() => setShowAiApiKey(v => !v)}
-                            className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
-                            aria-label={showAiApiKey ? '隐藏API Key' : '显示API Key'}
-                          >
-                            {showAiApiKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                          </button>
-                        </div>
-                      </div>
-                      <div className="input-group">
-                        {/* 注意：label 不能包裹 button，否则点击 label 任意位置都会触发内部 button 的 click 事件。改用 div 容器隔离 */}
-                        <div className="input-label flex items-center justify-between">
-                          <span>模型名称</span>
-                          <button
-                            type="button"
-                            onClick={handleFetchAIModels}
-                            disabled={aiModelsLoading || aiProviderType === 'dashscope_app'}
-                            className="text-xs text-blue-500 hover:text-blue-600 disabled:text-slate-400 disabled:cursor-not-allowed flex items-center gap-1"
-                          >
-                            {aiModelsLoading ? (
-                              <>
-                                <Loader2 className="w-3 h-3 animate-spin" />
-                                获取中...
-                              </>
-                            ) : (
-                              <>
-                                <RefreshCw className="w-3 h-3" />
-                                获取模型列表
-                              </>
-                            )}
-                          </button>
-                        </div>
-                        <div className="relative">
-                          <input
-                            type="text"
-                            value={aiModelName}
-                            onChange={(e) => {
-                              setAiModelName(e.target.value)
-                              setAiModelFilterByInput(true)
-                              if (aiModelOptions.length > 0) setShowAiModelDropdown(true)
-                            }}
-                            onFocus={() => {
-                              if (aiModelOptions.length > 0) setShowAiModelDropdown(true)
-                            }}
-                            onBlur={() => { window.setTimeout(() => setShowAiModelDropdown(false), 150) }}
-                            className="input-ios pr-9"
-                            placeholder="qwen-plus"
-                          />
-                          {aiModelOptions.length > 0 && (
-                            <button
-                              type="button"
-                              onMouseDown={(e) => {
-                                e.preventDefault()
-                                setAiModelFilterByInput(false)
-                                setShowAiModelDropdown(v => !v)
-                              }}
-                              className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
-                              aria-label="展开模型列表"
-                            >
-                              <ChevronDown className={`w-4 h-4 transition-transform ${showAiModelDropdown ? 'rotate-180' : ''}`} />
-                            </button>
-                          )}
-                          {showAiModelDropdown && aiModelOptions.length > 0 && (() => {
-                            const q = aiModelName.trim().toLowerCase()
-                            const filtered = aiModelFilterByInput && q
-                              ? aiModelOptions.filter(m =>
-                                  m.id.toLowerCase().includes(q) ||
-                                  (m.name || '').toLowerCase().includes(q)
-                                )
-                              : aiModelOptions
-                            return (
-                              <div className="absolute z-20 mt-1 w-full bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg shadow-lg max-h-60 overflow-auto">
-                                {filtered.length === 0 ? (
-                                  <div className="px-3 py-2 text-xs text-slate-400">无匹配模型，将按当前输入保存</div>
-                                ) : (
-                                  filtered.map(model => (
-                                    <div
-                                      key={model.id}
-                                      onMouseDown={(e) => {
-                                        e.preventDefault()
-                                        setAiModelName(model.id)
-                                        setAiModelFilterByInput(false)
-                                        setShowAiModelDropdown(false)
-                                      }}
-                                      className={`px-3 py-2 cursor-pointer text-sm hover:bg-slate-100 dark:hover:bg-slate-700 ${aiModelName === model.id ? 'bg-blue-50 dark:bg-blue-900/30' : ''}`}
-                                    >
-                                      <div className="font-mono text-slate-700 dark:text-slate-200">{model.id}</div>
-                                      {model.name && model.name !== model.id && (
-                                        <div className="text-xs text-slate-400 mt-0.5">{model.name}</div>
-                                      )}
-                                    </div>
-                                  ))
-                                )}
-                              </div>
-                            )
-                          })()}
-                        </div>
-                        <p className="text-xs text-slate-400 mt-1">
-                          {aiProviderType === 'dashscope_app'
-                            ? '阿里云百炼应用编排无需填写模型名'
-                            : aiModelOptions.length > 0
-                              ? `已加载 ${aiModelOptions.length} 个模型，可直接选择或继续手动输入`
-                              : '可手动输入或点击右侧按钮获取该服务商支持的模型列表'}
-                        </p>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={handleTestAI}
-                        disabled={aiTesting}
-                        className="btn-ios-primary w-full"
-                      >
-                        {aiTesting ? (
-                          <span className="flex items-center justify-center gap-2">
-                            <Loader2 className="w-4 h-4 animate-spin" />
-                            测试中...
-                          </span>
-                        ) : (
-                          '测试AI连接'
-                        )}
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* 议价设置 */}
-                  <div className="border-t border-slate-200 dark:border-slate-700 pt-4">
-                    <h3 className="text-sm font-medium text-slate-700 dark:text-slate-300 mb-3">议价设置</h3>
-                    <div className="grid grid-cols-3 gap-3">
-                      <div className="input-group">
-                        <label className="input-label text-xs">最大折扣(%)</label>
-                        <input
-                          type="number"
-                          value={aiMaxDiscountPercent}
-                          onChange={(e) => setAiMaxDiscountPercent(Number(e.target.value))}
-                          className="input-ios"
-                          min="0"
-                          max="100"
-                        />
-                      </div>
-                      <div className="input-group">
-                        <label className="input-label text-xs">最大减价(元)</label>
-                        <input
-                          type="number"
-                          value={aiMaxDiscountAmount}
-                          onChange={(e) => setAiMaxDiscountAmount(Number(e.target.value))}
-                          className="input-ios"
-                          min="0"
-                        />
-                      </div>
-                      <div className="input-group">
-                        <label className="input-label text-xs">最大议价轮数</label>
-                        <input
-                          type="number"
-                          value={aiMaxBargainRounds}
-                          onChange={(e) => setAiMaxBargainRounds(Number(e.target.value))}
-                          className="input-ios"
-                          min="1"
-                          max="10"
-                        />
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* 自定义提示词 */}
-                  <div className="input-group">
-                    <label className="input-label">自定义提示词 (JSON格式)</label>
-                    <textarea
-                      value={aiCustomPrompts}
-                      onChange={(e) => setAiCustomPrompts(e.target.value)}
-                      className="input-ios h-24 resize-none font-mono text-xs"
-                      placeholder='{"classify": "分类提示词", "price": "议价提示词", "tech": "技术提示词", "default": "默认提示词"}'
-                    />
-                    <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-                      留空使用系统默认提示词
-                    </p>
-                  </div>
-
-                  {/* 配置提示 */}
-                  <div className="bg-slate-50 dark:bg-slate-800/50 rounded-lg p-3 text-xs text-slate-500 dark:text-slate-400">
-                    {aiProviderType === 'openai_compatible' && (
-                      <>
-                        <p className="font-medium mb-1">OpenAI兼容服务示例:</p>
-                        <ul className="space-y-0.5 list-disc list-inside">
-                          <li><span className="text-blue-500">阿里云百炼(推荐)</span>: https://dashscope.aliyuncs.com/compatible-mode/v1</li>
-                          <li>阿里云模型: qwen-plus、qwen-turbo、qwen-max、qwen-long</li>
-                          <li>OpenAI: https://api.openai.com/v1</li>
-                          <li>DeepSeek: https://api.deepseek.com / Moonshot: https://api.moonshot.cn/v1</li>
-                          <li>国内中转: 使用服务商提供的API地址</li>
-                        </ul>
-                        <p className="mt-2 text-slate-400">
-                          阿里云百炼平台: <a href="https://bailian.console.aliyun.com/" target="_blank" rel="noopener noreferrer" className="text-blue-500 hover:underline">https://bailian.console.aliyun.com/</a>
-                        </p>
-                      </>
-                    )}
-                    {aiProviderType === 'anthropic' && (
-                      <>
-                        <p className="font-medium mb-1">Anthropic Claude 配置:</p>
-                        <ul className="space-y-0.5 list-disc list-inside">
-                          <li>API地址: https://api.anthropic.com</li>
-                          <li>常用模型: claude-3-5-sonnet-latest、claude-3-5-haiku-latest、claude-3-opus-latest</li>
-                          <li>API Key 从 console.anthropic.com 获取</li>
-                        </ul>
-                      </>
-                    )}
-                    {aiProviderType === 'gemini' && (
-                      <>
-                        <p className="font-medium mb-1">Google Gemini 配置:</p>
-                        <ul className="space-y-0.5 list-disc list-inside">
-                          <li>API地址: https://generativelanguage.googleapis.com</li>
-                          <li>常用模型: gemini-1.5-pro、gemini-1.5-flash、gemini-2.0-flash</li>
-                          <li>API Key 从 Google AI Studio 获取</li>
-                        </ul>
-                      </>
-                    )}
-                    {aiProviderType === 'dashscope_app' && (
-                      <>
-                        <p className="font-medium mb-1">阿里云百炼应用编排:</p>
-                        <ul className="space-y-0.5 list-disc list-inside">
-                          <li>API地址需包含 app_id，例如 https://dashscope.aliyuncs.com/api/v1/apps/&lt;app_id&gt;/completion</li>
-                          <li>无需填写模型名，由应用编排内部决定</li>
-                          <li>API Key 在 bailian.console.aliyun.com 中创建</li>
-                        </ul>
-                      </>
-                    )}
-                  </div>
-                </>
-              )}
-            </div>
-            <div className="modal-footer">
-              <button type="button" onClick={closeModal} className="btn-ios-secondary" disabled={aiSettingsSaving}>
-                取消
-              </button>
-              <button
-                onClick={handleSaveAISettings}
-                className="btn-ios-primary"
-                disabled={aiSettingsSaving || aiSettingsLoading}
-              >
-                {aiSettingsSaving ? (
-                  <span className="flex items-center gap-2">
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                    保存中...
-                  </span>
-                ) : (
-                  '保存'
-                )}
-              </button>
-            </div>
-          </div>
-        </div>
+        <div className="modal-overlay"><div className="modal-content max-w-3xl overflow-y-auto">
+          <AISettingsPanel key={aiSettingsAccount.id} accountId={aiSettingsAccount.id}
+            accounts={accounts.map(a => ({ id: a.id, label: a.remark || a.id }))}
+            onSaved={() => { void loadAccounts() }} onClose={closeModal} />
+        </div></div>
       )}
 
       {/* 代理设置弹窗 */}

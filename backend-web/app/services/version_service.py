@@ -30,46 +30,8 @@ _USER_AGENT = "XianyuAutoReply-WebUpdater"
 
 
 def get_current_version() -> str:
-    """
-    获取系统当前版本号
-
-    优先复用桌面启动器的版本号常量（launcher.version.CURRENT_VERSION），
-    以保证 Windows 桌面版与 Web 端版本号一致；若导入失败则尝试从
-    data/version.txt 读取，最后返回空字符串由调用方决定如何向用户提示。
-
-    Returns:
-        当前版本号字符串（如 "1.0.3"），失败时返回空字符串
-    """
-    # 方式1：尝试从 launcher 模块读取（开发模式或完整打包时可用）
-    try:
-        from launcher.version import CURRENT_VERSION  # type: ignore
-        version = str(CURRENT_VERSION or "").strip()
-        if version:
-            return version
-    except Exception:
-        pass
-
-    # 方式2：从 data/version.txt 文件读取（打包后独立运行时可用）
-    try:
-        version_file = Path.cwd() / "data" / "version.txt"
-        if version_file.exists():
-            version = version_file.read_text(encoding="utf-8").strip()
-            if version:
-                return version
-    except Exception as exc:
-        logger.warning(f"从 data/version.txt 读取版本号失败: {exc}")
-
-    # 方式3：从项目根目录的 version.txt 读取
-    try:
-        version_file = Path.cwd() / "version.txt"
-        if version_file.exists():
-            version = version_file.read_text(encoding="utf-8").strip()
-            if version:
-                return version
-    except Exception as exc:
-        logger.warning(f"从 version.txt 读取版本号失败: {exc}")
-
-    return ""
+    from common.runtime_version import build_identity
+    return build_identity()["version"]
 
 
 def _get_update_url() -> str:
@@ -133,76 +95,15 @@ def _compare_versions(local: str, remote: str) -> bool:
 
 
 async def check_update() -> dict[str, Any]:
-    """
-    检查是否有新版本可用
-
-    调用远程 ``{update_url}/version.json`` 获取最新版本信息，
-    与本地版本号比较后返回统一结构。网络错误、解析错误等情况
-    由调用方转换为 ApiResponse 的 success=False 返回给前端。
-
-    Returns:
-        字典：
-          - has_update: bool 是否有新版本
-          - current_version: str 当前版本号
-          - remote_version: str 远程版本号（失败时为空）
-          - description: str 更新说明
-          - filename: str 下载文件名
-          - download_url: str 完整下载地址
-          - error: str 错误信息（正常时为空）
-    """
-    current_version = get_current_version()
-    result: dict[str, Any] = {
+    """Fork releases are reviewed and built from source, never upstream binaries."""
+    from common.runtime_version import build_identity
+    identity = build_identity()
+    return {
         "has_update": False,
-        "current_version": current_version,
+        "current_version": identity["version"],
         "remote_version": "",
-        "description": "",
-        "filename": "",
-        "download_url": "",
-        "error": "",
+        "description": "增强版仅通过已审核源码发布；main 用于原版同步预览。",
+        "filename": "", "download_url": "", "error": "",
+        "repository": identity["repository"],
+        "commit": identity["commit"], "update_mode": "source_review",
     }
-
-    if not current_version:
-        result["error"] = "无法读取当前版本号"
-        return result
-
-    update_url = _get_update_url()
-    version_url = f"{update_url}/version.json"
-
-    try:
-        async with httpx.AsyncClient(timeout=_REMOTE_TIMEOUT_SECONDS) as client:
-            response = await client.get(
-                version_url,
-                headers={"User-Agent": _USER_AGENT},
-            )
-            response.raise_for_status()
-            data = response.json()
-    except httpx.TimeoutException:
-        result["error"] = "连接更新服务器超时，请稍后重试"
-        return result
-    except httpx.HTTPStatusError as exc:
-        result["error"] = f"更新服务器返回错误状态码: {exc.response.status_code}"
-        return result
-    except httpx.HTTPError as exc:
-        result["error"] = f"无法连接更新服务器: {exc}"
-        return result
-    except json.JSONDecodeError:
-        result["error"] = "更新服务器返回的数据格式无效"
-        return result
-    except Exception as exc:
-        logger.exception("检查更新失败")
-        result["error"] = f"检查更新失败: {exc}"
-        return result
-
-    remote_version = str(data.get("version", "") or "").strip()
-    if not remote_version:
-        result["error"] = "更新服务器未返回版本号"
-        return result
-
-    filename = str(data.get("filename", "") or "").strip()
-    result["remote_version"] = remote_version
-    result["description"] = str(data.get("description", "") or "").strip() or "无更新说明"
-    result["filename"] = filename
-    result["download_url"] = f"{update_url}/{filename}" if filename else ""
-    result["has_update"] = _compare_versions(current_version, remote_version)
-
-    return result

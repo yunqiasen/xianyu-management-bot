@@ -1,3 +1,13 @@
+## xianyu-management-bot 增强版
+
+本仓库是原版的GitHub fork。`main`只同步上游，`xianyu-management-bot-fork`承载GuDong能力适配、统一账号执行权/固定代理、六协议AI、可靠履约与迁移，以及可选议价/监控增强。下方保留原版README内容与署名。
+
+- [使用说明](docs/OPERATIONS.md) · [接口契约](docs/API.md) · [功能与测试覆盖](docs/COVERAGE.md)
+- [迁移及增量回退](docs/implementation/migration.md) · [发布门禁](docs/RELEASE.md) · [来源与许可证](docs/SOURCES.md)
+- 工程回归：`.venv/bin/python tools/verification/run.py --plan` 查看完整入口；实际运行需显式隔离依赖及仓库外证据目录。代码回归不代替真实账号试跑、正式部署与48小时观察。
+
+---
+
 # 闲鱼自动回复系统
 
 基于 FastAPI + React + MySQL + Redis + Playwright 的闲鱼多账号自动化系统。

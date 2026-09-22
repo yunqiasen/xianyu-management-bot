@@ -1,3 +1,4 @@
+import { LogArchive } from './LogArchive'
 import { useState, useEffect } from 'react'
 import { FileText, RefreshCw, Trash2, AlertCircle, AlertTriangle, Info } from 'lucide-react'
 import { getSystemLogs, clearSystemLogs, type SystemLog } from '@/api/admin'
@@ -21,6 +22,9 @@ export function Logs() {
   const [logs, setLogs] = useState<SystemLog[]>([])
   const [levelFilter, setLevelFilter] = useState('')
   const [limit, setLimit] = useState(100)
+  const [correlation, setCorrelation] = useState('')
+  const [service, setService] = useState('')
+  const [services, setServices] = useState<Record<string,string>>({})
 
   // 清空确认弹窗状态
   const [clearConfirm, setClearConfirm] = useState(false)
@@ -31,9 +35,10 @@ export function Logs() {
     if (!_hasHydrated || !isAuthenticated || !token) return
     try {
       setLoading(true)
-      const result = await getSystemLogs({ limit, level: levelFilter || undefined })
+      const result = await getSystemLogs({ limit, level: levelFilter || undefined, correlation_id: correlation || undefined, service: service || undefined })
       if (result.success) {
         setLogs(result.data || [])
+        setServices(result.services || {})
       }
     } catch {
       addToast({ type: 'error', message: '加载系统日志失败' })
@@ -95,6 +100,8 @@ export function Logs() {
 
   return (
     <div className="space-y-4">
+      <LogArchive />
+      <div className="vben-card p-4 space-y-2"><p className="text-sm">运行日志保留30天；待核实与防重关联记录继续保留。</p><div className="flex flex-wrap gap-2"><input className="input-ios max-w-xs" aria-label="关联ID" placeholder="关联ID" value={correlation} onChange={e=>setCorrelation(e.target.value)}/><select className="input-ios max-w-xs" aria-label="日志服务" value={service} onChange={e=>setService(e.target.value)}><option value="">全部服务</option>{['backend-web','websocket','scheduler'].map(x=><option key={x}>{x}</option>)}</select><button className="btn-ios-secondary" onClick={loadLogs}>筛选</button></div><p className="text-xs text-slate-500">{Object.entries(services).map(([k,v])=>`${k}：${v==='available'?'已挂载':v==='missing'?'未挂载':'读取失败'}`).join('；')}</p></div>
       {/* Header */}
       <div className="page-header flex-between flex-wrap gap-4">
         <div>

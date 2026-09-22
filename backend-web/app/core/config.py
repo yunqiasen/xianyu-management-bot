@@ -55,6 +55,8 @@ class BackendWebConfig(BaseConfig):
         alias="SCHEDULER_SERVICE_URL"
     )
     
+    admin_restore_database_url: str = Field(default="", alias="ADMIN_RESTORE_DATABASE_URL", repr=False)
+
     # 静态文件目录（共享）
     static_dir: str = Field(default="static", alias="STATIC_DIR")
     
@@ -70,7 +72,7 @@ class BackendWebConfig(BaseConfig):
     )
 
     # 启动时是否自动启动Goofish定时采集任务
-    auto_start_crawl_jobs: bool = Field(default=True, alias="AUTO_START_CRAWL_JOBS")
+    auto_start_crawl_jobs: bool = Field(default=False, alias="AUTO_START_CRAWL_JOBS")
 
     # 卡券对接（分销卡券）上游服务基址：用于「分销卡券」页面通过上游卡券系统提货
     # 默认指向生产环境上游服务，可通过环境变量 CARD_DOCK_BASE_URL 覆盖（禁止写死 localhost）

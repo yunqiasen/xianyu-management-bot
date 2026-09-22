@@ -260,8 +260,8 @@ class DatabaseInitializer:
         ),
         (
             "log.retention_days",
-            "7",
-            "日志保留天数（所有模块生效，修改后重启服务生效）",
+            "30",
+            "日志在线保留天数（所有模块同步，更早记录归档）",
         ),
         (
             "password_login.mode",
@@ -2199,6 +2199,10 @@ class DatabaseInitializer:
                     # 自动续售表和发布日志关联字段独立幂等迁移，避免依赖旧版本 DDL 顺序。
                     async with ddl_connection() as conn:
                         await ensure_auto_relist_schema(conn, get_beijing_now_naive())
+
+                    from common.db.fork_schema import upgrade_fork_schema
+                    async with ddl_connection() as conn:
+                        await conn.run_sync(upgrade_fork_schema)
 
                     # 2. 创建默认管理员用户
                     await self.create_default_admin()

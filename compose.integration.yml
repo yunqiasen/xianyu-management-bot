@@ -1,0 +1,57 @@
+# Empty-account integration infrastructure. Never mounts production data.
+name: xymb-integration
+services:
+  mysql:
+    image: mysql:8.0
+    restart: "no"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${XYMB_MYSQL_ROOT_PASSWORD:?set in private environment file}
+      MYSQL_DATABASE: xymb_integration
+      MYSQL_USER: xymb
+      MYSQL_PASSWORD: ${XYMB_MYSQL_PASSWORD:?set in private environment file}
+    ports:
+      - "127.0.0.1:19006:3306"
+    volumes:
+      - integration_mysql:/var/lib/mysql
+    healthcheck:
+      test: [CMD-SHELL, 'mysqladmin ping -h 127.0.0.1 -uroot -p"$$MYSQL_ROOT_PASSWORD" --silent']
+      interval: 5s
+      timeout: 4s
+      retries: 30
+    command: [--max-connections=120, --innodb-buffer-pool-size=128M]
+  mysql-restore:
+    image: mysql:8.0
+    profiles: [restore]
+    restart: "no"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${XYMB_RESTORE_ROOT_PASSWORD:?set in private environment file}
+      MYSQL_DATABASE: xymb_restore_integration
+      MYSQL_USER: xymb
+      MYSQL_PASSWORD: ${XYMB_RESTORE_PASSWORD:?set in private environment file}
+    ports:
+      - "127.0.0.1:19007:3306"
+    volumes:
+      - integration_restore_mysql:/var/lib/mysql
+    healthcheck:
+      test: [CMD-SHELL, 'mysqladmin ping -h 127.0.0.1 -uroot -p"$$MYSQL_ROOT_PASSWORD" --silent']
+      interval: 5s
+      timeout: 4s
+      retries: 30
+    command: [--max-connections=60, --innodb-buffer-pool-size=64M]
+  redis:
+    image: redis:7-alpine
+    restart: "no"
+    ports:
+      - "127.0.0.1:19379:6379"
+    volumes:
+      - integration_redis:/data
+    command: [redis-server, --appendonly, 'yes']
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+volumes:
+  integration_mysql:
+  integration_redis:
+  integration_restore_mysql:

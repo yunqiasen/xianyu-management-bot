@@ -1,4 +1,4 @@
-﻿"""
+"""
 消息处理模块
 
 负责解析和处理WebSocket接收到的消息
@@ -36,6 +36,8 @@ class MessageHandler:
             myid: 用户ID（从cookies的unb字段获取），用于判断是否是自己发出的消息
         """
         self.cookie_id = cookie_id
+        from common.services.reply_state import ReplyState
+        self.reply_state = ReplyState()
         self.myid = myid or cookie_id  # 如果没有传入myid，使用cookie_id作为备选
         
         # 消息去重
@@ -600,6 +602,17 @@ class MessageHandler:
             if self.is_chat_message(message):
                 parsed = self.parse_chat_message(message)
                 if parsed:
+                    from common.services.reply_state import identity
+                    parsed['event_id'] = message_id or identity(message)
+                    _, fresh = await self.reply_state.record_message(
+                        self.cookie_id, parsed['chat_id'], parsed['event_id'],
+                        'assistant' if parsed.get('send_user_id') == self.myid else 'user',
+                        parsed.get('send_message', ''), parsed.get('send_user_id', ''),
+                        sender_name=parsed.get('send_user_name', ''), item_id=parsed.get('item_id', ''),
+                        origin='manual' if parsed.get('send_user_id') == self.myid else 'platform')
+                    parsed['_history_recorded'] = True
+                    if not fresh:
+                        return True
                     # 打印解密后的消息（参照旧框架）
                     self._log_chat_message(parsed)
                     
@@ -685,6 +698,11 @@ class MessageHandler:
     ):
         """调度防抖回复"""
         async with self.message_debounce_lock:
+            previous = self.message_debounce_tasks.get(chat_id, {})
+            originals = previous.get('originals', []) + [dict(message_info)]
+            merged = dict(message_info)
+            merged['send_message'] = '\n'.join(m.get('send_message', '') for m in originals)
+            merged['source_event_ids'] = [m.get('event_id') for m in originals if m.get('event_id')]
             # 取消之前的防抖任务
             if chat_id in self.message_debounce_tasks:
                 old_task = self.message_debounce_tasks[chat_id].get("task")
@@ -695,19 +713,20 @@ class MessageHandler:
             async def debounced_reply():
                 try:
                     await asyncio.sleep(self.message_debounce_delay)
-                    await reply_callback(message_info)
+                    await reply_callback(merged)
                 except asyncio.CancelledError:
                     pass
                 except Exception as e:
                     logger.error(f"【{self.cookie_id}】防抖回复异常: {safe_str(e)}")
                 finally:
                     async with self.message_debounce_lock:
-                        if chat_id in self.message_debounce_tasks:
+                        if self.message_debounce_tasks.get(chat_id, {}).get("task") is asyncio.current_task():
                             del self.message_debounce_tasks[chat_id]
             
             task = asyncio.create_task(debounced_reply())
             self.message_debounce_tasks[chat_id] = {
                 "task": task,
-                "last_message": message_info,
+                "last_message": merged,
+                "originals": originals,
                 "timer": time.time(),
             }

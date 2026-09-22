@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
 from loguru import logger
-from sqlalchemy import delete as sql_delete, or_, select, update as sql_update
+from sqlalchemy import delete as sql_delete, or_, and_, exists, select, update as sql_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.db.session import async_session_maker
@@ -26,6 +26,7 @@ from common.models.xy_account import XYAccount
 from common.models.xy_order import XYOrder
 from common.utils.time_utils import get_beijing_now_naive
 from common.models.card import Card
+from common.models.delivery_intent import DeliveryIntent
 from app.core.config import get_settings
 from app.core.http_client import get_http_client
 
@@ -243,16 +244,17 @@ class RedeliveryTask:
         now = get_beijing_now_naive()
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         
-        stmt = select(XYOrder).where(
-            XYOrder.account_id == account_id,
-            XYOrder.placed_at.is_not(None),
-            XYOrder.placed_at >= today_start,
-            XYOrder.status.in_(["pending_payment", "processing", "pending_ship"]),
-            XYOrder.card_only_delivered.is_(False),
-            # 双保险：买家已在提货页点「同意」的订单已单独发货，不再走定时补发货
-            XYOrder.agree_deliver_agreed.is_(False),
+        outstanding=exists(select(DeliveryIntent.id).where(
+            DeliveryIntent.owner_id==XYOrder.owner_id,DeliveryIntent.account_id==XYOrder.account_id,
+            DeliveryIntent.order_no==XYOrder.order_no,DeliveryIntent.operation_key=='payment',
+            or_(DeliveryIntent.content_state!='confirmed',DeliveryIntent.confirm_state.notin_(['confirmed','not_required']))))
+        stmt = select(XYOrder).join(XYAccount,and_(XYAccount.account_id==XYOrder.account_id,XYAccount.owner_id==XYOrder.owner_id)).where(
+            XYOrder.account_id==account_id,
+            or_(outstanding,and_(XYOrder.placed_at.is_not(None),XYOrder.placed_at>=today_start,
+                XYOrder.status.in_(['pending_payment','processing','pending_ship']),
+                XYOrder.card_only_delivered.is_(False),XYOrder.agree_deliver_agreed.is_(False)))
         ).order_by(XYOrder.placed_at)
-        
+
         result = await session.execute(stmt)
         return list(result.scalars().all())
     
@@ -287,8 +289,9 @@ class RedeliveryTask:
         
         # 处理每个订单
         for order in orders:
-            # 检查订单是否在冷却期内
-            if is_order_in_cooldown(order.order_no):
+            # 持久待办优先于临时冷却。
+            intent = await self._intent_for_order(session, order)
+            if not intent and is_order_in_cooldown((order.owner_id, order.account_id, order.order_no)):
                 logger.debug(f"[定时补发货] 订单 {order.order_no} 在冷却期内，跳过")
                 continue
             
@@ -333,13 +336,13 @@ class RedeliveryTask:
                         from common.services.order_service import OrderService
                         order_svc = OrderService(session)
                         await order_svc.update_order_delivery_fail_reason(
-                            order.order_no, error_message
+                            order.order_no, error_message, owner_id=order.owner_id, account_id=order.account_id
                         )
                     except Exception as rec_err:
                         logger.warning(f"[定时补发货] 记录失败原因到订单表失败: {rec_err}")
                     
                     if should_add_to_cooldown(error_message):
-                        add_order_to_cooldown(order.order_no)
+                        add_order_to_cooldown((order.owner_id, order.account_id, order.order_no))
                         logger.info(
                             f"[定时补发货] 订单 {order.order_no} 遇到临时错误，"
                             f"已加入冷却队列: {error_message}"
@@ -358,7 +361,7 @@ class RedeliveryTask:
                 
                 # 异常情况也判断是否需要加入冷却
                 if should_add_to_cooldown(error_msg):
-                    add_order_to_cooldown(order.order_no)
+                    add_order_to_cooldown((order.owner_id, order.account_id, order.order_no))
                 
                 await self._log_result(
                     session, batch_id, account_id, order.order_no, False, error_msg
@@ -390,13 +393,30 @@ class RedeliveryTask:
         
         logger.info(f"[定时补发货] 开始处理订单: {order_no}，当前状态: {order.status}")
         
+        if (order.owner_id, order.account_id) != (account.owner_id, account.account_id):
+            return False, '订单账号归属不匹配', cookie_string
+        intent = await self._intent_for_order(session, order)
+        if intent:
+            if intent.content_state == 'confirmed' and intent.confirm_state in {'confirmed','not_required'}:
+                return True, None, cookie_string
+            if intent.content_state not in {'confirmed','reserved'} or intent.confirm_state in {'unknown','confirming'}:
+                return False, '已有履约待核实，未重复出库', cookie_string
+            result = await get_http_client().post(
+                get_settings().websocket_service_url + '/internal/orders/fulfillment/start',
+                json={'owner_id':order.owner_id,'account_id':order.account_id,'order_no':order.order_no}, max_retries=1)
+            data = result.get('data') or {}
+            done = data.get('content_state') == 'confirmed' and data.get('confirm_state') in {'confirmed','not_required'}
+            # 平台状态由持久执行方投影；scheduler不覆盖新状态。
+            await session.refresh(order)
+            return done, None if done else '履约待继续或核实', cookie_string
+
         # 获取Redis分布式锁（防止与自动发货并发，Redis失败时降级继续执行）
         from common.db.redis_client import try_acquire_delivery_lock
         
         lock_result = None
         redis_lock_acquired = False
         try:
-            lock_result = await try_acquire_delivery_lock(order_no, expire=120, holder_info="scheduler", wait_timeout=5)
+            lock_result = await try_acquire_delivery_lock(f"{order.owner_id}:{account_id}:{order_no}", expire=120, holder_info="scheduler", wait_timeout=5)
             if lock_result.success:
                 redis_lock_acquired = True
                 logger.debug(f"[定时补发货] 获取Redis分布式锁成功: {order_no}")
@@ -412,9 +432,9 @@ class RedeliveryTask:
         
         try:
             # 即使 Redis 降级，也先复查持久化状态，避免已发卡订单被重复处理。
-            stmt = select(XYOrder).where(XYOrder.order_no == order_no)
+            stmt = select(XYOrder).where(XYOrder.order_no == order_no, XYOrder.owner_id == order.owner_id, XYOrder.account_id == account_id)
             result = await session.execute(stmt)
-            current_order = result.scalars().first()
+            current_order = result.scalar_one_or_none()
             if current_order and (
                 current_order.status == 'shipped' or current_order.card_only_delivered
             ):
@@ -440,7 +460,7 @@ class RedeliveryTask:
 
                 # 如果订单已发货或已交易成功，只更新本地数据库状态，不触发实际发货
                 if '已发货' in reason or '已交易成功' in reason:
-                    stmt = sql_update(XYOrder).where(XYOrder.order_no == order_no).values(status="shipped")
+                    stmt = sql_update(XYOrder).where(XYOrder.order_no == order_no, XYOrder.owner_id == order.owner_id, XYOrder.account_id == account_id).values(status="shipped")
                     await session.execute(stmt)
                     await session.commit()
                     logger.info(f"[定时补发货] 订单 {order_no} 闲鱼已发货，本地状态已同步为shipped")
@@ -462,7 +482,7 @@ class RedeliveryTask:
                     return True, f"订单已结束，状态已同步（{reason}）", cookie_string
 
                 # 不满足发货条件的订单加入冷却2分钟，避免频繁检查
-                add_order_to_cooldown(order_no, cooldown_seconds=120)
+                add_order_to_cooldown((order.owner_id, account_id, order_no), cooldown_seconds=120)
                 return False, reason, cookie_string
             
             logger.info(f"[定时补发货] 订单 {order_no} 可以发货: {check_result.get('reason')}")
@@ -569,7 +589,7 @@ class RedeliveryTask:
                 # 单独 SELECT 读取，不依赖 ORM 缓存状态。
                 order_quantity = int(order.quantity) if order.quantity and order.quantity > 0 else 1
                 try:
-                    fresh_qty_stmt = select(XYOrder.quantity).where(XYOrder.order_no == order_no)
+                    fresh_qty_stmt = select(XYOrder.quantity).where(XYOrder.order_no == order_no, XYOrder.owner_id == order.owner_id, XYOrder.account_id == account_id)
                     fresh_qty_result = await session.execute(fresh_qty_stmt)
                     fresh_qty = fresh_qty_result.scalar_one_or_none()
                     if fresh_qty is not None and int(fresh_qty) > 0:
@@ -593,6 +613,8 @@ class RedeliveryTask:
                 deliver_url = f"{settings.websocket_service_url}/internal/orders/deliver"
                 deliver_data = {
                     "order_no": order_no,
+                    "owner_id": order.owner_id,
+                    "account_id": account_id,
                     "item_id": order.item_id,
                     "buyer_id": order.buyer_id,
                     "chat_id": order.chat_id,
@@ -603,9 +625,18 @@ class RedeliveryTask:
                 }
                 
                 logger.info(f"[定时补发货] 调用WebSocket服务发货: {order_no}")
-                result = await http_client.post(deliver_url, json=deliver_data)
-                logger.info(f"[定时补发货] 订单 {order_no} 接口返回: {result}")
+                result = await http_client.post(deliver_url, json=deliver_data, max_retries=1)
+                logger.info(f"[定时补发货] 订单 {order_no} 发货接口已返回，检查阶段事实")
                 
+                result_data = result.get('data') or {}
+                if 'content_state' in result_data:
+                    done = result_data.get('content_state') == 'confirmed' and result_data.get('confirm_state') in {'confirmed','not_required'}
+                    await session.refresh(order)
+                    return done, None if done else '履约待继续或核实', cookie_string
+                if result_data.get('status') in {'submitted','pending','unknown'} or not any(
+                    result_data.get(key) for key in ('only_send_card','is_card_only','platform_shipping_confirmed','content','already_card_only_delivered')):
+                    return False, '发货结果缺少完成证据，待核实', cookie_string
+
                 if result.get('success'):
                     result_data = result.get('data') or {}
                     # is_card_only=True 表示 internal API 走了「禁止发货 + 主动关闭订单 + 仅发卡券」流程：
@@ -662,7 +693,7 @@ class RedeliveryTask:
                         try:
                             from common.services.order_service import OrderService
                             order_svc = OrderService(session)
-                            await order_svc.update_order_delivery_fail_reason(order_no, degraded_warn_msg)
+                            await order_svc.update_order_delivery_fail_reason(order_no, degraded_warn_msg, owner_id=order.owner_id, account_id=order.account_id)
                             logger.warning(f"[定时补发货] 订单 {order_no} {degraded_warn_msg}")
                         except Exception as warn_err:
                             logger.warning(
@@ -765,7 +796,7 @@ class RedeliveryTask:
                 placeholder_chat_id = f"FAILED_{order.buyer_id}"
                 from common.services.order_service import OrderService
                 order_svc = OrderService(session)
-                await order_svc.update_order_chat_id(order.order_no, placeholder_chat_id)
+                await order_svc.update_order_chat_id(order.order_no, placeholder_chat_id, owner_id=order.owner_id, account_id=order.account_id)
                 order.chat_id = placeholder_chat_id
                 return False, f"创建会话失败: {error_msg}"
             
@@ -779,7 +810,7 @@ class RedeliveryTask:
                 placeholder_chat_id = f"FAILED_{order.buyer_id}"
                 from common.services.order_service import OrderService
                 order_svc = OrderService(session)
-                await order_svc.update_order_chat_id(order.order_no, placeholder_chat_id)
+                await order_svc.update_order_chat_id(order.order_no, placeholder_chat_id, owner_id=order.owner_id, account_id=order.account_id)
                 order.chat_id = placeholder_chat_id
                 return False, "创建会话响应缺少 chat_id"
             
@@ -787,7 +818,7 @@ class RedeliveryTask:
             from common.services.order_service import OrderService
             order_svc = OrderService(session)
             updated = await order_svc.update_order_chat_id(
-                order.order_no, new_chat_id
+                order.order_no, new_chat_id, owner_id=order.owner_id, account_id=order.account_id
             )
             if not updated:
                 logger.warning(
@@ -828,31 +859,26 @@ class RedeliveryTask:
         Returns:
             匹配的卡券或None
         """
-        from common.services.card_matcher import CardMatcher
-        
-        item_id = order.item_id
-        spec_name = order.spec_name
-        spec_value = order.spec_value
-        
-        matcher = CardMatcher(session)
-        matched_cards = await matcher.get_cards_by_item_id(item_id, spec_name, spec_value)
-        
-        if not matched_cards:
-            logger.info(f"[定时补发货] 商品 {item_id} 没有匹配的卡券")
-            return None
-        
-        # 必须唯一匹配
-        if len(matched_cards) > 1:
-            card_names = [c.get('name') for c in matched_cards]
-            logger.info(f"[定时补发货] 商品 {item_id} 匹配到多个卡券: {card_names}，需要唯一匹配")
-            return None
-        
-        # 从字典中获取卡券ID，再查询完整的Card对象
-        card_id = matched_cards[0].get('id')
-        stmt = select(Card).where(Card.id == card_id)
-        result = await session.execute(stmt)
-        return result.scalars().first()
-    
+        from common.services.order_delivery_runtime import OrderDeliveryRuntime
+        from sqlalchemy.ext.asyncio import async_sessionmaker
+        from common.models.card_item_relation import CardItemRelation
+        rules = await OrderDeliveryRuntime(async_sessionmaker(session.bind,expire_on_commit=False)).preview(order.owner_id,order.account_id,order.order_no)
+        if rules:
+            matches=[r for r in rules if r['matched']]
+            if len(matches)!=1: return None
+            return await session.get(Card,matches[0]['card_id'])
+        cards=(await session.scalars(select(Card).join(CardItemRelation,CardItemRelation.card_id==Card.id).where(
+            CardItemRelation.user_id==order.owner_id,CardItemRelation.item_id==order.item_id,
+            CardItemRelation.source.in_(['dock_l1','dock_l2']),Card.enabled.is_(True)))).unique().all()
+        matches=[c for c in cards if not c.is_multi_spec or (order.spec_name and order.spec_value and
+                 (c.spec_name,c.spec_value)==(order.spec_name,order.spec_value))]
+        return matches[0] if len(matches)==1 else None
+
+    async def _intent_for_order(self,session,order):
+        return await session.scalar(select(DeliveryIntent).where(DeliveryIntent.owner_id==order.owner_id,
+            DeliveryIntent.account_id==order.account_id,DeliveryIntent.order_no==order.order_no,
+            DeliveryIntent.operation_key=='payment').execution_options(populate_existing=True))
+
     async def _cleanup_expired_logs(self, session: AsyncSession) -> None:
         """
         主动清理过期的补发货日志

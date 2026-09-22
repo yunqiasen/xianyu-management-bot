@@ -40,7 +40,7 @@ SELLER_REFERER = "https://seller.goofish.com/?site=COMMONPRO"
 VIDEO_MTOP_PARAMS = {"preventFallback": "true", "dataType": "jsonp"}
 VIDEO_TIMEOUT = aiohttp.ClientTimeout(total=90)
 DEFAULT_SLICE_SIZE = 2 * 1024 * 1024
-MAX_PART_RETRIES = 3
+MAX_PART_RETRIES = 1
 
 
 class PublishVideoError(RuntimeError):
@@ -68,36 +68,20 @@ def _resolve_video_path(value: str, static_root: Path | None) -> Path:
     return Path(normalized).expanduser()
 
 
-async def _read_video(video: dict[str, Any], static_root: Path | None) -> tuple[bytes, str, str]:
+async def _read_video(video: dict[str, Any], static_root: Path | None, owner_id: int | None = None) -> tuple[bytes, str, str]:
     """读取本地或远程视频内容，并返回字节、文件名和 MIME 类型。"""
     path_value = _text(video.get("path"))
     source = path_value or _text(video.get("url"))
     if not source:
         raise PublishVideoError("视频缺少本地路径或视频地址")
-    if source.lower().startswith(("http://", "https://")):
-        try:
-            async with aiohttp.ClientSession(timeout=VIDEO_TIMEOUT) as session:
-                async with session.get(source) as response:
-                    content = await response.read()
-                    if response.status != 200 or not content:
-                        raise PublishVideoError(f"远程视频下载失败：HTTP {response.status}")
-                    content_type = (response.headers.get("Content-Type") or "").split(";", 1)[0].strip()
-            name = Path(urlparse(source).path).name or "publish-video.mp4"
-            return content, name, content_type or mimetypes.guess_type(name)[0] or "video/mp4"
-        except PublishVideoError:
-            raise
-        except (aiohttp.ClientError, OSError, TimeoutError) as exc:
-            raise PublishVideoError(f"远程视频下载失败：{exc}") from exc
-    path = _resolve_video_path(source, static_root)
-    if not path.is_file():
-        raise PublishVideoError(f"视频文件不存在：{path}")
+    from common.services.media_paths import read_owned_media
+    from common.utils.local_video_upload import DEFAULT_VIDEO_MAX_SIZE
     try:
-        content = path.read_bytes()
-    except OSError as exc:
-        raise PublishVideoError(f"读取视频失败：{path}，{exc}") from exc
-    if not content:
-        raise PublishVideoError(f"视频文件为空：{path}")
-    return content, path.name, mimetypes.guess_type(path.name)[0] or "video/mp4"
+        content, name = await asyncio.to_thread(read_owned_media, source, owner_id,
+            static_root=static_root, max_bytes=DEFAULT_VIDEO_MAX_SIZE, kinds={'products'})
+    except ValueError as exc:
+        raise PublishVideoError(str(exc)) from exc
+    return content, name, mimetypes.guess_type(name)[0] or 'video/mp4'
 
 
 def _video_dimensions(content: bytes) -> tuple[int, int]:
@@ -149,7 +133,7 @@ async def _extract_video_cover(content: bytes, name: str) -> tuple[bytes, int, i
     return await asyncio.to_thread(_extract_video_cover_sync, content, Path(name).suffix)
 
 
-async def _upload_video_cover(content: bytes, name: str, cookie: str) -> str:
+async def _upload_video_cover(content: bytes, name: str, cookie: str, account_id, owner_id) -> str:
     """上传视频首帧封面并返回闲鱼图片地址。"""
     try:
         cover_item = await upload_publish_image_content(
@@ -157,7 +141,7 @@ async def _upload_video_cover(content: bytes, name: str, cookie: str) -> str:
             f"{Path(name).stem}_cover.jpg",
             cookie,
             content_type="image/jpeg",
-            source=f"视频封面:{name}",
+            source=f"视频封面:{name}", account_id=account_id, owner_id=owner_id,
         )
     except PublishMediaError as exc:
         raise PublishVideoError(f"视频封面上传失败：{exc}") from exc
@@ -169,17 +153,12 @@ def _strategy_model(response: dict[str, Any]) -> dict[str, Any]:
     raw = response.get("res") if isinstance(response, dict) else None
     model = raw.get("data", {}).get("model") if isinstance(raw, dict) else None
     if not isinstance(model, dict):
-        raise PublishVideoError(f"闲鱼视频接口返回缺少 model：{response.get('error') or raw}")
+        raise PublishVideoError("video_response_missing_model")
     return model
 
 
 def _log_mtop_response(stage: str, account_id: str, response: dict[str, Any]) -> None:
-    """记录视频上传 mtop 接口的完整原始返回，不记录 Cookie。"""
-    logger.info(
-        f"闲鱼视频上传{stage}完整返回: account_id={account_id}, "
-        f"success={response.get('success')}, response="
-        f"{json.dumps(response.get('res'), ensure_ascii=False, default=str)}"
-    )
+    logger.info("视频阶段 {}: account={} success={}", stage, account_id, bool(response.get('success')))
 
 
 def _parse_slice_size(value: Any) -> int:
@@ -216,75 +195,79 @@ def _encrypt_second_upload(public_key: str, content: bytes, file_size: int) -> s
     return base64.b64encode(encrypted).decode("ascii")
 
 
+def _video_context():
+    from common.services.account_dispatch import CURRENT_OPERATION, DispatchError
+    context=CURRENT_OPERATION.get()
+    if context is None or context.request.command!='upload_video':
+        raise DispatchError('missing_video_execution_context')
+    return context
+
+
 async def _fetch_biz_config(cookie: str) -> dict[str, Any]:
-    """获取闲鱼媒体上传接口映射。"""
-    params = {"bizCode": VIDEO_BIZ_CODE, "userSite": str(VIDEO_USER_SITE)}
-    headers = {
-        "Accept": "application/json",
-        "Cookie": cookie,
-        "Origin": SELLER_ORIGIN,
-        "Referer": SELLER_REFERER,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/146.0.0.0 Safari/537.36",
-    }
-    try:
-        async with aiohttp.ClientSession(timeout=VIDEO_TIMEOUT, cookie_jar=aiohttp.DummyCookieJar()) as session:
-            async with session.get(VIDEO_CONFIG_URL, params=params, headers=headers) as response:
-                text = await response.text()
-                logger.info(f"闲鱼视频上传配置完整返回: http_status={response.status}, response={text}")
-                if response.status != 200:
-                    raise PublishVideoError(f"获取视频上传配置失败：HTTP {response.status}")
-                body = json.loads(text)
-    except PublishVideoError:
-        raise
-    except (aiohttp.ClientError, OSError, TimeoutError, ValueError) as exc:
-        raise PublishVideoError(f"获取视频上传配置失败：{exc}") from exc
-    config = body.get("data") if isinstance(body, dict) else None
-    if not isinstance(config, dict) or not isinstance(config.get("apiInfo"), dict):
-        raise PublishVideoError("视频上传配置缺少 API 映射")
+    context=_video_context()
+    await context.before_external()
+    async with context.live.session.get(VIDEO_CONFIG_URL,
+            params={'bizCode':VIDEO_BIZ_CODE,'userSite':str(VIDEO_USER_SITE)},
+            headers={'Cookie':'','Origin':SELLER_ORIGIN,'Referer':SELLER_REFERER},
+            allow_redirects=False,timeout=VIDEO_TIMEOUT) as response:
+        if response.status!=200:raise PublishVideoError('video_config_unverified')
+        body=await response.json(content_type=None)
+    await context.check()
+    config=body.get('data') if isinstance(body,dict) else None
+    if not isinstance(config,dict) or not isinstance(config.get('apiInfo'),dict):
+        raise PublishVideoError('video_config_invalid')
+    for key,value in config['apiInfo'].items():
+        if key in {'init','second','complete','keepAlive'} and value and not re.fullmatch(r'mtop\.video\.[a-z.]+\.xianyu',str(value)):
+            raise PublishVideoError('video_api_invalid')
     return config
 
 
+def _validate_oss_url(url):
+    parsed=urlparse(url);host=(parsed.hostname or '').lower()
+    if (parsed.scheme!='https' or parsed.username or parsed.password or parsed.port not in (None,443)
+            or not any(host.endswith('.'+suffix) for suffix in ('aliyuncs.com','alicdn.com'))):
+        raise PublishVideoError('video_upload_host_invalid')
+
+
 async def _put_part(url: str, content: bytes, part_number: int) -> str:
-    """上传一个 OSS 分片并返回 ETag/本地 MD5。"""
-    local_md5 = hashlib.md5(content).hexdigest().upper()
-    headers = {
-        "Accept": "*/*",
-        "Origin": SELLER_ORIGIN,
-        "Referer": SELLER_REFERER,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/146.0.0.0 Safari/537.36",
-    }
-    last_error = ""
-    for attempt in range(1, MAX_PART_RETRIES + 1):
-        try:
-            async with aiohttp.ClientSession(timeout=VIDEO_TIMEOUT, cookie_jar=aiohttp.DummyCookieJar()) as session:
-                async with session.put(url, data=content, headers=headers) as response:
-                    response_text = await response.text()
-                    logger.info(
-                        f"闲鱼视频分片上传完整返回: part={part_number}, attempt={attempt}, "
-                        f"http_status={response.status}, etag={response.headers.get('ETag')}, response={response_text}"
-                    )
-                    if 200 <= response.status < 300:
-                        etag = _text(response.headers.get("ETag")).strip('"')
-                        return etag or local_md5
-                    last_error = f"HTTP {response.status}"
-        except (aiohttp.ClientError, OSError, TimeoutError) as exc:
-            last_error = str(exc)
-        if attempt < MAX_PART_RETRIES:
-            await asyncio.sleep(0.5 * attempt)
-    raise PublishVideoError(f"第 {part_number} 个视频分片上传失败：{last_error}")
+    _validate_oss_url(url)
+    context=_video_context()
+    await context.before_external()
+    async with context.live.session.put(url,data=content,headers={'Cookie':'','Origin':SELLER_ORIGIN,
+            'Referer':SELLER_REFERER},allow_redirects=False,timeout=VIDEO_TIMEOUT) as response:
+        if not 200<=response.status<300:raise PublishVideoError('video_part_unverified')
+        etag=_text(response.headers.get('ETag')).strip('"').upper()
+        if etag!=hashlib.md5(content).hexdigest().upper():
+            raise PublishVideoError('video_part_checksum_unverified')
+    await context.check()
+    return etag
 
 
-async def upload_publish_video(
-    video: dict[str, Any],
-    cookie: str,
-    account_id: str,
-    owner_id: int | None = None,
-    *,
-    static_root: str | Path | None = None,
+async def upload_publish_video(video, cookie, account_id, owner_id=None, *, static_root=None):
+    from common.services.video_gateway import upload_account_video, upload_account_video_url
+    from common.services.account_dispatch import DispatchError
+    from common.utils.local_video_upload import SAFE_VIDEO_EXTS
+    root = Path(static_root) if static_root else None
+    source = _text(video.get('path')) or _text(video.get('url'))
+    try:
+        if source.lower().startswith(('http://', 'https://')):
+            name = Path(urlparse(source).path).name
+            if Path(name).suffix.lower() not in SAFE_VIDEO_EXTS:
+                name = 'publish-video.mp4'
+            payload = await upload_account_video_url(account_id, owner_id, source, name)
+        else:
+            content, name, _ = await _read_video(video, root, owner_id)
+            payload = await upload_account_video(account_id, owner_id, content, name)
+    except (DispatchError, ValueError) as exc:
+        raise PublishVideoError(getattr(exc, 'code', 'invalid_video_reference')) from exc
+    return payload, cookie
+
+
+async def _upload_video_content(
+    video: dict[str, Any], content: bytes, name: str, mime_type: str,
+    cookie: str, account_id: str, owner_id: int,
 ) -> tuple[dict[str, Any], str]:
     """上传一个视频并返回发布载荷及可能刷新后的 Cookie。"""
-    root = Path(static_root) if static_root else None
-    content, name, mime_type = await _read_video(video, root)
     try:
         width = int(video.get("width") or 0)
         height = int(video.get("height") or 0)
@@ -365,10 +348,10 @@ async def upload_publish_video(
                 file_id = _text(second_model.get("fileId"))
                 oss_url = _text(second_model.get("ossUrl"))
                 if file_id and oss_url:
-                    cover_url = await _upload_video_cover(cover_content, name, cookie)
+                    cover_url = await _upload_video_cover(cover_content, name, cookie, account_id, owner_id)
                     return _video_payload(video, file_id, oss_url, width, height, cover_url), cookie
         else:
-            logger.warning(f"闲鱼视频秒传检查失败，继续分片上传：account_id={account_id}, error={second_result.get('error')}")
+            raise PublishVideoError("video_second_check_unverified")
 
     slice_size = _parse_slice_size(policy.get("sliceSize"))
     chunks = [content[offset:offset + slice_size] for offset in range(0, len(content), slice_size)]
@@ -390,7 +373,7 @@ async def upload_publish_video(
             return index + 1, await _put_part(url, chunks[index], index + 1)
 
     started = asyncio.get_running_loop().time()
-    results = await asyncio.gather(*(upload_one(index) for index in range(len(chunks))))
+    results = [await upload_one(index) for index in range(len(chunks))]
     part_list = json.dumps(
         [json.dumps({"partNumber": number, "md5": md5}, separators=(",", ":")) for number, md5 in sorted(results)],
         separators=(",", ":"),
@@ -415,10 +398,7 @@ async def upload_publish_video(
         _log_mtop_response("会话保活", account_id, keep_alive_result)
         cookie = keep_alive_result.get("cookies_str") or cookie
         if not keep_alive_result.get("success"):
-            logger.warning(
-                f"闲鱼视频上传会话保活失败，继续调用完成接口："
-                f"account_id={account_id}, error={keep_alive_result.get('error')}"
-            )
+            raise PublishVideoError('video_keepalive_unverified')
     complete_result = await mtop_call(
         account_id=account_id,
         cookies_str=cookie,
@@ -450,7 +430,7 @@ async def upload_publish_video(
     oss_url = _text(model.get("ossUrl"))
     if not file_id or not oss_url:
         raise PublishVideoError("视频上传完成接口未返回 fileId 或 ossUrl")
-    cover_url = await _upload_video_cover(cover_content, name, cookie)
+    cover_url = await _upload_video_cover(cover_content, name, cookie, account_id, owner_id)
     return _video_payload(video, file_id, oss_url, width, height, cover_url), cookie
 
 

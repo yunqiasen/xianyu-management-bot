@@ -16,7 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.models.db_backup_log import DbBackupLog
-from common.utils.backup_paths import locate_backup_file
+from common.utils.backup_paths import resolve_backup_file
 from common.utils.pagination import execute_paginated_with_filters
 from common.utils.time_utils import safe_isoformat
 
@@ -90,7 +90,7 @@ class DbBackupLogService:
                 "duration_ms": log.duration_ms,
                 "error_message": log.error_message,
                 # 文件真实存在（按文件名或记录路径任一可定位）时才允许下载
-                "downloadable": bool(locate_backup_file(log.file_name, log.file_path)),
+                "downloadable": bool(resolve_backup_file(log.file_name)),
                 "created_at": safe_isoformat(log.created_at),
             }
             for log in logs
@@ -110,7 +110,7 @@ class DbBackupLogService:
         if not log or not log.file_name:
             return None, None
 
-        file_path = locate_backup_file(log.file_name, log.file_path)
+        file_path = resolve_backup_file(log.file_name)
         if not file_path:
             return None, None
         return file_path, log.file_name

@@ -30,11 +30,11 @@ async def upload_image(
             )
 
         # 读取图片数据
-        image_data = await image.read()
+        image_data = await image.read(image_manager.max_size + 1)
         logger.info(f"读取图片数据成功，大小: {len(image_data)} bytes")
 
         # 保存图片
-        image_url = image_manager.save_image(image_data, image.filename)
+        image_url = image_manager.save_image(image_data, image.filename, owner_id=current_user.id)
         if not image_url:
             logger.error("图片保存失败")
             return ApiResponse(

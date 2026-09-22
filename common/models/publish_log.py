@@ -8,7 +8,7 @@
 """
 from __future__ import annotations
 
-from sqlalchemy import BigInteger, Index, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Index, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from common.db.base_class import Base, TimestampMixin
@@ -33,6 +33,7 @@ class PublishLog(TimestampMixin, Base):
     batch_id: Mapped[str | None] = mapped_column(String(36), index=True, comment="批次ID（批量发布任务标识）")
     publish_request_id: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True, comment="发布幂等请求号")
     source_event_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True, comment="来源自动续售事件ID")
+    publish_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True, comment="发布时素材不可变快照")
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending", comment="状态：pending/publishing/success/failed")
     item_url: Mapped[str | None] = mapped_column(String(500), comment="发布成功后的商品链接")
     item_id: Mapped[str | None] = mapped_column(String(64), comment="发布成功后的商品ID")

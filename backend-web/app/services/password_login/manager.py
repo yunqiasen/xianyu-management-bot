@@ -22,7 +22,7 @@ from app.services.password_login.flow import run_protocol_login
 # 协议会话 ID 前缀（用于路由区分：pl_ → 本地协议会话；无前缀 → websocket 浏览器会话）
 SESSION_PREFIX = "pl_"
 # 会话过期时间（秒）
-_SESSION_TTL = 3600
+_SESSION_TTL = 900
 # 终态（success/failed）会话读取后的宽限保留时长（秒）：
 # 期内并发/重复轮询仍能稳定读到终态，避免"读一次即删除"导致后到的轮询读到
 # not_found 而把成功误报为失败（success→not_found 竞态）。
@@ -48,7 +48,9 @@ class PasswordLoginManager:
                     expired.append(sid)
             elif now - s.get("timestamp", 0) > _SESSION_TTL:
                 # 非终态会话：按总过期时间回收
-                expired.append(sid)
+                s.update(cancelled=True, status='expired', terminal_at=now, face_qr_url=None)
+                if s.get('_task'):
+                    s['_task'].cancel()
         for sid in expired:
             self.sessions.pop(sid, None)
 
@@ -99,8 +101,12 @@ class PasswordLoginManager:
                 logger.exception(f"【{account_id}】协议登录后台任务异常")
                 session["status"] = "failed"
                 session["error"] = f"登录失败：{e}"
+            finally:
+                from app.services.password_login.flow import end_pending_job
+                await end_pending_job(session, account_id, owner_id)
 
         task = asyncio.create_task(_runner())
+        session['_task'] = task
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         logger.info(f"【{account_id}】协议密码登录会话已创建: {session_id}")
@@ -132,8 +138,9 @@ class PasswordLoginManager:
         session = self.sessions.get(session_id)
         if not session or session.get("owner_id") != owner_id:
             return False
-        session["cancelled"] = True
-        self.sessions.pop(session_id, None)
+        session.update(cancelled=True, status='cancelled', terminal_at=time.time(), face_qr_url=None)
+        if session.get('_task'):
+            session['_task'].cancel()
         return True
 
     def owns(self, session_id: str) -> bool:

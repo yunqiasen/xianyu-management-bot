@@ -270,7 +270,7 @@ class ListingMonitorService:
 
         # 任务间隔
         if "interval_minutes" in data or not partial:
-            raw_interval = data.get("interval_minutes")
+            raw_interval = data.get("interval_minutes", 5)
             try:
                 interval = int(raw_interval)
             except (TypeError, ValueError):
@@ -652,15 +652,28 @@ class ListingMonitorService:
         stmt = select(ListingMonitorTask).where(*conditions)
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
+    @staticmethod
+    def _check_candidate_enable(is_enabled, values):
+        from common.services import listing_monitor_reliability as monitor
+        if not is_enabled or not monitor.monitor_v2_enabled():
+            return
+        if values.get("proxy_url"):
+            raise ValueError("任务代理与固定账号出口冲突，请保留停用并清除任务代理")
+        if values.get("direct_order") or values.get("order_account_ids") or values.get("dm_content"):
+            raise ValueError("增强监控只发现和通知，请保留停用并清除下单与私信配置")
+        if not values.get("account_ids"):
+            raise ValueError("增强监控需选择本用户的采集账号")
+
     async def create(self, owner_id: Optional[int], operator_user_id: int, data: dict) -> ListingMonitorTask:
         """创建上新监控任务。"""
         payload = await self._normalize_payload(owner_id, data, partial=False)
         task = ListingMonitorTask(
             owner_id=owner_id if owner_id is not None else operator_user_id,
             created_by=operator_user_id,
-            is_enabled=bool(data.get("is_enabled", True)),
+            is_enabled=bool(data.get("is_enabled", False)),
             **payload,
         )
+        self._check_candidate_enable(task.is_enabled, payload)
         self.session.add(task)
         await self.session.commit()
         await self.session.refresh(task)
@@ -689,6 +702,10 @@ class ListingMonitorService:
         if effective_direct_order and not effective_order_accounts:
             raise ValueError("开启采集后直接下单需配置下单账号")
 
+        self._check_candidate_enable(data.get("is_enabled", task.is_enabled), {
+            name: payload.get(name, getattr(task, name)) for name in
+            ("proxy_url", "direct_order", "order_account_ids", "dm_content", "account_ids")
+        })
         for field_name, field_value in payload.items():
             setattr(task, field_name, field_value)
         if "is_enabled" in data:
@@ -703,6 +720,8 @@ class ListingMonitorService:
         task = await self.get(owner_id, task_id)
         if not task:
             return None
+        self._check_candidate_enable(is_enabled, {name: getattr(task, name) for name in
+            ("proxy_url", "direct_order", "order_account_ids", "dm_content", "account_ids")})
         task.is_enabled = bool(is_enabled)
         await self.session.commit()
         await self.session.refresh(task)

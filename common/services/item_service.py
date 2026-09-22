@@ -1,4 +1,4 @@
-﻿"""
+"""
 商品服务
 
 功能：
@@ -16,6 +16,8 @@ from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from typing import Any, Dict, Optional, Set
 
 from loguru import logger
+from common.services.product_results import product_error_status
+from common.services.product_admission import product_admission
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -63,39 +65,22 @@ class ItemService:
             )
 
         logger.info(f"账号[{account.account_id}]为普通账号，使用个人版接口获取商品")
-        return ItemInfoManager(account.account_id, account.cookie)
+        return ItemInfoManager(account.account_id, account.cookie, owner_id=account.owner_id)
 
     async def _detect_is_fish_shop(self, account: XYAccount) -> bool:
-        """检测账号是否开通鱼小铺；检测失败或无法识别时回退为普通账号（False）。
-
-        注意：检测过程中 mtop 可能因令牌过期而刷新 _m_h5_tk，但 mtop_call 仅在调用成功时
-        才把新 Cookie 写回数据库。因此这里无论成败都要把 cookies_str 回填到 account，
-        否则紧随其后的商品抓取仍用旧令牌，会白跑一次「令牌过期→重试」。
-        """
+        """Select an account type only from a verified capability response."""
         from common.services.xianyu_publish_service import detect_publish_account_capability
-
+        from common.services.product_results import ProductCapabilityError
         try:
             result = await detect_publish_account_capability(
-                cookie=account.cookie,
-                account_id=account.account_id,
-                owner_id=account.owner_id,
-            )
+                cookie=account.cookie, account_id=account.account_id, owner_id=account.owner_id)
         except Exception as exc:
-            logger.warning(
-                f"账号[{account.account_id}]鱼小铺检测异常，回退个人版接口获取商品: {exc}"
-            )
-            return False
-
-        self._sync_account_cookie(account, result.get("cookies_str"))
-
-        if not result.get("success"):
-            logger.warning(
-                f"账号[{account.account_id}]鱼小铺检测失败，回退个人版接口获取商品: "
-                f"{result.get('message') or '未知原因'}"
-            )
-            return False
-
-        return bool(result.get("is_fish_shop"))
+            raise ProductCapabilityError({'error':'capability_transport_error'}) from exc
+        if (not isinstance(result, dict) or not result.get('success')
+                or not isinstance(result.get('is_fish_shop'), bool)
+                or result.get('detection_reliable') is False):
+            raise ProductCapabilityError(result if isinstance(result, dict) else {'error':'capability_schema_error'})
+        return result['is_fish_shop']
 
     @staticmethod
     def _sync_account_cookie(account: XYAccount, latest_cookie: Optional[str]) -> None:
@@ -306,44 +291,38 @@ class ItemService:
         page: int = 1,
         page_size: int = 20,
     ) -> dict[str, Any]:
-        """从指定账号抓取单页商品并入库"""
-        myid = self._resolve_account_fetch_user_id(account)
-
-        manager = await self._resolve_item_fetch_manager(account)
+        """Validate an entire page before saving; malformed is not empty."""
+        from common.services.product_results import ProductCapabilityError, product_retry_hint, validate_product_page
+        def failed(message, status=None, response=None):
+            status = status or product_error_status(message)
+            return dict(success=False, status=status, message=message, items=[], saved_count=0,
+                        failed_page=page, **product_retry_hint(status, response))
+        if page < 1 or page_size < 1 or page_size > 100:
+            return failed('分页参数错误', 'schema_error')
+        admission = product_admission(account)
+        if not admission['allowed']:
+            return {**admission, 'success': False, 'items': [], 'saved_count': 0}
+        manager = None
         try:
-            result = await manager.get_item_list_info(page, page_size, myid=myid)
-        except Exception as exc:
-            return {"success": False, "message": f"获取商品失败: {exc}"}
-        finally:
-            await manager.close()
-
-        if not result or not result.get("success"):
-            message = ""
-            if isinstance(result, dict):
-                message = result.get("message") or result.get("error") or ""
-            return {"success": False, "message": message or "获取商品失败"}
-
-        items = result.get("items") or []
-        count = result.get("current_count") or len(items)
-
-        try:
+            manager = await self._resolve_item_fetch_manager(account)
+            result = await manager.get_item_list_info(page, page_size, myid=self._resolve_account_fetch_user_id(account))
+            if not isinstance(result, dict) or not result.get('success'):
+                return failed(result.get('message', '获取商品失败') if isinstance(result,dict) else '商品列表结构错误', response=result)
+            if not validate_product_page(result):
+                return failed('商品列表结构错误', 'schema_error')
+            items = list({str(i.get('id') or i.get('item_id')): i for i in result['items']}.values())
             saved_count, _ = await self.save_fetched_items(account, items)
+            return dict(success=True, message=f'获取到第 {page} 页商品，共 {len(items)} 件', items=items,
+                        page=page, page_number=page, page_size=page_size, count=len(items), current_count=len(items),
+                        has_more=result.get('has_more', len(result['items']) >= page_size), saved_count=saved_count)
+        except ProductCapabilityError as exc:
+            return failed(exc.code, exc.status, {'retry_after':exc.retry_after})
         except Exception as exc:
             await self.session.rollback()
-            return {"success": False, "message": f"保存商品失败: {exc}"}
-
-        return {
-            "success": True,
-            "message": f"获取到第 {page} 页商品，共 {count} 件",
-            "items": items,
-            "page": page,
-            "page_number": page,
-            "page_size": page_size,
-            "count": count,
-            "current_count": count,
-            "has_more": len(items) >= page_size,
-            "saved_count": saved_count,
-        }
+            return failed('获取商品失败: '+type(exc).__name__)
+        finally:
+            if manager is not None:
+                await manager.close()
 
     async def fetch_all_items_from_account(
         self,
@@ -358,8 +337,8 @@ class ItemService:
 
         通过 Redis 账号级互斥锁，保证同一账号同一时刻只有一个商品同步流程在
         拉取 + 落库，避免「定时获取闲鱼商品任务」与「商品管理页手动触发同步」
-        并发 upsert 同一商品。``fail_on_lock_error=False`` 时保持普通同步任务的
-        无锁兼容降级；自动续售确认链路传入 True，Redis 锁不可用时返回可见失败。
+        并发 upsert 同一商品。Redis 锁不可用时返回可见失败；保留原参数签名，
+        所有入口统一停止，不退回无锁执行。
         """
         lock_name = f"item_sync:{account.account_id}"
         execution_started = False
@@ -394,30 +373,10 @@ class ItemService:
             if execution_started:
                 logger.error(f"账号[{account.account_id}]商品同步执行失败: {exc}")
                 return {"success": False, "message": f"账号商品同步失败: {exc}"}
-            if fail_on_lock_error:
-                logger.error(f"账号[{account.account_id}]商品同步锁不可用，自动续售本轮暂停: {exc}")
-                return {
-                    "success": False,
-                    "lock_error": True,
-                    "message": "账号商品同步锁不可用，稍后重试",
-                    "items": [],
-                    "total_count": 0,
-                    "total_pages": 0,
-                    "page_size": page_size,
-                    "saved_count": 0,
-                }
-            # Redis 不可用等异常时降级为无锁执行，靠唯一约束兜底防止重复入库
-            logger.warning(
-                f"账号[{account.account_id}]商品同步获取锁异常，降级无锁执行"
-                f"（依赖唯一约束兜底）: {exc}"
-            )
-            return await self._fetch_all_items_from_account_impl(
-                account=account,
-                page_size=page_size,
-                max_pages=max_pages,
-                stop_when_page_all_existing=stop_when_page_all_existing,
-                required_title_keyword=required_title_keyword,
-            )
+            logger.error(f"账号[{account.account_id}]商品同步锁不可用，本轮暂停")
+            return {"success": False, "lock_error": True, "status": "execution_unavailable",
+                    "message": "账号商品同步锁不可用，稍后重试", "items": [],
+                    "total_count": 0, "total_pages": 0, "page_size": page_size, "saved_count": 0}
 
     async def _fetch_all_items_from_account_impl(
         self,
@@ -428,15 +387,33 @@ class ItemService:
         required_title_keyword: str | None = None,
     ) -> dict[str, Any]:
         """抓取指定账号全部商品并入库（实际实现，调用方需已持有账号锁）"""
+        if not 1 <= page_size <= 100 or (max_pages is not None and max_pages < 1):
+            return {"success": False, "status": "invalid_input", "message": "分页范围错误"}
+        admission = product_admission(account)
+        if not admission['allowed']:
+            return {**admission, 'success': False, 'items': [], 'saved_count': 0}
         myid = self._resolve_account_fetch_user_id(account)
         normalized_required_title_keyword = str(required_title_keyword or "").strip()
 
-        manager = await self._resolve_item_fetch_manager(account)
+        from common.services.product_results import ProductCapabilityError
+        manager = None
         fetched_items: list[dict] = []
         total_saved_count = 0
         fetched_pages = 0
         matched_required_title_keyword = False
+        seen_ids: set[str] = set()
+        page_number = 1
+
+        def failed(message, status=None, response=None):
+            from common.services.product_results import product_retry_hint
+            return {"success": False, "status": status or product_error_status(message),
+                    "message": message, "partial": bool(fetched_items), "items": fetched_items,
+                    "total_count": len(fetched_items), "saved_count": total_saved_count,
+                    "total_pages": fetched_pages, "failed_page": page_number, "page_size": page_size,
+                    **product_retry_hint(status or product_error_status(message), response)}
+
         try:
+            manager = await self._resolve_item_fetch_manager(account)
             page_number = 1
             while True:
                 if max_pages and page_number > max_pages:
@@ -446,19 +423,28 @@ class ItemService:
                 logger.info(f"账号[{account.account_id}]商品同步正在获取第 {page_number} 页")
                 result = await manager.get_item_list_info(page_number, page_size, myid=myid)
 
-                if not result or not result.get("success"):
+                if not isinstance(result, dict) or not result.get("success"):
                     message = ""
                     if isinstance(result, dict):
                         message = result.get("message") or result.get("error") or ""
                     logger.error(f"账号[{account.account_id}]商品同步获取第 {page_number} 页失败: {result}")
-                    return {"success": False, "message": message or f"获取第 {page_number} 页商品失败"}
+                    return failed(message or f"获取第 {page_number} 页商品失败", response=result)
 
-                items = result.get("items") or []
+                from common.services.product_results import validate_product_page
+                if not validate_product_page(result):
+                    return failed("商品列表结构错误", "schema_error")
+                raw_items = result["items"]
+                items = raw_items
                 if not items:
                     logger.info(f"账号[{account.account_id}]商品同步第 {page_number} 页无数据，结束获取")
                     break
 
                 valid_items, skipped_count = self._collect_valid_item_entries(items)
+                items = []
+                for item_id, item in valid_items:
+                    if item_id not in seen_ids:
+                        seen_ids.add(item_id)
+                        items.append(item)
                 unique_item_ids = list(dict.fromkeys(item_id for item_id, _ in valid_items))
                 existing_map = await self._get_existing_item_map(account, unique_item_ids)
                 page_matches_required_title = (
@@ -483,7 +469,7 @@ class ItemService:
                     )
                 except Exception as exc:
                     await self.session.rollback()
-                    return {"success": False, "message": f"保存商品失败: {exc}"}
+                    return failed("保存商品失败", "storage_error")
                 fetched_items.extend(items)
                 total_saved_count += saved_count
                 fetched_pages = page_number
@@ -508,19 +494,23 @@ class ItemService:
                     logger.info(f"账号[{account.account_id}]商品同步命中整页已存在且无字段变更，停止继续获取后续页面")
                     break
 
-                if len(items) < page_size:
+                if result.get("has_more") is False or len(raw_items) < page_size:
                     logger.info(f"账号[{account.account_id}]商品同步第 {page_number} 页数量少于页大小，结束获取")
                     break
 
                 page_number += 1
                 await asyncio.sleep(1)
+        except ProductCapabilityError as exc:
+            return failed(exc.code, exc.status, {'retry_after':exc.retry_after})
         except Exception as exc:
-            return {"success": False, "message": f"获取商品失败: {exc}"}
+            return failed("获取商品失败: " + type(exc).__name__)
         finally:
-            await manager.close()
+            if manager is not None:
+                await manager.close()
 
         return {
             "success": True,
+            "status": "complete" if fetched_items else "empty",
             "message": f"获取到 {len(fetched_items)} 个商品",
             "items": fetched_items,
             "total_count": len(fetched_items),
@@ -791,9 +781,12 @@ class ItemService:
         """
         from common.services.xianyu_seller_item_client import update_seller_item_price
 
-        # 改价功能仅支持鱼小铺账号
-        if not await self._detect_is_fish_shop(account):
-            return {"success": False, "message": "改价功能仅支持鱼小铺账号"}
+        from common.services.product_results import ProductCapabilityError
+        try:
+            if not await self._detect_is_fish_shop(account):
+                return {"success": False, "message": "改价功能仅支持鱼小铺账号"}
+        except ProductCapabilityError as exc:
+            return exc.response()
 
         try:
             single_payload = None
@@ -1070,14 +1063,14 @@ class ItemService:
         if not item:
             return False
         
-        # 级联删除关联表记录
-        matcher = CardMatcher(self.session)
-        rel_count = await matcher.delete_relations_by_item_id(item_id)
-        if rel_count > 0:
-            logger.info(f"删除商品 {item_id} 的 {rel_count} 条卡券关联记录")
-        
+        # Legacy card relations carry owner+item identity, not account identity.
+        # Keep them while another catalog row in that owner still references the item.
         await self.session.delete(item)
-        await self.session.commit()
+        await self.session.flush()
+        await self._cleanup_unreferenced_item_relations(account.owner_id, item_id)
+        from common.services.product_item_operations import record_item_operation
+        await record_item_operation(self.session, account, account.owner_id, 'local_delete',
+                                    {'item_id': item_id, 'status': 'success', 'platform_changed': False})
         return True
 
     async def delete_item_smart(
@@ -1125,16 +1118,24 @@ class ItemService:
             # 商品所属账号仍存在 → 不允许脱离账号删除，要求指定账号
             return "account_required"
 
-        # 全部为孤儿商品（账号已删除）→ 按 item_id 删除，并清理卡券关联
-        matcher = CardMatcher(self.session)
-        rel_count = await matcher.delete_relations_by_item_id(item_id)
-        if rel_count > 0:
-            logger.info(f"删除孤儿商品 {item_id} 的 {rel_count} 条卡券关联记录")
+        owners = {it.owner_id for it in items}
         for it in items:
             await self.session.delete(it)
+        await self.session.flush()
+        for item_owner in owners:
+            await self._cleanup_unreferenced_item_relations(item_owner, item_id)
         await self.session.commit()
         logger.info(f"已删除孤儿商品 {item_id}（所属账号已不存在），共 {len(items)} 条记录")
         return "ok"
+
+    async def _cleanup_unreferenced_item_relations(self, owner_id, item_id):
+        from sqlalchemy import delete
+        from common.models.card_item_relation import CardItemRelation
+        remaining = (await self.session.execute(select(XYCatalogItem.id).where(
+            XYCatalogItem.owner_id == owner_id, XYCatalogItem.item_id == item_id).limit(1))).first()
+        if remaining is None:
+            await self.session.execute(delete(CardItemRelation).where(
+                CardItemRelation.user_id == owner_id, CardItemRelation.item_id == item_id))
 
     async def delete_many(self, account: XYAccount, item_ids: list[str]) -> int:
         deleted = 0

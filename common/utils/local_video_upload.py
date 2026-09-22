@@ -61,7 +61,7 @@ async def save_uploaded_video(
     if not content_type.startswith("video/") and original_ext not in SAFE_VIDEO_EXTS:
         raise VideoUploadError("只支持上传视频文件")
 
-    content = await video.read()
+    content = await video.read(max_size + 1) if max_size > 0 else await video.read()
     if max_size > 0 and len(content) > max_size:
         raise VideoUploadError(f"视频大小不能超过{max_size // (1024 * 1024)}MB")
 

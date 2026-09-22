@@ -110,7 +110,7 @@ def create_access_token(
 
     expires_delta = expires_delta or timedelta(minutes=settings.access_token_expire_minutes)
     expire = datetime.now(tz=timezone.utc) + expires_delta
-    to_encode.update({"exp": expire})
+    to_encode.update({"exp": expire, "type": "access"})
     return jwt.encode(to_encode, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
 
 

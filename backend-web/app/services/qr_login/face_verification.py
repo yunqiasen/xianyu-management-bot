@@ -74,7 +74,8 @@ async def run_face_verification(
         async with httpx.AsyncClient(
             follow_redirects=True,
             timeout=manager.timeout,
-            proxy=manager.proxy,
+            proxy=session.proxy,
+            trust_env=False,
             cookies=session.cookies,
             headers=manager.headers,
         ) as client:
@@ -125,7 +126,7 @@ async def run_face_verification(
                 }
             )
             iv_check_url: Optional[str] = None
-            while not session.is_expired():
+            while not session.is_expired() and session.status != 'cancelled':
                 if session_id not in manager.sessions:
                     return
                 try:

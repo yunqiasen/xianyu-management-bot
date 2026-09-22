@@ -1,3 +1,4 @@
+import { OperatingSummary } from './OperatingSummary'
 import { useEffect, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Activity, Calendar, MessageSquare, RefreshCw, Shield, ShoppingCart, Users, Package, Clock, DollarSign, ChevronDown, ChevronUp, ExternalLink } from 'lucide-react'
@@ -241,6 +242,7 @@ export function Dashboard() {
         </button>
       </div>
 
+      <OperatingSummary />
       {/* Stats cards */}
       <div className="flex flex-nowrap gap-2 sm:gap-3 overflow-x-auto pb-1 scrollbar-visible">
         {statsLoading ? (
@@ -554,7 +556,7 @@ export function Dashboard() {
                     <span className="text-rose-500 text-xl font-bold">￥</span>
                   </div>
                   <p className="text-2xl font-bold text-rose-600">¥{todayStats.today_amount?.toFixed(2) || '0.00'}</p>
-                  <p className="text-sm text-slate-500">今日订单金额</p>
+                  <p className="text-sm text-slate-500">今日订单净额（含退款）</p>
                 </div>
                 <div className="text-center p-3 bg-emerald-50 dark:bg-emerald-900/20 rounded-lg border border-emerald-100 dark:border-emerald-800">
                   <div className="flex items-center justify-center mb-2">

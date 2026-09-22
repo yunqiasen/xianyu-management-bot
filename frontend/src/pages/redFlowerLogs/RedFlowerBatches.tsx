@@ -1,3 +1,4 @@
+import { ProductFeedbackPanel } from '@/pages/product-feedback/ProductFeedbackPanel'
 /**
  * 求小红花日志页面
  *
@@ -37,7 +38,7 @@ const columns: BatchLogColumn<RedFlowerBatch>[] = [
 
 export function RedFlowerBatches() {
   return (
-    <BatchLogList
+    <><ProductFeedbackPanel kind="red_flower" /><BatchLogList
       title="求小红花日志"
       description="查看求小红花定时任务执行记录"
       fetchBatches={getRedFlowerBatches}
@@ -46,6 +47,6 @@ export function RedFlowerBatches() {
       detailPath={(batchId) => `/admin/red-flower-batches/${batchId}`}
       clearConfirmMessage="此操作将清空10天前的求小红花日志数据，最近10天的日志将被保留。确定要继续吗？"
       showPageSizeSelector={false}
-    />
+    /></>
   )
 }

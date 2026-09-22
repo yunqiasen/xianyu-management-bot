@@ -95,92 +95,13 @@ class RateService:
                 cookies[key.strip()] = value.strip()
         return cookies
     
-    async def rate_buyer(self, trade_id: str, feedback: str = "不错的买家", retry_count: int = 0) -> Dict[str, Any]:
-        """评价买家
-        
-        支持令牌过期时存储set-cookie并重试（参照发货服务模式）
-        
-        Args:
-            trade_id: 订单ID
-            feedback: 评价内容，默认"不错的买家"
-            retry_count: 当前重试次数
-            
-        Returns:
-            评价结果字典，包含success和message
-        """
-        max_retry = 3
-        log_prefix = f"【{self.account_id}】" if self.account_id else ""
-        
-        try:
-            m_h5_tk = self.cookies_dict.get('_m_h5_tk', '')
-            token = m_h5_tk.split('_')[0] if m_h5_tk else ''
-            timestamp = str(int(time.time() * 1000))
-            
-            # 构建请求数据
-            data_obj = {
-                "tradeId": trade_id,
-                "rate": 1,  # 好评
-                "feedback": feedback,
-                "createOrAppend": 0
-            }
-            data_val = json.dumps(data_obj, separators=(',', ':'), ensure_ascii=False)
-            sign = generate_sign(timestamp, token, data_val)
-            
-            params = {
-                "jsv": "2.7.2",
-                "appKey": "34839810",
-                "t": timestamp,
-                "sign": sign,
-                "v": "4.0",
-                "type": "originaljson",
-                "accountSite": "xianyu",
-                "dataType": "json",
-                "timeout": "20000",
-                "api": "mtop.taobao.idle.rate.create",
-                "sessionOption": "AutoLoginOnly"
-            }
-            
-            headers = {
-                "accept": "application/json",
-                "content-type": "application/x-www-form-urlencoded",
-                "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "referer": "https://www.goofish.com/",
-                "origin": "https://www.goofish.com",
-                "cookie": self.cookie_string
-            }
-            
-            url = "https://h5api.m.goofish.com/h5/mtop.taobao.idle.rate.create/4.0/"
-            
-            timeout = aiohttp.ClientTimeout(total=20)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(url, params=params, headers=headers, data={"data": data_val}) as response:
-                    result = await response.json()
-                    
-                    # 处理响应中的set-cookie，更新本地cookie并写入数据库
-                    await self._handle_response_cookies(response)
-                    
-                    ret = result.get('ret', [])
-                    ret_str = ret[0] if ret else str(result)
-                    
-                    if 'SUCCESS' in ret_str:
-                        logger.info(f"{log_prefix}评价成功: trade_id={trade_id}, feedback={feedback}")
-                        return {"success": True, "message": "评价成功"}
-                    else:
-                        logger.warning(f"{log_prefix}评价失败: trade_id={trade_id}, ret={ret_str}")
-                        
-                        # 令牌过期时，用更新后的cookie重试
-                        if any('TOKEN_EXOIRED' in r or 'TOKEN_EXPIRED' in r for r in ret):
-                            if retry_count < max_retry - 1:
-                                logger.info(f"{log_prefix}评价令牌过期，已更新Cookie，准备重试({retry_count + 1}/{max_retry - 1})...")
-                                await asyncio.sleep(0.5)
-                                return await self.rate_buyer(trade_id, feedback, retry_count + 1)
-                        
-                        return {"success": False, "message": ret_str}
-                        
-        except Exception as e:
-            logger.error(f"{log_prefix}评价异常: trade_id={trade_id}, error={e}")
-            return {"success": False, "message": str(e)}
-    
+    async def rate_buyer(self, trade_id: str, feedback: str = "不错的买家", retry_count: int = 0):
+        from common.services.rate_service import RateService as SharedRateService
+        shared = SharedRateService(self.cookie_string, self.account_id)
+        result = await shared.rate_buyer(trade_id, feedback)
+        self.cookie_string = shared.cookie_string
+        return result
+
     async def _handle_response_cookies(self, response) -> None:
         """处理响应中的set-cookie，更新本地cookie并写入数据库
         

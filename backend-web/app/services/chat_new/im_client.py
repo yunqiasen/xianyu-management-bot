@@ -22,6 +22,7 @@ from sqlalchemy import text
 
 from app.services.websocket_client import websocket_client
 from common.db.session import async_session_maker
+from common.services.reply_state import MessageRejectedError
 from common.utils.cookie_refresh import (
     merge_cookies,
     update_account_cookies_in_db,
@@ -527,7 +528,7 @@ class GoofishImClient:
             more_info = body.get("moreInfo", "")
             # moreInfo 形如 "CSI_FORBID||安全拦截"，附在原因后便于定位拦截类型
             detail = f"{reason}（{more_info}）" if more_info else reason
-            raise Exception(detail)
+            raise MessageRejectedError(detail)
 
     # ==================== Token缓存（数据库） ====================
     # 缓存键使用 chat_{myid} 前缀，与自动回复WebSocket的缓存隔离，

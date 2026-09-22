@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from common.db.session import async_session_maker
 from common.models.xy_account import XYAccount
 from common.services.item_service import ItemService
+from common.services.product_admission import product_admission
 from common.services.publish_address_service import PublishAddressService
 from common.services.publish_log_service import PublishLogService
 from common.services.xianyu_publish_service import (
@@ -105,18 +106,20 @@ async def execute_single_publish(
     static_root: str | Path | None = None,
     publish_request_id: str | None = None,
     source_event_id: int | None = None,
+    queued_log_id: int | None = None,
 ) -> Dict[str, Any]:
     """执行单品发布并返回统一结果。"""
     log_svc = PublishLogService(session)
     address_svc = PublishAddressService(session)
 
-    # 只有自动续售发布才启用幂等与未知结果对账保护。
-    # 手工单品发布必须优先执行，不得被自动续售历史状态拦截。
+    # 单品、批次和自动续售均按请求号防重；进入外部调用后的异常先核实。
     is_auto_relist_publish = source_event_id is not None
     existing_log = None
-    if is_auto_relist_publish and publish_request_id:
+    if publish_request_id:
         existing_log = await log_svc.get_by_request_id(publish_request_id)
         if existing_log:
+            if existing_log.user_id != user_id or existing_log.account_id != account_id:
+                return {"success": False, "message": "发布请求号归属不匹配"}
             if existing_log.status == "success" and existing_log.item_id:
                 return {
                     "success": True,
@@ -126,7 +129,9 @@ async def execute_single_publish(
                     "log_id": existing_log.id,
                     "idempotent_reused": True,
                 }
-            if existing_log.status in {"pending", "publishing", "unknown"}:
+            if existing_log.status in {"pending", "publishing", "unknown", "cancelled"} and not (
+                queued_log_id == existing_log.id and existing_log.status == 'pending'
+            ):
                 return {
                     "success": False,
                     "unknown": True,
@@ -136,8 +141,27 @@ async def execute_single_publish(
                     "log_id": existing_log.id,
                 }
 
-    # 单品发布严格使用前端选择的账号；启用状态只控制自动任务，不限制手动发布。
+    from common.models.publish_log import PublishLog
+    queued_claimed = False
+    if queued_log_id is not None:
+        from sqlalchemy import update
+        if not existing_log or existing_log.id != queued_log_id:
+            return {'success': False, 'message': '批次日志不匹配'}
+        changed = await session.execute(update(PublishLog).where(PublishLog.id == queued_log_id,
+            PublishLog.user_id == user_id, PublishLog.status == 'pending').values(status='publishing'))
+        await session.commit()
+        if changed.rowcount != 1:
+            return {'success': False, 'message': '未发项已取消或已由其他执行方领取'}
+        queued_claimed = True
+
+    # 手动与自动发布同样遵守账号业务状态，停用账号不执行平台调用。
     account = await _get_account(session=session, account_id=account_id, user_id=user_id)
+    if account:
+        admission = product_admission(account)
+        if not admission['allowed']:
+            if queued_claimed:
+                await log_svc.update_log(existing_log.id, 'failed', error_message=admission.get('message', admission['status']))
+            return {**admission, 'success': False}
     cookies_str = account.cookie if account and account.cookie else ""
     if not account or not cookies_str.strip():
         error_message = (
@@ -145,7 +169,8 @@ async def execute_single_publish(
             if not account
             else "选择的闲鱼账号缺少Cookie，请重新登录账号"
         )
-        if existing_log and existing_log.status == "failed":
+        if existing_log and (existing_log.status == "failed" or queued_claimed):
+            existing_log.status = "failed"
             existing_log.error_message = error_message
             await session.commit()
             log = existing_log
@@ -171,7 +196,8 @@ async def execute_single_publish(
     try:
         resolved_address = await address_svc.resolve_publish_address(account_id, item_data)
     except ValueError as exc:
-        if existing_log and existing_log.status == "failed":
+        if existing_log and (existing_log.status == "failed" or queued_claimed):
+            existing_log.status = "failed"
             existing_log.error_message = str(exc)
             await session.commit()
             log = existing_log
@@ -191,14 +217,22 @@ async def execute_single_publish(
         return {"success": False, "message": str(exc), "log_id": log.id}
 
     publish_item_data = resolved_address.apply_to_item_data(item_data)
-    if existing_log and existing_log.status == "failed":
+    if existing_log and (existing_log.status == "failed" or queued_claimed):
         # 明确失败未产生平台副作用，可安全复用同一幂等日志重试。
-        existing_log.status = "publishing"
-        existing_log.error_message = None
-        existing_log.item_id = None
-        existing_log.item_url = None
-        await session.commit()
+        if not queued_claimed and not await log_svc.claim_failed(existing_log.id):
+            return {"success": False, "unknown": True, "message": "该发布记录已被其他执行方处理", "log_id": existing_log.id}
+        # 重试沿用最初快照，不随素材编辑漂移。
+        publish_item_data = existing_log.publish_snapshot or publish_item_data
         log = existing_log
+        # A queued snapshot freezes material identity first; freeze the selected account
+        # address exactly once before the first actual platform submission.
+        if queued_claimed and not getattr(existing_log, 'resolved_address_text', None):
+            from copy import deepcopy
+            publish_item_data = resolved_address.apply_to_item_data(publish_item_data)
+            log.publish_snapshot = deepcopy(publish_item_data)
+            for field, value in resolved_address.to_log_fields().items():
+                setattr(log, field, value)
+            await session.commit()
     else:
         try:
             log = await log_svc.create_log(
@@ -209,6 +243,7 @@ async def execute_single_publish(
                 price=str(item_data.get("price", "")),
                 material_id=item_data.get("id"),
                 status="publishing",
+                publish_snapshot=publish_item_data,
                 publish_request_id=publish_request_id,
                 source_event_id=source_event_id,
                 **resolved_address.to_log_fields(),
@@ -217,9 +252,11 @@ async def execute_single_publish(
             # 并发调用同一请求号时，唯一约束只允许一个日志获胜；
             # 另一方必须读取已有状态，不能继续调用平台接口。
             await session.rollback()
-            if is_auto_relist_publish and publish_request_id:
+            if publish_request_id:
                 existing_log = await log_svc.get_by_request_id(publish_request_id)
                 if existing_log:
+                    if existing_log.user_id != user_id or existing_log.account_id != account_id:
+                        return {"success": False, "message": "发布请求号归属不匹配"}
                     return {
                         "success": existing_log.status == "success" and bool(existing_log.item_id),
                         "unknown": existing_log.status != "failed",
@@ -271,7 +308,7 @@ async def execute_single_publish(
                 owner_id=user_id,
                 static_root=static_root,
             )
-        if result.get("account_invalid"):
+        if isinstance(result, dict) and result.get("account_invalid"):
             logger.warning(
                 f"单品发布选定账号不可用，按要求不切换账号: account_id={account.account_id}, "
                 f"error={result.get('message') or '账号失效'}"
@@ -281,18 +318,18 @@ async def execute_single_publish(
         if refreshed_cookies and refreshed_cookies != account.cookie:
             account.cookie = refreshed_cookies
             refreshed_cookie = refreshed_cookies
-        publish_unknown = is_auto_relist_publish and publish_call_started and bool(
+        publish_unknown = publish_call_started and bool(
             result and (result.get("unknown") or result.get("_request_status_unknown"))
         )
     except Exception as exc:
         pub_error = exc
         # 一旦进入平台发布调用，异常无法证明平台未产生副作用；即使异常类型
         # 不是常见网络错误，也必须进入人工对账，避免自动续售重复上架。
-        publish_unknown = is_auto_relist_publish and publish_call_started
+        publish_unknown = publish_call_started
         logger.error(f"单品发布异常: {exc}")
 
     if not isinstance(result, dict):
-        publish_unknown = is_auto_relist_publish and publish_call_started
+        publish_unknown = publish_call_started
         result = {"success": False, "message": "发布接口未返回有效结果"}
 
     # 手动发布失败或商品列表没有发生变化时，后续流程可能不会提交调用方会话；
@@ -321,7 +358,7 @@ async def execute_single_publish(
             if pub_error:
                 await fresh_log_svc.update_log(
                     log_id=log.id,
-                    status="publishing" if publish_unknown else "failed",
+                    status=("publishing" if is_auto_relist_publish else "unknown") if publish_unknown else "failed",
                     error_message="发布请求已提交，结果未知，请先对账" if publish_unknown else str(pub_error),
                 )
                 return {
@@ -334,7 +371,7 @@ async def execute_single_publish(
             if publish_unknown:
                 await fresh_log_svc.update_log(
                     log_id=log.id,
-                    status="publishing",
+                    status="publishing" if is_auto_relist_publish else "unknown",
                     error_message="发布请求结果未知，请先对账",
                 )
                 return {
@@ -351,7 +388,7 @@ async def execute_single_publish(
             # 自动续售必须拿到平台商品 ID 才能继续本地迁移和切换监听商品。
             # 平台返回成功但缺少 ID（或返回失败却带有 ID）都无法证明副作用状态，
             # 统一保留为未知结果，禁止后续再次调用发布接口。
-            ambiguous_result = is_auto_relist_publish and bool(publish_request_id) and (
+            ambiguous_result = publish_call_started and (
                 (publish_success and not result_item_id)
                 or (not publish_success and bool(result_item_id))
             )
@@ -363,7 +400,7 @@ async def execute_single_publish(
                 )
                 await fresh_log_svc.update_log(
                     log_id=log.id,
-                    status="publishing",
+                    status="publishing" if is_auto_relist_publish else "unknown",
                     item_id=result_item_id or None,
                     error_message=reconcile_message,
                 )
@@ -385,7 +422,7 @@ async def execute_single_publish(
             )
     except Exception as db_err:
         logger.error(f"更新发布日志失败: {db_err}")
-        if is_auto_relist_publish and publish_request_id:
+        if publish_request_id:
             # 外部平台结果已返回，但本地日志状态无法确认，自动续售不得把它当作
             # 可安全重试的明确失败，否则可能重复上架。
             return {
@@ -406,12 +443,23 @@ async def execute_single_publish(
         "sync_total_count": 0,
         "sync_saved_count": 0,
     }
+    batch_id = getattr(log, 'batch_id', None)
+    if publish_success and batch_id:
+        from common.services.product_batch_service import ProductBatchService
+        ProductBatchService(session).evidence(user_id, f'batch:{batch_id}', 'account_sync',
+            {'account_id': account_id, 'sync_status': 'running', 'sync_message': '正在同步已发布商品'})
+        await session.commit()
     if publish_success and account is not None:
         sync_info = await _sync_account_items_after_publish(
             session=session,
             account_id=account_id,
             account=account,
         )
+
+    if publish_success and batch_id:
+        ProductBatchService(session).evidence(user_id, f'batch:{batch_id}', 'account_sync',
+            {'account_id': account_id, **sync_info})
+        await session.commit()
 
     message = result.get("message") or ("商品发布成功" if publish_success else "发布失败")
     if publish_success and sync_info.get("sync_message"):

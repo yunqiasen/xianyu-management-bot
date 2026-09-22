@@ -38,6 +38,8 @@ class SchedulerConfig(BaseConfig):
         alias="BACKEND_WEB_SERVICE_URL",
     )
 
+    auto_start_scheduler: bool = Field(default=False, alias="AUTO_START_SCHEDULER")
+
     # 自动续售执行参数：周期由定时任务配置表控制，批量和租约通过环境变量调节。
     auto_relist_batch_size: int = Field(
         default=10, alias="AUTO_RELIST_BATCH_SIZE", ge=1, le=100

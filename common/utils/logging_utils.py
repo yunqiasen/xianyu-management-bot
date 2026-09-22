@@ -20,7 +20,7 @@ from typing import List, Optional
 from loguru import logger
 
 # 默认日志保留天数
-DEFAULT_LOG_RETENTION_DAYS = 7
+DEFAULT_LOG_RETENTION_DAYS = 30
 
 # 模块级变量：跟踪普通日志与错误日志处理器，支持动态更新
 _file_handler_id: int | None = None
@@ -29,7 +29,7 @@ _current_log_file: Path | None = None
 _current_retention_days: int = DEFAULT_LOG_RETENTION_DAYS
 
 # 文件日志格式与轮转大小（普通日志和错误日志共用）
-_FILE_LOG_FORMAT = "{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}"
+_FILE_LOG_FORMAT = "{extra[correlation_id]} | {time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}"
 _FILE_LOG_ROTATION = "100 MB"
 
 
@@ -71,7 +71,7 @@ def _add_file_handlers(log_file: Path, retention_days: int) -> tuple[int, int]:
         level="DEBUG",
         format=_FILE_LOG_FORMAT,
         rotation=_FILE_LOG_ROTATION,
-        retention=f"{retention_days} days",
+        retention=lambda files: archive_expired_logs(files, retention_days),
         encoding="utf-8",
         enqueue=True,
     )
@@ -80,7 +80,7 @@ def _add_file_handlers(log_file: Path, retention_days: int) -> tuple[int, int]:
         level="ERROR",
         format=_FILE_LOG_FORMAT,
         rotation=_FILE_LOG_ROTATION,
-        retention=f"{retention_days} days",
+        retention=lambda files: archive_expired_logs(files, retention_days),
         encoding="utf-8",
         enqueue=True,
     )
@@ -102,7 +102,7 @@ def setup_logging(
         log_file: 日志文件路径
         log_level: 控制台日志级别，默认 INFO
         third_party_loggers: 需要拦截的第三方库日志名称列表
-        retention_days: 日志保留天数，默认 7 天
+        retention_days: 日志在线保留天数，默认 30 天；更早记录归档
     """
     global _file_handler_id, _error_file_handler_id, _current_log_file, _current_retention_days
     _current_log_file = log_file
@@ -113,6 +113,7 @@ def setup_logging(
 
     # 移除默认的 stderr handler
     logger.remove()
+    logger.configure(patcher=_redact_record)
 
     # 添加控制台输出
     logger.add(
@@ -259,3 +260,59 @@ async def run_db_log_retention_sync(poll_interval_seconds: int = 5) -> None:
                 last_error_message = error_message
 
         await asyncio.sleep(interval_seconds)
+
+# 所有日志出口共用；结构字段优先，字符串处理常见凭据赋值/URL参数。
+import re
+from contextvars import ContextVar
+from contextlib import contextmanager
+from uuid import uuid4
+correlation_id = ContextVar('correlation_id', default='-')
+_SECRET_KEY = re.compile(r'cookie|password|passwd|secret|token|authorization|api.?key|proxy_pass|delivery_content|card_content|screenshot|x5sec', re.I)
+_SECRET_TEXT = re.compile(r'''(?i)(["']?(?:cookie|password|passwd|secret(?:_key)?|token|access_token|api_key|authorization|proxy_pass|delivery_content|card_content|x5sec)["']?\s*[:=]\s*)(?:"[^"\n]*"|'[^'\n]*'|[^\s,;&}]+)''')
+
+def redact_secrets(value):
+    if isinstance(value, dict):
+        return {k: '[REDACTED]' if _SECRET_KEY.search(str(k)) else redact_secrets(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact_secrets(v) for v in value]
+    if isinstance(value, str):
+        value = re.sub(r"(?i)\bcookie\s*[:=]\s*[^\r\n]+", "Cookie: [REDACTED]", value)
+        value = re.sub(r'(?i)Bearer\s+[A-Za-z0-9._~+/-]+=*', 'Bearer [REDACTED]', value)
+        return _SECRET_TEXT.sub(r'\1[REDACTED]', value)
+    return value
+
+
+def _redact_record(record):
+    record['message'] = redact_secrets(record['message'])
+    record['extra'] = redact_secrets(record['extra'])
+    record['extra'].setdefault('correlation_id', correlation_id.get())
+    # 异常原值常携带HTTP请求体；类型留存，详细秘密不写普通sink。
+    if record.get('exception'):
+        exc = record['exception']
+        record['message'] += f' [{exc.type.__name__}]'
+        record['exception'] = None
+
+
+@contextmanager
+def log_context(value=None):
+    value = value if value and re.fullmatch(r'[A-Za-z0-9_-]{1,80}', value) else str(uuid4())
+    token = correlation_id.set(value)
+    try:
+        yield value
+    finally:
+        correlation_id.reset(token)
+
+
+def archive_expired_logs(files, retention_days=30):
+    """轮转文件超期移入归档；不销毁未知结果与业务追踪证据。"""
+    import time
+    for file in files:
+        path = Path(file)
+        if not path.is_file() or path.is_symlink() or path.stat().st_mtime >= time.time()-retention_days*86400:
+            continue
+        directory = path.parent / 'archive'
+        directory.mkdir(exist_ok=True)
+        target = directory / path.name
+        if target.exists():
+            target = directory / f'{path.name}.{uuid4().hex}'
+        path.rename(target)

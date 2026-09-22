@@ -82,6 +82,7 @@ class VideoMaterialRequest(BaseModel):
 
 
 class SpecificationValueRequest(BaseModel):
+    source_id: Optional[str] = Field(None, max_length=128)
     """单个商品规格值。"""
 
     name: str = Field(..., min_length=1, max_length=100)
@@ -89,6 +90,7 @@ class SpecificationValueRequest(BaseModel):
 
 
 class ProductSpecificationRequest(BaseModel):
+    source_id: Optional[str] = Field(None, max_length=128)
     """商品规格类型及其可选值。"""
 
     name: str = Field(..., min_length=1, max_length=100)
@@ -97,6 +99,7 @@ class ProductSpecificationRequest(BaseModel):
 
 
 class PublishSkuRowRequest(BaseModel):
+    source_id: Optional[str] = Field(None, max_length=128)
     """规格组合对应的价格和库存。"""
 
     specs: Dict[str, str] = Field(default_factory=dict, max_length=4)
@@ -183,6 +186,7 @@ class MaterialUpdateRequest(BaseModel):
 
 
 class PublishSingleRequest(BaseModel):
+    publish_request_id: Optional[str] = Field(None, min_length=8, max_length=100)
     """单品发布请求"""
     account_id: str = Field(..., description="闲鱼账号ID（cookie_id）")
     title: str = Field(..., min_length=1, max_length=200)
@@ -218,6 +222,8 @@ class PublishSingleRequest(BaseModel):
     @model_validator(mode="after")
     def normalize_delivery_method(self) -> "PublishSingleRequest":
         """以 shipping_method 为发布载荷事实来源，统一兼容字段。"""
+        from app.services.product_publish_service import _normalize_material_json
+        _normalize_material_json(self.model_dump())
         self.delivery_method = "pickup" if self.shipping_method == "none" else "express"
         return self
 
@@ -717,6 +723,7 @@ async def publish_single(
             "item_url": result.get("item_url"),
             "item_id": result.get("item_id"),
             "log_id": result.get("log_id"),
+            "unknown": result.get("unknown", False),
             "sync_status": result.get("sync_status"),
             "sync_message": result.get("sync_message"),
             "sync_total_count": result.get("sync_total_count"),
@@ -744,12 +751,12 @@ async def publish_batch(
     if not materials:
         return ApiResponse(success=False, message="没有找到有效的素材")
 
-    batch_id = str(uuid.uuid4())
-    await PublishBatchStatusService.init_batch(
-        batch_id=batch_id,
-        account_ids=req.account_ids,
-        material_count=len(materials),
-    )
+    from common.services.product_batch_service import ProductBatchService
+    try:
+        batch = await ProductBatchService(session).create(current_user.id, req.account_ids, materials)
+    except ValueError as exc:
+        return ApiResponse(success=False, message=str(exc))
+    batch_id = batch.id
 
     # 创建后台任务
     background_tasks.add_task(
@@ -770,130 +777,66 @@ async def publish_batch(
     )
 
 
+@router.get('/publish/batches', response_model=ApiResponse)
+async def list_persistent_batches(current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db_session)):
+    from sqlalchemy import select
+    from common.models.product_operation import ProductPublishBatch
+    batches = (await session.execute(select(ProductPublishBatch).where(ProductPublishBatch.owner_id == current_user.id)
+        .order_by(ProductPublishBatch.created_at.desc()).limit(100))).scalars()
+    return ApiResponse(success=True, data=[dict(batch_id=b.id, created_at=b.created_at.isoformat(),
+        total=b.material_count * len(b.account_ids), cancelled=b.cancelled) for b in batches])
+
+
 @router.get("/publish/batch/{batch_id}/status", response_model=ApiResponse)
 async def get_batch_status(
     batch_id: str,
     current_user: User = Depends(get_current_active_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> Dict[str, Any]:
-    """查询批量发布任务进度"""
-    from sqlalchemy import select, func
-    from common.models.publish_log import PublishLog
+    from common.services.product_batch_service import ProductBatchService
+    data = await ProductBatchService(session).status(current_user.id, batch_id)
+    return ApiResponse(success=data is not None, message="查询成功" if data else "批次不存在", data=data)
 
-    unknown_sync_message = "批量任务同步状态缓存不存在，无法判断自动获取商品结果"
 
-    stmt = select(
-        PublishLog.status,
-        func.count().label("cnt"),
-    ).where(
-        PublishLog.batch_id == batch_id,
-        PublishLog.user_id == current_user.id,
-    ).group_by(PublishLog.status)
+@router.post('/publish/batch/{batch_id}/{action}', response_model=ApiResponse)
+async def control_batch(batch_id: str, action: Literal['cancel', 'retry-failed', 'resume'],
+    background_tasks: BackgroundTasks, current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db_session)):
+    from common.services.product_batch_service import ProductBatchService
+    svc = ProductBatchService(session)
+    if not await svc.get(current_user.id, batch_id):
+        return ApiResponse(success=False, message='批次不存在')
+    if action == 'cancel':
+        count = await svc.cancel(current_user.id, batch_id)
+    else:
+        count = await svc.retry_failed(current_user.id, batch_id) if action == 'retry-failed' else 0
+        background_tasks.add_task(_run_batch_publish_background, current_user.id, [], [], batch_id)
+    return ApiResponse(success=True, message='操作已记录', data={'affected': count})
 
-    rows = (await session.execute(stmt)).all()
-    counts = {r.status: r.cnt for r in rows}
 
-    account_stmt = select(
-        PublishLog.account_id,
-        PublishLog.status,
-        func.count().label("cnt"),
-    ).where(
-        PublishLog.batch_id == batch_id,
-        PublishLog.user_id == current_user.id,
-    ).group_by(PublishLog.account_id, PublishLog.status)
-    account_rows = (await session.execute(account_stmt)).all()
+class PublishReconcileRequest(BaseModel):
+    outcome: Literal['published', 'not_published']
+    item_id: Optional[str] = Field(None, min_length=1, max_length=64)
+    evidence: str = Field(..., min_length=5, max_length=1000)
 
-    account_count_map: Dict[str, Dict[str, int]] = {}
-    for row in account_rows:
-        status_map = account_count_map.setdefault(row.account_id, {})
-        status_map[row.status] = int(row.cnt)
 
-    total = sum(counts.values())
-    success = counts.get("success", 0)
-    failed = counts.get("failed", 0)
-    publishing = counts.get("publishing", 0)
-    pending = counts.get("pending", 0)
-    batch_snapshot = await PublishBatchStatusService.get_batch_snapshot(batch_id)
+@router.post('/logs/{log_id}/reconcile', response_model=ApiResponse)
+async def reconcile_publish(log_id: int, req: PublishReconcileRequest,
+    current_user: User = Depends(get_current_active_user), session: AsyncSession = Depends(get_db_session)):
+    from common.services.product_batch_service import ProductBatchService
+    try:
+        await ProductBatchService(session).reconcile(current_user.id, log_id, **req.model_dump())
+    except ValueError as exc:
+        return ApiResponse(success=False, message=str(exc))
+    return ApiResponse(success=True, message='核对结果与操作证据已保存')
 
-    if batch_snapshot is None:
-        if total == 0:
-            return ApiResponse(success=False, message="批量任务不存在或状态已失效")
-        return ApiResponse(success=False, message="批量任务状态已失效，请到发布日志查看执行结果")
 
-    account_statuses: List[Dict[str, Any]] = []
-    if batch_snapshot:
-        material_count = int(batch_snapshot.get("material_count") or 0)
-        account_order = batch_snapshot.get("account_order") or []
-        account_sync_map = batch_snapshot.get("accounts") or {}
-        expected_total = material_count * len(account_order)
-        if expected_total > total:
-            total = expected_total
-            pending = max(total - success - failed - publishing, 0)
-
-        for account_id in account_order:
-            status_map = account_count_map.get(account_id, {})
-            account_total = material_count if material_count > 0 else sum(status_map.values())
-            account_success = int(status_map.get("success", 0))
-            account_failed = int(status_map.get("failed", 0))
-            account_publishing = int(status_map.get("publishing", 0))
-            account_pending = max(account_total - account_success - account_failed - account_publishing, 0)
-            sync_info = account_sync_map.get(account_id, {})
-            account_statuses.append(
-                {
-                    "account_id": account_id,
-                    "total": account_total,
-                    "success": account_success,
-                    "failed": account_failed,
-                    "publishing": account_publishing,
-                    "pending": account_pending,
-                    "sync_status": sync_info.get("sync_status", "pending"),
-                    "sync_message": sync_info.get("sync_message", "等待该账号发布完成后自动获取商品"),
-                    "sync_total_count": int(sync_info.get("sync_total_count") or 0),
-                    "sync_saved_count": int(sync_info.get("sync_saved_count") or 0),
-                }
-            )
-
-        extra_account_ids = [account_id for account_id in account_count_map.keys() if account_id not in set(account_order)]
-        for account_id in extra_account_ids:
-            status_map = account_count_map.get(account_id, {})
-            account_total = sum(status_map.values())
-            account_success = int(status_map.get("success", 0))
-            account_failed = int(status_map.get("failed", 0))
-            account_publishing = int(status_map.get("publishing", 0))
-            account_pending = int(status_map.get("pending", 0))
-            account_statuses.append(
-                {
-                    "account_id": account_id,
-                    "total": account_total,
-                    "success": account_success,
-                    "failed": account_failed,
-                    "publishing": account_publishing,
-                    "pending": account_pending,
-                    "sync_status": "unknown",
-                    "sync_message": unknown_sync_message,
-                    "sync_total_count": 0,
-                    "sync_saved_count": 0,
-                }
-            )
-    sync_finished = all(
-        account_status.get("sync_status") in {"success", "failed", "skipped", "unknown"}
-        for account_status in account_statuses
-    ) if account_statuses else True
-
-    return ApiResponse(
-        success=True,
-        message="查询成功",
-        data={
-            "batch_id": batch_id,
-            "total": total,
-            "success": success,
-            "failed": failed,
-            "publishing": publishing,
-            "pending": pending,
-            "finished": total > 0 and (publishing + pending) == 0 and sync_finished,
-            "account_statuses": account_statuses,
-        },
-    )
+@router.get('/logs/{log_id}/evidence', response_model=ApiResponse)
+async def publish_evidence(log_id: int, current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db_session)):
+    from common.services.product_batch_service import ProductBatchService
+    return ApiResponse(success=True, data=await ProductBatchService(session).list_evidence(current_user.id, f'publish:{log_id}'))
 
 
 # ==================== 发布日志接口 ====================
@@ -948,6 +891,9 @@ async def clear_publish_logs(
         stmt = delete(PublishLog).where(
             PublishLog.user_id == current_user.id,
             PublishLog.created_at < ten_days_ago,
+            PublishLog.publish_request_id.is_(None),
+            PublishLog.status.in_(['success', 'failed']),
+            PublishLog.publish_snapshot.is_(None),
         )
 
         result = await session.execute(stmt)
@@ -976,7 +922,7 @@ async def upload_product_images(
 
     返回本地文件路径列表，这些路径将直接传给 Playwright 的 set_input_files。
     """
-    upload_dir = get_upload_path("products")
+    upload_dir = get_upload_path("products") / str(current_user.id)
 
     if len(files) > 9:
         return ApiResponse(success=False, message="最多上传9张图片")
@@ -998,7 +944,7 @@ async def upload_product_images(
             )
 
         saved_paths.append(str(filepath))                          # 绝对路径，用于 Playwright
-        saved_urls.append(f"/static/uploads/products/{filename}")  # URL，用于前端预览
+        saved_urls.append(f"/static/uploads/products/{current_user.id}/{filename}")  # URL，用于前端预览
 
     return ApiResponse(
         success=True,
@@ -1013,11 +959,10 @@ async def upload_product_videos(
     current_user: User = Depends(get_current_active_user),
 ) -> Dict[str, Any]:
     """上传商品视频（最多3个，每个最大100MB）。"""
-    del current_user
     if len(files) > 3:
         return ApiResponse(success=False, message="最多上传3个视频")
 
-    upload_dir = get_upload_path("products")
+    upload_dir = get_upload_path("products") / str(current_user.id)
     videos: List[dict] = []
     for file in files:
         try:
@@ -1026,7 +971,7 @@ async def upload_product_videos(
             return ApiResponse(success=False, message=f"文件 {file.filename}: {exc.message}")
         videos.append({
             "path": str(filepath),
-            "url": f"/static/uploads/products/{filename}",
+            "url": f"/static/uploads/products/{current_user.id}/{filename}",
             "name": file.filename or filename,
             "size": size,
         })
@@ -1056,15 +1001,10 @@ async def _run_batch_publish_background(
     import traceback
 
     async with async_session_maker() as session:
-        svc = PublishExecutorService(session)
+        from common.services.product_batch_service import ProductBatchService
+        from app.core.paths import STATIC_ROOT
         try:
-            # 直接将 batch_id 传给 service，确保日志与路由返回值一致
-            await svc.batch_publish(
-                user_id=user_id,
-                account_ids=account_ids,
-                materials=materials,
-                batch_id=batch_id,
-            )
-        except Exception as e:
-            logger.error(f"批量发布后台任务异常: {e}\n{traceback.format_exc()}")
-            await PublishBatchStatusService.clear_batch(batch_id)
+            await ProductBatchService(session).run(user_id, batch_id, STATIC_ROOT)
+        except Exception:
+            await session.rollback()
+            logger.exception('批量任务中断；未发项可继续，已提交项先核实')

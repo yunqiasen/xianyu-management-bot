@@ -1,3 +1,4 @@
+import type { NotificationChannel } from '@/api/notifications'
 import { useState, useEffect } from 'react'
 import type { FormEvent } from 'react'
 import { motion } from 'framer-motion'
@@ -9,7 +10,7 @@ import { useAuthStore } from '@/store/authStore'
 import { PageLoading } from '@/components/common/Loading'
 import { Select } from '@/components/common/Select'
 import { ConfirmModal } from '@/components/common/ConfirmModal'
-import type { MessageNotification, NotificationChannel, Account } from '@/types'
+import type { MessageNotification, Account } from '@/types'
 
 export function MessageNotifications() {
   const { addToast } = useUIStore()

@@ -390,18 +390,18 @@ async def upload_item_default_reply_image(
         return ApiResponse(success=False, message="账号不存在")
 
     try:
-        # 保留原行为：只校验类型，不限制文件大小
+        # 统一图片类型、大小与资源归属限制
         _, filename, _ = await save_uploaded_image(
             image,
-            ITEM_REPLY_UPLOAD_DIR,
+            ITEM_REPLY_UPLOAD_DIR / str(account.owner_id),
             filename_prefix=f"{cookie_id}_{item_id}",
-            validate_size=False,
+            validate_size=True,
         )
     except ImageUploadError as exc:
         return ApiResponse(success=False, message=exc.message)
 
     # 返回相对URL路径
-    image_url = f"/static/uploads/item_reply/{filename}"
+    image_url = f"/static/uploads/item_reply/{account.owner_id}/{filename}"
     return {"success": True, "image_url": image_url}
 
 
@@ -466,18 +466,18 @@ async def upload_batch_default_reply_image(
         return ApiResponse(success=False, message="账号不存在")
 
     try:
-        # 保留原行为：只校验类型，不限制文件大小
+        # 统一图片类型、大小与资源归属限制
         _, filename, _ = await save_uploaded_image(
             image,
-            ITEM_REPLY_UPLOAD_DIR,
+            ITEM_REPLY_UPLOAD_DIR / str(account.owner_id),
             filename_prefix=f"{cookie_id}_batch",
-            validate_size=False,
+            validate_size=True,
         )
     except ImageUploadError as exc:
         return ApiResponse(success=False, message=exc.message)
 
     # 返回相对URL路径
-    image_url = f"/static/uploads/item_reply/{filename}"
+    image_url = f"/static/uploads/item_reply/{account.owner_id}/{filename}"
     return {"success": True, "image_url": image_url}
 
 
@@ -719,6 +719,50 @@ async def batch_save_item_ai_prompt(
 
 
 # ==================== 商品详情（通用路由放在具体路由之后）====================
+
+
+class PolishWindowRequest(PydanticBaseModel):
+    randomize: bool = False
+    timezone_name: str = 'Asia/Shanghai'
+    start: str = '09:00'
+    end: str = '10:00'
+
+
+@items_router.get('/polish-window/{account_id}')
+async def get_polish_window(account_id: str,
+                            current_user: User = Depends(deps.get_current_active_user),
+                            account_service: AccountService = Depends(deps.get_account_service),
+                            session: AsyncSession = Depends(deps.get_db_session)):
+    from datetime import datetime, timezone
+    from common.services.product_polish_schedule import ProductPolishScheduleService, polish_window
+    owner_id, _ = resolve_owner_scope(current_user)
+    account = await account_service.get_account_for_user(owner_id, account_id)
+    if not account:
+        raise HTTPException(404, '账号不存在')
+    row = await ProductPolishScheduleService(session).get(account.owner_id, account_id)
+    if row is None:
+        return {'success': True, 'data': {'configured': False, 'enabled': account.auto_polish}}
+    config = {key: getattr(row, key) for key in ('timezone_name', 'start', 'end')}
+    return {'success': True, 'data': {**config, 'configured': True, 'enabled': account.auto_polish,
+        'last_status': row.last_status, 'randomize':row.randomize, 'planned_at':row.planned_at, **polish_window(datetime.now(timezone.utc), **config, last_cycle=row.last_cycle)}}
+
+
+@items_router.put('/polish-window/{account_id}')
+async def save_polish_window(account_id: str, payload: PolishWindowRequest,
+                             current_user: User = Depends(deps.get_current_active_user),
+                             account_service: AccountService = Depends(deps.get_account_service),
+                             session: AsyncSession = Depends(deps.get_db_session)):
+    from common.services.product_polish_schedule import ProductPolishScheduleService
+    owner_id, _ = resolve_owner_scope(current_user)
+    account = await account_service.get_account_for_user(owner_id, account_id)
+    if not account:
+        raise HTTPException(404, '账号不存在')
+    try:
+        await ProductPolishScheduleService(session).save(account.owner_id, account_id, payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return {'success': True, 'message': '时间窗已保存；账号原擦亮开关保持不变'}
+
 
 @items_router.get("/{cookie_id}/{item_id}")
 async def get_item_detail(
@@ -1044,6 +1088,8 @@ async def batch_offline_items(
     payload: ItemBatchOfflineRequest,
     current_user: User = Depends(deps.get_current_active_user),
     account_service: AccountService = Depends(deps.get_account_service),
+    item_service: ItemService = Depends(deps.get_item_service),
+    session: AsyncSession = Depends(deps.get_db_session),
 ) -> ApiResponse:
     """批量下架商品（调用闲鱼接口，使用所选账号的Cookie）
 
@@ -1062,9 +1108,22 @@ async def batch_offline_items(
     if not account.cookie:
         return ApiResponse(success=False, message="该账号未登录（Cookie为空），无法下架")
 
-    result = await batch_offline_items_from_xianyu(
-        account.account_id, account.cookie, payload.item_ids
-    )
+    from common.services.product_admission import product_admission
+    from common.services.product_item_operations import record_item_operation
+    admission = product_admission(account)
+    if not admission['allowed']:
+        return ApiResponse(success=False, message=admission.get('message', admission['status']), data=admission)
+    known = await item_service.get_existing_item_ids_for_account(account, payload.item_ids)
+    if set(payload.item_ids) - set(known):
+        return ApiResponse(success=False, message='部分商品不属于当前账号，请先同步核对')
+    await record_item_operation(session, account, current_user.id, 'platform_offline',
+                                {'item_ids': payload.item_ids, 'status': 'submitted'})
+    try:
+        result = await batch_offline_items_from_xianyu(account.account_id, account.cookie, payload.item_ids)
+    except Exception:
+        result = {'suc_count': 0, 'fail_count': 0, 'unknown': True, 'message': '下架结果待核实'}
+    await record_item_operation(session, account, current_user.id, 'platform_offline',
+                                {k: v for k, v in result.items() if k in ('results','suc_count','fail_count','unknown','message')})
     suc_count = result.get("suc_count", 0)
     fail_count = result.get("fail_count", 0)
     logger.info(
@@ -1072,7 +1131,7 @@ async def batch_offline_items(
         f"成功={suc_count}, 失败={fail_count}"
     )
 
-    data = {"results": result.get("results", []), "suc_count": suc_count, "fail_count": fail_count}
+    data = {"results": result.get("results", []), "suc_count": suc_count, "fail_count": fail_count, "unknown": bool(result.get("unknown"))}
     # 全部失败：透传闲鱼返回的失败原因，便于前端展示
     if suc_count == 0:
         return ApiResponse(
@@ -1091,6 +1150,7 @@ async def batch_delete_xianyu_items(
     current_user: User = Depends(deps.get_current_active_user),
     account_service: AccountService = Depends(deps.get_account_service),
     item_service: ItemService = Depends(deps.get_item_service),
+    session: AsyncSession = Depends(deps.get_db_session),
 ) -> ApiResponse:
     """使用指定账号 Cookie 批量删除闲鱼平台商品，并同步删除本地库记录。
 
@@ -1188,13 +1248,25 @@ async def batch_delete_xianyu_items(
             message=f"以下商品不属于所选账号或本地记录不存在：{preview}{suffix}",
         )
 
-    result = await batch_delete_items_from_xianyu(
-        account_id=account.account_id,
-        account_row_id=int(account.id),
-        owner_id=int(account.owner_id),
-        cookies_str=account.cookie,
-        item_ids=cleaned_item_ids,
-    )
+    from common.services.product_admission import product_admission
+    from common.services.product_item_operations import record_item_operation
+    admission = product_admission(account)
+    if not admission['allowed']:
+        return ApiResponse(success=False, message=admission.get('message', admission['status']), data=admission)
+    await record_item_operation(session, account, current_user.id, 'platform_delete',
+                                {'item_ids': cleaned_item_ids, 'status': 'submitted'})
+    try:
+        result = await batch_delete_items_from_xianyu(
+            account_id=account.account_id,
+            account_row_id=int(account.id),
+            owner_id=int(account.owner_id),
+            cookies_str=account.cookie,
+            item_ids=cleaned_item_ids,
+        )
+    except Exception:
+        result = {'success_count': 0, 'fail_count': 0, 'unknown': True, 'message': '平台删除结果待核实'}
+    await record_item_operation(session, account, current_user.id, 'platform_delete',
+                                {k: v for k, v in result.items() if k in ('results','success_count','fail_count','unknown','message')})
     success_count = int(result.get("success_count", 0) or 0)
     fail_count = int(result.get("fail_count", 0) or 0)
 
@@ -1212,6 +1284,7 @@ async def batch_delete_xianyu_items(
         "results": result.get("results", []),
         "success_count": success_count,
         "fail_count": fail_count,
+        "unknown": bool(result.get("unknown")),
         "local_deleted_count": local_deleted_count,
         "local_failed_ids": local_failed_ids,
     }
@@ -1326,6 +1399,8 @@ class ItemSearchRequest(PydanticBaseModel):
     keyword: str
     page: int = 1
     page_size: int = 20
+    total_pages: int = 1
+    account_id: str | None = None
 
 
 @items_router.post("/search")
@@ -1342,17 +1417,18 @@ async def search_items(
     try:
         from app.services.search.searcher import ItemSearchService
 
-        service = ItemSearchService(db_session=session, user_id=str(current_user.id))
-        result = await service.search_items(
+        service = ItemSearchService(db_session=session, user_id=str(current_user.id), account_id=payload.account_id)
+        result = await service.search_multiple_pages(
             keyword=payload.keyword,
-            page=payload.page,
+            start_page=payload.page,
             page_size=payload.page_size,
+            total_pages=payload.total_pages,
         )
 
         if result.get("error"):
-            return {"success": False, "data": [], "error": result.get("error")}
+            return {**result, "success": False, "data": result.get("items", [])}
 
-        return {"success": True, "data": result.get("items", []), "total": result.get("total", 0)}
+        return {**result, "success": True, "data": result.get("items", [])}
     except Exception as e:
         logger.error(f"商品搜索失败: {e}")
         return {
@@ -1360,3 +1436,37 @@ async def search_items(
             "data": [],
             "error": str(e),
         }
+
+
+
+@items_router.post('/polish/{account_id}')
+async def polish_account_now(account_id: str, current_user: User = Depends(deps.get_current_active_user),
+    session: AsyncSession = Depends(deps.get_db_session)):
+    from common.services.product_polish_service import ProductPolishService
+    from common.models.xy_account import XYAccount
+    from sqlalchemy import select
+    from fastapi import HTTPException
+    account=(await session.execute(select(XYAccount).where(XYAccount.owner_id==current_user.id,
+        XYAccount.account_id==account_id))).scalar_one_or_none()
+    if not account: raise HTTPException(404,'账号不存在')
+    return {'success':True,'data':await ProductPolishService(session).run(account)}
+
+
+@items_router.get('/polish/{account_id}/history')
+async def polish_account_history(account_id: str, current_user: User = Depends(deps.get_current_active_user),
+    session: AsyncSession = Depends(deps.get_db_session)):
+    from common.services.product_polish_service import ProductPolishService
+    from common.models.xy_account import XYAccount
+    from sqlalchemy import select
+    from fastapi import HTTPException
+    account=(await session.execute(select(XYAccount).where(XYAccount.owner_id==current_user.id,
+        XYAccount.account_id==account_id))).scalar_one_or_none()
+    if not account: raise HTTPException(404,'账号不存在')
+    return {'success':True,'data':await ProductPolishService(session).history(current_user.id,account_id)}
+
+
+@items_router.get('/operations/{account_id}/history')
+async def product_operation_history(account_id: str, current_user: User=Depends(deps.get_current_active_user),
+    session: AsyncSession=Depends(deps.get_db_session)):
+    from common.services.product_item_operations import item_operation_history
+    return {'success':True,'data':await item_operation_history(session,current_user.id,account_id)}

@@ -5,6 +5,9 @@
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import select
+from common.models.xy_account import XYAccount
+from common.utils.auth_scope import resolve_owner_scope
+from pathlib import Path
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_db_session
@@ -18,7 +21,18 @@ router = APIRouter(tags=["confirm-receipt-messages"])
 
 # 图片保存目录 - 使用统一的静态文件根目录（兼容Docker共享卷）
 from app.core.paths import STATIC_ROOT
-UPLOAD_DIR = str(STATIC_ROOT / "uploads" / "confirm_receipt")
+UPLOAD_DIR = STATIC_ROOT / "uploads" / "confirm_receipt"
+
+
+async def _owned_account(db, user, account_id):
+    owner_id, _ = resolve_owner_scope(user)
+    statement = select(XYAccount).where(XYAccount.account_id == account_id)
+    if owner_id is not None:
+        statement = statement.where(XYAccount.owner_id == owner_id)
+    account = await db.scalar(statement)
+    if account is None:
+        raise HTTPException(404, '账号不存在')
+    return account
 
 
 class ConfirmReceiptMessageResponse(BaseModel):
@@ -42,6 +56,7 @@ async def get_confirm_receipt_message(
     current_user: User = Depends(get_current_user),
 ):
     """获取账号的确认收货消息配置"""
+    await _owned_account(db, current_user, account_id)
     result = await db.execute(
         select(ConfirmReceiptMessage).where(ConfirmReceiptMessage.account_id == account_id)
     )
@@ -65,6 +80,13 @@ async def update_confirm_receipt_message(
     current_user: User = Depends(get_current_user),
 ):
     """更新账号的确认收货消息配置"""
+    account = await _owned_account(db, current_user, account_id)
+    if data.message_image and not data.message_image.startswith(('https://', 'http://')):
+        from common.services.media_paths import owned_media_path
+        try:
+            owned_media_path(data.message_image, account.owner_id, static_root=STATIC_ROOT)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
     result = await db.execute(
         select(ConfirmReceiptMessage).where(ConfirmReceiptMessage.account_id == account_id)
     )
@@ -99,10 +121,11 @@ async def upload_confirm_receipt_image(
     current_user: User = Depends(get_current_user),
 ):
     """上传确认收货消息图片"""
+    account = await _owned_account(db, current_user, account_id)
     try:
         _, filename, _ = await save_uploaded_image(
             image,
-            UPLOAD_DIR,
+            UPLOAD_DIR / str(account.owner_id),
             filename_prefix=account_id,
             short_uuid=True,
         )
@@ -110,6 +133,6 @@ async def upload_confirm_receipt_image(
         raise HTTPException(status_code=exc.status_code, detail=exc.message)
 
     # 返回前端可访问的静态资源URL
-    image_url = f"/static/uploads/confirm_receipt/{filename}"
+    image_url = f"/static/uploads/confirm_receipt/{account.owner_id}/{filename}"
 
     return {"success": True, "image_url": image_url}

@@ -19,7 +19,7 @@ from starlette.websockets import WebSocket
 from common.db.session import async_session_maker
 from common.models import XYAccount
 
-from .im_client import GoofishImClient
+from .executor_client import ExecutorImClient as GoofishImClient
 
 
 class ImSessionManager:

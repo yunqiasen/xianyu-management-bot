@@ -16,12 +16,13 @@ import asyncio
 from typing import Optional, Dict
 
 import aiohttp
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, select, update, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from loguru import logger
 
 from common.models.xy_order import XYOrder
+from common.services.order_state import merge_order_status
 from common.models.xy_catalog_item import XYCatalogItem
 from common.models.auto_reply_message_log import XYAutoReplyMessageLog
 
@@ -208,15 +209,15 @@ class OrderService:
                     XYAutoReplyMessageLog.reply_strategy == "auto_delivery",
                     XYAutoReplyMessageLog.order_no.isnot(None),
                 )
-                .group_by(XYAutoReplyMessageLog.order_no)
+                .group_by(XYAutoReplyMessageLog.owner_id, XYAutoReplyMessageLog.account_id, XYAutoReplyMessageLog.order_no)
                 .subquery()
             )
             matched_order_nos = (
-                select(XYAutoReplyMessageLog.order_no)
+                select(XYAutoReplyMessageLog.owner_id, XYAutoReplyMessageLog.account_id, XYAutoReplyMessageLog.order_no)
                 .join(latest_log_subq, XYAutoReplyMessageLog.id == latest_log_subq.c.max_id)
                 .where(XYAutoReplyMessageLog.send_status == delivery_send_status.strip())
             )
-            conditions.append(XYOrder.order_no.in_(matched_order_nos))
+            conditions.append(tuple_(XYOrder.owner_id, XYOrder.account_id, XYOrder.order_no).in_(matched_order_nos))
         
         if conditions:
             base_stmt = base_stmt.where(and_(*conditions))
@@ -243,63 +244,33 @@ class OrderService:
         
         return orders, total, item_titles
 
-    async def get_delivery_log_status_map(self, order_nos: list[str]) -> Dict[str, Dict[str, str | None]]:
-        """批量查询订单对应的自动发货消息日志发送状态
+    async def get_delivery_log_status_by_identity(self, identities):
+        if not identities: return {}
+        latest = (select(func.max(XYAutoReplyMessageLog.id).label('max_id'))
+            .where(tuple_(XYAutoReplyMessageLog.owner_id, XYAutoReplyMessageLog.account_id, XYAutoReplyMessageLog.order_no).in_(identities),
+                   XYAutoReplyMessageLog.reply_strategy == 'auto_delivery')
+            .group_by(XYAutoReplyMessageLog.owner_id, XYAutoReplyMessageLog.account_id, XYAutoReplyMessageLog.order_no).subquery())
+        rows = (await self.session.scalars(select(XYAutoReplyMessageLog).join(latest, XYAutoReplyMessageLog.id == latest.c.max_id))).all()
+        return {(r.owner_id, r.account_id, r.order_no): {'send_status': r.send_status, 'send_fail_reason': r.send_fail_reason} for r in rows}
 
-        以订单号关联自动发货日志（reply_strategy == 'auto_delivery'），取每个订单号
-        最新一条日志的发送状态与发送失败原因，供订单列表关联展示。
+    async def get_delivery_log_status_map(self, order_nos):
+        """兼容旧调用：遇到同名订单不给出跨账号日志。"""
+        identities = []
+        for number in set(order_nos):
+            try: order = await self.get_order_by_id(number)
+            except ValueError: continue
+            if order: identities.append((order.owner_id, order.account_id, order.order_no))
+        rows = await self.get_delivery_log_status_by_identity(identities)
+        return {identity[2]: row for identity, row in rows.items()}
 
-        Args:
-            order_nos: 订单号列表
-
-        Returns:
-            { 订单号: {"send_status": ..., "send_fail_reason": ...} }
-            没有对应日志的订单号不会出现在返回结果中。
-        """
-        result_map: Dict[str, Dict[str, str | None]] = {}
-        valid_order_nos = [no for no in order_nos if no]
-        if not valid_order_nos:
-            return result_map
-
-        try:
-            # 先取每个订单号最新一条自动发货日志的主键（max(id) 即最新插入），
-            # 再回查该日志的发送状态与失败原因，保证与"发送状态"筛选口径完全一致。
-            latest_log_subq = (
-                select(
-                    XYAutoReplyMessageLog.order_no.label("order_no"),
-                    func.max(XYAutoReplyMessageLog.id).label("max_id"),
-                )
-                .where(
-                    XYAutoReplyMessageLog.order_no.in_(valid_order_nos),
-                    XYAutoReplyMessageLog.reply_strategy == "auto_delivery",
-                )
-                .group_by(XYAutoReplyMessageLog.order_no)
-                .subquery()
-            )
-            stmt = (
-                select(
-                    XYAutoReplyMessageLog.order_no,
-                    XYAutoReplyMessageLog.send_status,
-                    XYAutoReplyMessageLog.send_fail_reason,
-                )
-                .join(latest_log_subq, XYAutoReplyMessageLog.id == latest_log_subq.c.max_id)
-            )
-            rows = (await self.session.execute(stmt)).all()
-            for order_no, send_status, send_fail_reason in rows:
-                result_map[order_no] = {
-                    "send_status": send_status,
-                    "send_fail_reason": send_fail_reason,
-                }
-        except Exception as e:
-            logger.error(f"查询订单自动发货日志发送状态失败: {e}")
-
-        return result_map
-
-    async def get_order_by_id(self, order_no: str) -> Optional[XYOrder]:
-        """根据订单号获取订单"""
+    async def get_order_by_id(self, order_no: str, *, owner_id=None, account_id=None) -> Optional[XYOrder]:
+        """按完整身份查询；旧调用遇到同名订单时停止，不选首行。"""
         stmt = select(XYOrder).where(XYOrder.order_no == order_no)
-        result = await self.session.execute(stmt)
-        return result.scalars().first()
+        if owner_id is not None: stmt = stmt.where(XYOrder.owner_id == owner_id)
+        if account_id is not None: stmt = stmt.where(XYOrder.account_id == account_id)
+        rows = (await self.session.execute(stmt.limit(2))).scalars().all()
+        if len(rows) > 1: raise ValueError("同名订单需指定账号")
+        return rows[0] if rows else None
 
     async def get_item_title(self, owner_id: int, item_id: str) -> str:
         """获取单个商品标题"""
@@ -363,17 +334,19 @@ class OrderService:
             logger.warning(f"从自动回复日志获取商品标题失败: item_id={item_id}, {e}")
             return ""
 
-    async def get_order_by_no(self, order_no: str) -> Optional[XYOrder]:
+    async def get_order_by_no(self, order_no: str, *, owner_id=None, account_id=None) -> Optional[XYOrder]:
         """根据订单号获取订单（别名方法）"""
-        return await self.get_order_by_id(order_no)
+        return await self.get_order_by_id(order_no, owner_id=owner_id, account_id=account_id)
 
-    async def update_order_status(self, order_no: str, status: str) -> bool:
+    async def update_order_status(self, order_no: str, status: str, *, owner_id=None, account_id=None) -> bool:
         """更新订单状态"""
         try:
+            existing_order = await self.get_order_by_id(order_no, owner_id=owner_id, account_id=account_id)
+            if not existing_order: return False
             stmt = (
                 update(XYOrder)
-                .where(XYOrder.order_no == order_no)
-                .values(status=status)
+                .where(XYOrder.id == existing_order.id)
+                .values(**merge_order_status(existing_order, status))
             )
             result = await self.session.execute(stmt)
             await self.session.commit()
@@ -383,7 +356,7 @@ class OrderService:
             await self.session.rollback()
             return False
 
-    async def update_order_chat_id(self, order_no: str, chat_id: str) -> bool:
+    async def update_order_chat_id(self, order_no: str, chat_id: str, *, owner_id=None, account_id=None) -> bool:
         """更新订单的聊天会话ID（chat_id）
         
         场景：订单手动发货时发现 chat_id 为空，
@@ -400,9 +373,11 @@ class OrderService:
             logger.warning(f"更新订单 chat_id 失败: chat_id 为空 (order_no={order_no})")
             return False
         try:
+            existing_order = await self.get_order_by_id(order_no, owner_id=owner_id, account_id=account_id)
+            if not existing_order: return False
             stmt = (
                 update(XYOrder)
-                .where(XYOrder.order_no == order_no)
+                .where(XYOrder.id == existing_order.id)
                 .values(chat_id=chat_id)
             )
             result = await self.session.execute(stmt)
@@ -464,6 +439,7 @@ class OrderService:
         delivery_method: str,
         delivery_content: str | None = None,
         buyer_fish_nick: str | None = None,
+        *, owner_id=None, account_id=None,
     ) -> bool:
         """更新订单发货信息
         
@@ -478,11 +454,13 @@ class OrderService:
             是否更新成功
         """
         try:
+            existing_order = await self.get_order_by_id(order_no, owner_id=owner_id, account_id=account_id)
+            if not existing_order: return False
             if delivery_content and len(delivery_content) > 2000:
                 delivery_content = delivery_content[:1997] + "..."
             
             values = {
-                "status": status,
+                **merge_order_status(existing_order, status),
                 "delivery_method": delivery_method,
                 "delivery_content": delivery_content,
                 "delivery_fail_reason": None,  # 发货成功，清空失败原因
@@ -492,7 +470,7 @@ class OrderService:
 
             stmt = (
                 update(XYOrder)
-                .where(XYOrder.order_no == order_no)
+                .where(XYOrder.id == existing_order.id)
                 .values(**values)
             )
             result = await self.session.execute(stmt)
@@ -509,6 +487,7 @@ class OrderService:
         delivery_method: str,
         delivery_content: str | None = None,
         buyer_fish_nick: str | None = None,
+        *, owner_id=None, account_id=None,
     ) -> bool:
         """专为「禁止发货 + 主动关闭订单 + 关闭后只发卡券」场景设计的记录方法
 
@@ -531,6 +510,8 @@ class OrderService:
             是否更新成功
         """
         try:
+            existing_order = await self.get_order_by_id(order_no, owner_id=owner_id, account_id=account_id)
+            if not existing_order: return False
             if delivery_content and len(delivery_content) > 2000:
                 delivery_content = delivery_content[:1997] + "..."
 
@@ -544,7 +525,7 @@ class OrderService:
 
             stmt = (
                 update(XYOrder)
-                .where(XYOrder.order_no == order_no)
+                .where(XYOrder.id == existing_order.id)
                 .values(**values)
             )
             result = await self.session.execute(stmt)
@@ -561,6 +542,7 @@ class OrderService:
         delivery_method: str,
         delivery_content: str | None = None,
         buyer_fish_nick: str | None = None,
+        *, owner_id=None, account_id=None,
     ) -> bool:
         """记录账号级“只发卡券”已处理结果，不伪造闲鱼平台订单状态。
 
@@ -568,6 +550,8 @@ class OrderService:
         持久化防重标记和内容，避免定时任务再次消费一张新卡券。失败原因由调用方随后写入。
         """
         try:
+            existing_order = await self.get_order_by_id(order_no, owner_id=owner_id, account_id=account_id)
+            if not existing_order: return False
             if delivery_content and len(delivery_content) > 2000:
                 delivery_content = delivery_content[:1997] + "..."
 
@@ -582,7 +566,7 @@ class OrderService:
 
             stmt = (
                 update(XYOrder)
-                .where(XYOrder.order_no == order_no)
+                .where(XYOrder.id == existing_order.id)
                 .values(**values)
             )
             result = await self.session.execute(stmt)
@@ -596,7 +580,8 @@ class OrderService:
     async def update_order_delivery_fail_reason(
         self,
         order_no: str,
-        fail_reason: str
+        fail_reason: str,
+        *, owner_id=None, account_id=None,
     ) -> bool:
         """更新订单发货失败原因
         
@@ -608,12 +593,14 @@ class OrderService:
             是否更新成功
         """
         try:
+            existing_order = await self.get_order_by_id(order_no, owner_id=owner_id, account_id=account_id)
+            if not existing_order: return False
             if fail_reason and len(fail_reason) > 2000:
                 fail_reason = fail_reason[:1997] + "..."
             
             stmt = (
                 update(XYOrder)
-                .where(XYOrder.order_no == order_no)
+                .where(XYOrder.id == existing_order.id)
                 .values(delivery_fail_reason=fail_reason)
             )
             result = await self.session.execute(stmt)
@@ -653,7 +640,7 @@ class OrderService:
             from common.models.xy_catalog_item import XYCatalogItem
             
             # 获取账号信息
-            account_stmt = select(XYAccount).where(XYAccount.account_id == account_id)
+            account_stmt = select(XYAccount).where(XYAccount.account_id == account_id).with_for_update()
             account_result = await self.session.execute(account_stmt)
             account = account_result.scalars().first()
             
@@ -678,24 +665,14 @@ class OrderService:
                     return False
             
             # 检查订单是否已存在
-            existing_stmt = select(XYOrder).where(XYOrder.order_no == order_no)
+            existing_stmt = select(XYOrder).where(XYOrder.order_no == order_no, XYOrder.owner_id == account.owner_id, XYOrder.account_id == account_id).with_for_update()
             existing_result = await self.session.execute(existing_stmt)
             existing_order = existing_result.scalars().first()
             
             if existing_order:
                 # 订单已存在，准备更新字段
-                update_values = {}
-                stale_statuses = {"pending_payment", "pending_ship", "pending", "paid"}
-                terminal_statuses = {"shipped", "completed", "cancelled", "closed", "refunded"}
-                is_stale_downgrade = (
-                    existing_order.status in terminal_statuses and status in stale_statuses
-                ) or (
-                    existing_order.status in {"pending_ship", "pending", "paid"}
-                    and status == "pending_payment"
-                )
-                if status and status != existing_order.status and not is_stale_downgrade:
-                    update_values['status'] = status
-                
+                update_values = merge_order_status(existing_order, status)
+
                 # 如果要更新item_id，需要验证商品归属
                 if item_id and not existing_order.item_id:
                     item_stmt = select(XYCatalogItem).where(
@@ -720,7 +697,7 @@ class OrderService:
                     update_values['chat_id'] = chat_id
                 
                 if update_values:
-                    update_stmt = update(XYOrder).where(XYOrder.order_no == order_no).values(**update_values)
+                    update_stmt = update(XYOrder).where(XYOrder.id == existing_order.id).values(**update_values)
                     await self.session.execute(update_stmt)
                     await self.session.commit()
                     logger.info(f"订单 {order_no} 已存在，更新字段: {update_values}")
@@ -1081,157 +1058,12 @@ class OrderService:
             'errors': errors,
         }
 
-    async def _fetch_sold_orders_page(
-        self, cookies_str: str, page: int,
-        account_id: str = None, is_retry: bool = False,
-        query_code: str = "ALL",
-    ) -> Optional[dict]:
-        """获取闲鱼卖家已售订单的单页数据
-        
-        支持令牌过期自动刷新Cookie并重试一次
-        
-        Args:
-            cookies_str: Cookie字符串
-            page: 页码（从1开始）
-            account_id: 账号ID，用于令牌过期时更新数据库Cookie（可选）
-            is_retry: 是否为令牌过期后的重试请求
-            query_code: 查询类型，"ALL"=全部，"NOT_SHIP"=待发货
-            
-        Returns:
-            { items, next_page, total_count, error }
-        """
-        import json
-        import time
-        import aiohttp
-        from common.utils.xianyu_utils import trans_cookies, generate_sign
-        from common.utils.cookie_refresh import (
-            is_token_expired_error, handle_token_expired_response,
-            update_account_cookies_in_db,
-            is_session_expired_error, trigger_password_login_async,
-            mark_account_session_expired,
-            extract_cookies_from_response, merge_cookies,
-        )
-        
-        cookies = trans_cookies(cookies_str)
-        timestamp = str(int(time.time() * 1000))
-        data_val = json.dumps({
-            "pageNumber": page,
-            "rowsPerPage": self._XIANYU_ORDER_PAGE_SIZE,
-            "orderIds": "",
-            "queryCode": query_code,
-            "orderSearchParam": "{}"
-        }, separators=(',', ':'))
-        
-        token = cookies.get('_m_h5_tk', '').split('_')[0] if cookies.get('_m_h5_tk') else ''
-        sign = generate_sign(timestamp, token, data_val)
-        
-        params = {
-            'jsv': '2.7.2',
-            'appKey': '34839810',
-            't': timestamp,
-            'sign': sign,
-            'v': '1.0',
-            # 卖家端页面使用 originaljson；json 会在部分账号上被判定为
-            # 非卖家端请求，表现为 TOKEN_EMPTY 后 PERMISSION_EXCEPTION。
-            'type': 'originaljson',
-            'accountSite': 'xianyu',
-            'dataType': 'json',
-            'timeout': '20000',
-            'api': 'mtop.taobao.idle.trade.merchant.sold.get',
-            'valueType': 'string',
-            'sessionOption': 'AutoLoginOnly',
-            'spm_cnt': 'a21107h.42826273.0.0',
-        }
-        
-        headers = {
-            'accept': 'application/json',
-            'content-type': 'application/x-www-form-urlencoded',
-            'cookie': cookies_str.replace('\n', '').replace('\r', ''),
-            # 卖家接口会校验来源；缺少 Origin 会被误报为 Session 过期/无权限。
-            'origin': 'https://seller.goofish.com',
-            'referer': 'https://seller.goofish.com/',
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/138.0.0.0 Safari/537.36',
-        }
-        
-        async with aiohttp.ClientSession(
-            connector=get_goofish_connector(),
-            connector_owner=False,
-            cookie_jar=aiohttp.DummyCookieJar(),
-        ) as session:
-            async with session.post(
-                'https://h5api.m.goofish.com/h5/mtop.taobao.idle.trade.merchant.sold.get/1.0/',
-                params=params,
-                data={'data': data_val},
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=20)
-            ) as response:
-                res_json = await response.json(content_type=None)
-                # 成功响应也可能下发新的签名 Cookie，供后续分页使用。
-                response_cookies = extract_cookies_from_response(response)
-                response_cookies_str = (
-                    merge_cookies(cookies_str, response_cookies)
-                    if response_cookies else cookies_str
-                )
-                
-                ret = res_json.get('ret', [])
-                ret_str = ret[0] if ret else ''
-                retry_tag = '[令牌过期重试] ' if is_retry else ''
-                
-                if 'SUCCESS' not in ret_str:
-                    # 检测令牌过期，尝试刷新Cookie并重试
-                    if not is_retry and is_token_expired_error(ret):
-                        logger.warning(
-                            f"账号 {account_id or '未知账号'} 获取闲鱼订单列表第{page}页令牌过期，"
-                            f"接口返回: ret={ret}，准备刷新Cookie后重试"
-                        )
-                        has_new, new_cookies_str = handle_token_expired_response(
-                            response, cookies_str
-                        )
-                        if has_new:
-                            if account_id:
-                                await update_account_cookies_in_db(account_id, new_cookies_str)
-                            # 用新Cookie重试，并将最新Cookie传递给调用方
-                            retry_result = await self._fetch_sold_orders_page(
-                                new_cookies_str, page, account_id, is_retry=True,
-                                query_code=query_code
-                            )
-                            if retry_result and 'cookies_str' not in retry_result:
-                                retry_result['cookies_str'] = new_cookies_str
-                            return retry_result
-                        else:
-                            logger.warning(f"账号 {account_id or '未知账号'} 获取闲鱼订单列表第{page}页令牌过期，但响应中没有Set-Cookie，无法重试")
-                    
-                    # 检测Session过期，标记账号冷却并触发后台异步密码登录（不阻塞、不重试）
-                    if is_session_expired_error(ret):
-                        logger.warning(
-                            f"账号 {account_id or '未知账号'} 获取闲鱼订单列表第{page}页Session过期，"
-                            f"接口返回: ret={ret}，触发后台异步密码登录"
-                        )
-                        if account_id:
-                            mark_account_session_expired(account_id)
-                            trigger_password_login_async(account_id)
-                    
-                    error_msg = ret_str or '未知错误'
-                    logger.warning(
-                        f"账号 {account_id or '未知账号'} {retry_tag}获取闲鱼订单列表第{page}页失败: "
-                        f"ret={ret}, response={res_json}"
-                    )
-                    return {'items': [], 'next_page': False, 'total_count': 0, 'error': error_msg}
-                
-                # 成功时也打印返回值摘要
-                logger.info(f"账号 {account_id or '未知账号'} {retry_tag}获取闲鱼订单列表第{page}页成功: ret={ret_str}")
-        
-        module = res_json.get('data', {}).get('module', {})
-        items = module.get('items', [])
-        next_page = module.get('nextPage', 'false') == 'true'
-        total_count = int(module.get('totalCount', '0'))
-        
-        return {
-            'items': items,
-            'next_page': next_page,
-            'total_count': total_count,
-            'cookies_str': response_cookies_str,
-        }
+    async def _fetch_sold_orders_page(self,cookies_str,page,account_id=None,is_retry=False,query_code='ALL'):
+        from common.services.order_platform_gateway import read_order_platform
+        result=await read_order_platform(account_id,'sold',page=page,query_code=query_code)
+        module=result.get('data',{}).get('module',{})
+        return {'items':module.get('items',[]),'next_page':str(module.get('nextPage','false')).lower()=='true',
+                'total_count':int(module.get('totalCount',0))}
 
     def _parse_sold_order_item(self, item: dict) -> Optional[dict]:
         """解析闲鱼卖家订单列表中的单条订单
@@ -1242,6 +1074,7 @@ class OrderService:
         Returns:
             解析后的订单字典
         """
+        from common.services.order_lines import lines_from_platform
         from decimal import Decimal
         from datetime import datetime
         
@@ -1297,6 +1130,7 @@ class OrderService:
                 pass
         
         return {
+            'order_lines': lines_from_platform(item.get('orderLines')),
             'order_no': order_no,
             'status': status,
             'item_id': common.get('itemId', ''),
@@ -1324,19 +1158,22 @@ class OrderService:
         """
         order_no = parsed['order_no']
 
-        if existing is None:
-            stmt = select(XYOrder).where(
-                XYOrder.order_no == order_no,
-                XYOrder.account_id == account.account_id
-            )
-            result = await self.session.execute(stmt)
-            existing = result.scalars().first()
+        # 预加载对象仅供显示；写入前重读并加锁，防迟到页覆盖实时退款。
+        stmt = select(XYOrder).where(
+            XYOrder.order_no == order_no, XYOrder.account_id == account.account_id,
+            XYOrder.owner_id == account.owner_id,
+        ).with_for_update().execution_options(populate_existing=True)
+        existing = (await self.session.execute(stmt)).scalar_one_or_none()
 
+        if existing and (existing.owner_id != account.owner_id or existing.account_id != account.account_id):
+            raise ValueError("订单身份不一致")
         if existing:
-            update_values = {}
-            # 始终更新状态
-            if parsed.get('status') and parsed['status'] != (existing.status or ''):
-                update_values['status'] = parsed['status']
+            update_values = merge_order_status(existing, parsed.get('status'))
+            if parsed.get('order_lines') is not None:
+                from common.services.order_lines import canonical_lines
+                metadata=dict(update_values.get('metadata_json',existing.metadata_json) or {})
+                if not metadata.get('status_conflict'):
+                    metadata['order_lines']=canonical_lines(parsed['order_lines']);update_values['metadata_json']=metadata
             # 补充缺失数据
             if parsed.get('buyer_id') and not existing.buyer_id:
                 update_values['buyer_id'] = parsed['buyer_id']
@@ -1404,6 +1241,9 @@ class OrderService:
                 placed_at=parsed.get('placed_at'),
                 source='fetch_xianyu',
             )
+            if parsed.get('order_lines') is not None:
+                from common.services.order_lines import canonical_lines
+                new_order.metadata_json={'order_lines':canonical_lines(parsed['order_lines'])}
             self.session.add(new_order)
             try:
                 await self.session.commit()
@@ -1418,7 +1258,8 @@ class OrderService:
                 )
                 stmt = select(XYOrder).where(
                     XYOrder.order_no == order_no,
-                    XYOrder.account_id == account.account_id
+                    XYOrder.account_id == account.account_id,
+                    XYOrder.owner_id == account.owner_id
                 )
                 result = await self.session.execute(stmt)
                 concurrent_existing = result.scalars().first()
@@ -1432,133 +1273,10 @@ class OrderService:
 
     # ---- 获取退款订单列表（mtop.taobao.idle.merchant.refund.list）----
 
-    async def _fetch_refund_orders_page(
-        self, cookies_str: str, dispute_status: str,
-        account_id: str = None, is_retry: bool = False,
-    ) -> Optional[dict]:
-        """获取闲鱼退款订单列表的单页数据（仅第一页）
-
-        照搬 _fetch_sold_orders_page 的 mtop 调用机制（签名 / 令牌过期自动刷新重试），
-        仅更换 API、请求体与响应解析。
-
-        Args:
-            cookies_str: Cookie字符串
-            dispute_status: 退款查询状态（1/2/3=退款中，5=退款成功）
-            account_id: 账号ID（令牌过期时更新数据库Cookie）
-            is_retry: 是否为令牌过期后的重试请求
-
-        Returns:
-            { items, cookies_str, error }
-        """
-        import json
-        import time
-        import aiohttp
-        from common.utils.xianyu_utils import trans_cookies, generate_sign
-        from common.utils.cookie_refresh import (
-            is_token_expired_error, handle_token_expired_response,
-            update_account_cookies_in_db,
-            is_session_expired_error, trigger_password_login_async,
-            mark_account_session_expired
-        )
-
-        cookies = trans_cookies(cookies_str)
-        timestamp = str(int(time.time() * 1000))
-        data_val = json.dumps({
-            "pageNumber": 1,
-            "rowsPerPage": 20,
-            "queryType": "refund",
-            "refundSearchParam": {
-                "disputeStatus": dispute_status,
-                "queryCode": "ALL",
-            },
-        }, separators=(',', ':'))
-
-        token = cookies.get('_m_h5_tk', '').split('_')[0] if cookies.get('_m_h5_tk') else ''
-        sign = generate_sign(timestamp, token, data_val)
-
-        params = {
-            'jsv': '2.7.2',
-            'appKey': '34839810',
-            't': timestamp,
-            'sign': sign,
-            'v': '1.0',
-            'type': 'json',
-            'accountSite': 'xianyu',
-            'dataType': 'json',
-            'timeout': '20000',
-            'api': 'mtop.taobao.idle.merchant.refund.list',
-            'valueType': 'string',
-            'sessionOption': 'AutoLoginOnly',
-        }
-
-        headers = {
-            'accept': 'application/json',
-            'content-type': 'application/x-www-form-urlencoded',
-            'idle_site_biz_code': 'COMMONPRO',
-            'cookie': cookies_str,
-            'Referer': 'https://seller.goofish.com/?site=COMMONPRO',
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/138.0.0.0 Safari/537.36',
-        }
-
-        async with aiohttp.ClientSession(
-            connector=get_goofish_connector(),
-            connector_owner=False,
-            cookie_jar=aiohttp.DummyCookieJar(),
-        ) as session:
-            async with session.post(
-                'https://h5api.m.goofish.com/h5/mtop.taobao.idle.merchant.refund.list/1.0/',
-                params=params,
-                data={'data': data_val},
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=20)
-            ) as response:
-                res_json = await response.json()
-                ret = res_json.get('ret', [])
-                ret_str = ret[0] if ret else ''
-                retry_tag = '[令牌过期重试] ' if is_retry else ''
-
-                if 'SUCCESS' not in ret_str:
-                    # 令牌过期 → 刷新Cookie重试一次
-                    if not is_retry and is_token_expired_error(ret):
-                        logger.warning(
-                            f"账号 {account_id or '未知账号'} 获取退款订单(disputeStatus={dispute_status})令牌过期，准备刷新Cookie后重试"
-                        )
-                        has_new, new_cookies_str = handle_token_expired_response(response, cookies_str)
-                        if has_new:
-                            if account_id:
-                                await update_account_cookies_in_db(account_id, new_cookies_str)
-                            retry_result = await self._fetch_refund_orders_page(
-                                new_cookies_str, dispute_status, account_id, is_retry=True
-                            )
-                            if retry_result and 'cookies_str' not in retry_result:
-                                retry_result['cookies_str'] = new_cookies_str
-                            return retry_result
-                        else:
-                            logger.warning(f"账号 {account_id or '未知账号'} 获取退款订单令牌过期，但响应中没有Set-Cookie，无法重试")
-
-                    # Session 过期 → 标记冷却 + 触发后台密码登录
-                    if is_session_expired_error(ret):
-                        logger.warning(
-                            f"账号 {account_id or '未知账号'} 获取退款订单 Session 过期，触发后台异步密码登录"
-                        )
-                        if account_id:
-                            mark_account_session_expired(account_id)
-                            trigger_password_login_async(account_id)
-
-                    error_msg = ret_str or '未知错误'
-                    logger.warning(
-                        f"账号 {account_id or '未知账号'} {retry_tag}获取退款订单(disputeStatus={dispute_status})失败: ret={ret}"
-                    )
-                    return {'items': [], 'cookies_str': cookies_str, 'error': error_msg}
-
-                logger.info(
-                    f"账号 {account_id or '未知账号'} {retry_tag}获取退款订单(disputeStatus={dispute_status})成功: ret={ret_str}"
-                )
-
-        # 退款列表响应结构：data.data.items（见 退款接口.txt）
-        data_node = res_json.get('data', {}).get('data', {})
-        items = data_node.get('items', [])
-        return {'items': items, 'cookies_str': cookies_str}
+    async def _fetch_refund_orders_page(self,cookies_str,dispute_status,account_id=None,is_retry=False):
+        from common.services.order_platform_gateway import read_order_platform
+        result=await read_order_platform(account_id,'refund',dispute_status=str(dispute_status))
+        return {'items':result.get('data',{}).get('data',{}).get('items',[])}
 
     def _parse_refund_item(self, item: dict, status: str) -> Optional[dict]:
         """解析退款订单列表的单条订单
@@ -1739,7 +1457,7 @@ class OrderDetailService:
             
             async with async_session_maker() as session:
                 # 查询现有订单
-                stmt = select(XYOrder).where(XYOrder.order_no == order_id)
+                stmt = select(XYOrder).where(XYOrder.order_no == order_id, XYOrder.account_id == self.cookie_id).with_for_update()
                 result = await session.execute(stmt)
                 existing_order = result.scalars().first()
                 
@@ -1768,6 +1486,14 @@ class OrderDetailService:
                 
                 # 更新从API获取的详情
                 if detail:
+                    if detail.get('order_lines') is not None or detail.get('order_lines_error'):
+                        metadata = dict(existing_order.metadata_json or {})
+                        if detail.get('order_lines_error'):
+                            metadata['order_lines_error'] = 'ambiguous_platform_lines'
+                        else:
+                            metadata['order_lines'] = detail['order_lines']
+                            metadata.pop('order_lines_error', None)
+                        update_values['metadata_json'] = metadata
                     if detail.get('spec_name'):
                         update_values['spec_name'] = detail['spec_name']
                     if detail.get('spec_value'):
@@ -1795,7 +1521,7 @@ class OrderDetailService:
                         update_values['receiver_address'] = detail['receiver_address']
                 
                 if update_values:
-                    stmt = update(XYOrder).where(XYOrder.order_no == order_id).values(**update_values)
+                    stmt = update(XYOrder).where(XYOrder.order_no == order_id, XYOrder.account_id == self.cookie_id).values(**update_values)
                     await session.execute(stmt)
                     await session.commit()
                     if api_failed:
@@ -1833,106 +1559,15 @@ class OrderDetailService:
             return True
         return False
     
-    async def _fetch_order_detail(self, order_id: str, retry_count: int = 0) -> Optional[Dict]:
-        """通过API获取订单详情
-        
-        参照发货服务的模式：每次请求后存储set-cookie，令牌过期时用新cookie重试
-        
-        Args:
-            order_id: 订单ID
-            retry_count: 当前重试次数
-            
-        Returns:
-            订单详情字典，包含spec_name, spec_value, amount, quantity, receiver_name等
-        """
-        max_retry = 3
-        
+    async def _fetch_order_detail(self,order_id,retry_count=0):
+        from common.services.order_platform_gateway import read_order_platform
         try:
-            import json
-            import time
-            import aiohttp
-            from common.utils.xianyu_utils import trans_cookies, generate_sign
-            
-            cookies = trans_cookies(self.cookies_str)
-            timestamp = str(int(time.time() * 1000))
-            data_val = json.dumps({"tid": order_id}, separators=(',', ':'))
-            
-            # 从Cookie中获取token用于签名
-            token = cookies.get('_m_h5_tk', '').split('_')[0] if cookies.get('_m_h5_tk') else ''
-            sign = generate_sign(timestamp, token, data_val)
-            
-            params = {
-                'jsv': '2.7.2',
-                'appKey': '34839810',
-                't': timestamp,
-                'sign': sign,
-                'v': '1.0',
-                'type': 'originaljson',
-                'accountSite': 'xianyu',
-                'dataType': 'json',
-                'timeout': '20000',
-                'api': 'mtop.idle.web.trade.order.detail',
-                'sessionOption': 'AutoLoginOnly',
-                'spm_cnt': 'a21ybx.order-detail.0.0',
-            }
-            
-            headers = {
-                'accept': 'application/json',
-                'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
-                'content-type': 'application/x-www-form-urlencoded',
-                'origin': 'https://www.goofish.com',
-                'referer': 'https://www.goofish.com/',
-                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/138.0.0.0 Safari/537.36',
-                'cookie': self.cookies_str,
-            }
-            
-            async with aiohttp.ClientSession(
-                connector=get_goofish_connector(),
-                connector_owner=False,
-                cookie_jar=aiohttp.DummyCookieJar(),
-            ) as session:
-                async with session.post(
-                    'https://h5api.m.goofish.com/h5/mtop.idle.web.trade.order.detail/1.0/',
-                    params=params,
-                    data={'data': data_val},
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=20)
-                ) as response:
-                    res_json = await response.json()
-                    
-                    # 处理响应中的set-cookie，更新本地cookie并写入数据库
-                    await self._handle_response_cookies(response)
-                    
-                    # 打印API返回结果用于分析
-                    logger.info(f"【{self.cookie_id}】订单 {order_id} API返回: ret={res_json.get('ret', [])}")
-                    
-                    # 检查响应是否成功
-                    ret_list = res_json.get('ret', [])
-                    if not any('SUCCESS' in ret for ret in ret_list):
-                        # 打印详细的失败原因
-                        ret_str = ', '.join(ret_list) if ret_list else '无返回信息'
-                        logger.warning(f"【{self.cookie_id}】订单 {order_id} API调用失败: {ret_str}")
-                        
-                        # 令牌过期时，用更新后的cookie重试
-                        from common.utils.cookie_refresh import is_token_expired_error
-                        if is_token_expired_error(ret_list):
-                            if retry_count < max_retry - 1:
-                                logger.info(f"【{self.cookie_id}】订单 {order_id} 令牌过期，已更新Cookie，准备重试({retry_count + 1}/{max_retry - 1})...")
-                                await asyncio.sleep(0.5)
-                                return await self._fetch_order_detail(order_id, retry_count + 1)
-                        
-                        return None
-                    
-                    # 解析返回数据
-                    return self._parse_order_detail_response(order_id, res_json)
-                    
-        except Exception as e:
-            logger.error(f"【{self.cookie_id}】获取订单详情异常: {type(e).__name__}: {e}")
-            if retry_count < max_retry - 1:
-                await asyncio.sleep(0.5)
-                return await self._fetch_order_detail(order_id, retry_count + 1)
+            result=await read_order_platform(self.cookie_id,'detail',order_no=order_id)
+            return self._parse_order_detail_response(order_id,result)
+        except Exception:
+            logger.warning('订单详情读取未完成，保留本地订单事实')
             return None
-    
+
     async def _handle_response_cookies(self, response) -> None:
         """处理响应中的set-cookie，更新本地cookie并写入数据库
         
@@ -2056,6 +1691,24 @@ class OrderDetailService:
                             result['is_bargain'] = True
                             break
             
+            from common.services.order_lines import lines_from_detail
+            try:
+                lines=lines_from_detail(data)
+                if lines is not None:
+                    result['order_lines']=lines
+                    result['quantity']=sum(line['quantity'] for line in lines)
+                    # Parent SKU fields are a display fallback, never the last child's SKU.
+                    result['spec_name']=result['spec_value']=''
+                    if all(line['amount'] is not None for line in lines):
+                        from decimal import Decimal
+                        result['amount']=str(sum(Decimal(line['amount']) for line in lines))
+                    else:
+                        result['amount']=''
+            except ValueError:
+                result['order_lines_error']='ambiguous_platform_lines'
+                for key in ('spec_name','spec_value','quantity','amount'):
+                    result[key] = ''
+
             logger.info(f"【{self.cookie_id}】订单 {order_id} 详情解析成功: item_id={result['item_id']}, buyer_id={result['buyer_id']}, 价格={result['amount']}, 规格={result['spec_name']}:{result['spec_value']}, 小刀={result['is_bargain']}")
             return result
             
@@ -2241,123 +1894,13 @@ class OrderStatusChecker:
                 'order_status': '未知'
             }
     
-    async def _fetch_raw_order_detail(self, order_id: str, is_retry: bool = False) -> Optional[Dict]:
-        """获取订单详情的原始API响应
-        
-        支持令牌过期自动刷新Cookie并重试一次
-        
-        Args:
-            order_id: 订单号
-            is_retry: 是否为令牌过期后的重试请求
-            
-        Returns:
-            原始API响应JSON，失败返回None
-        """
-        try:
-            import json
-            import time
-            import aiohttp
-            from common.utils.xianyu_utils import trans_cookies, generate_sign
-            from common.utils.cookie_refresh import (
-                is_token_expired_error, handle_token_expired_response,
-                update_account_cookies_in_db,
-                is_session_expired_error, trigger_password_login_async,
-                mark_account_session_expired
-            )
-            
-            cookies = trans_cookies(self.cookies_str)
-            timestamp = str(int(time.time() * 1000))
-            data_val = json.dumps({"tid": order_id}, separators=(',', ':'))
-            
-            token = cookies.get('_m_h5_tk', '').split('_')[0] if cookies.get('_m_h5_tk') else ''
-            sign = generate_sign(timestamp, token, data_val)
-            
-            params = {
-                'jsv': '2.7.2',
-                'appKey': '34839810',
-                't': timestamp,
-                'sign': sign,
-                'v': '1.0',
-                'type': 'originaljson',
-                'accountSite': 'xianyu',
-                'dataType': 'json',
-                'timeout': '20000',
-                'api': 'mtop.idle.web.trade.order.detail',
-                'sessionOption': 'AutoLoginOnly',
-                'spm_cnt': 'a21ybx.order-detail.0.0',
-            }
-            
-            headers = {
-                'accept': 'application/json',
-                'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
-                'content-type': 'application/x-www-form-urlencoded',
-                'origin': 'https://www.goofish.com',
-                'referer': 'https://www.goofish.com/',
-                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/138.0.0.0 Safari/537.36',
-                'cookie': self.cookies_str,
-            }
-            
-            async with aiohttp.ClientSession(
-                connector=get_goofish_connector(),
-                connector_owner=False,
-                cookie_jar=aiohttp.DummyCookieJar(),
-            ) as session:
-                async with session.post(
-                    'https://h5api.m.goofish.com/h5/mtop.idle.web.trade.order.detail/1.0/',
-                    params=params,
-                    data={'data': data_val},
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=20)
-                ) as response:
-                    res_json = await response.json()
-                    
-                    ret_list = res_json.get('ret', [])
-                    retry_tag = '[令牌过期重试] ' if is_retry else ''
-                    
-                    if not any('SUCCESS' in ret for ret in ret_list):
-                        # 检测令牌过期，尝试刷新Cookie并重试
-                        if not is_retry and is_token_expired_error(ret_list):
-                            logger.warning(
-                                f"账号 {self.account_id or '未知账号'} 订单 {order_id} 查询详情令牌过期，"
-                                f"接口返回: ret={ret_list}，准备刷新Cookie后重试"
-                            )
-                            has_new, new_cookies_str = handle_token_expired_response(
-                                response, self.cookies_str
-                            )
-                            if has_new:
-                                # 更新数据库
-                                if self.account_id:
-                                    await update_account_cookies_in_db(self.account_id, new_cookies_str)
-                                # 更新本地Cookie并重试
-                                self.cookies_str = new_cookies_str
-                                return await self._fetch_raw_order_detail(order_id, is_retry=True)
-                            else:
-                                logger.warning(f"账号 {self.account_id or '未知账号'} 订单 {order_id} 查询详情令牌过期，但响应中没有Set-Cookie，无法重试")
-                        
-                        # 检测Session过期，标记账号冷却并触发后台异步密码登录（不阻塞、不重试）
-                        if is_session_expired_error(ret_list):
-                            logger.warning(
-                                f"账号 {self.account_id or '未知账号'} 订单 {order_id} 查询详情Session过期，"
-                                f"接口返回: ret={ret_list}，触发后台异步密码登录"
-                            )
-                            if self.account_id:
-                                mark_account_session_expired(self.account_id)
-                                trigger_password_login_async(self.account_id)
-                        
-                        logger.warning(
-                            f"账号 {self.account_id or '未知账号'} {retry_tag}订单 {order_id} 查询详情API失败: "
-                            f"ret={ret_list}, response={res_json}"
-                        )
-                        return None
-                    
-                    # 成功时也打印返回值摘要
-                    logger.info(f"账号 {self.account_id or '未知账号'} {retry_tag}订单 {order_id} 查询详情API成功: ret={ret_list}")
-                    return res_json
-                    
-        except Exception as e:
-            logger.error(f"账号 {self.account_id or '未知账号'} 获取订单 {order_id} 原始详情失败: {e}")
+    async def _fetch_raw_order_detail(self,order_id,is_retry=False):
+        from common.services.order_platform_gateway import read_order_platform
+        try: return await read_order_platform(self.account_id,'detail',order_no=order_id)
+        except Exception:
+            logger.warning('订单状态读取未完成，保留本地订单事实')
             return None
-    
+
     def _extract_order_status_nodes(self, raw_response: Dict) -> Optional[list]:
         """从原始API响应中提取订单状态节点列表
         
@@ -2427,9 +1970,9 @@ class OrderStatusChecker:
             from common.db.session import async_session_maker
             
             async with async_session_maker() as session:
-                stmt = update(XYOrder).where(XYOrder.order_no == order_id).values(status="cancelled")
-                await session.execute(stmt)
-                await session.commit()
+                if not self.account_id: return
+                service=OrderService(session)
+                await service.update_order_status(order_id,'cancelled',account_id=self.account_id)
                 logger.info(f"订单 {order_id} 状态已更新为 cancelled（交易关闭）")
         except Exception as e:
             logger.error(f"更新订单 {order_id} 状态失败: {e}")

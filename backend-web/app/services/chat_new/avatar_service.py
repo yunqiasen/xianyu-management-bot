@@ -57,7 +57,7 @@ async def get_user_info(
         {"avatar": "头像URL", "nick": "昵称"} 或 None
     """
     # 1. 检查 Redis 缓存
-    cache_key = f"{AVATAR_CACHE_PREFIX}{cid}"
+    cache_key = f"{AVATAR_CACHE_PREFIX}{account_id}:{cid}"
     try:
         redis = await get_redis_client()
         cached = await redis.get(cache_key)

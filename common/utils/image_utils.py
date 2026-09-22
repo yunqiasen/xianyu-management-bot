@@ -38,7 +38,7 @@ class ImageManager:
         except Exception as e:
             logger.error(f"创建图片上传目录失败: {e}")
     
-    def save_image(self, image_data: bytes, original_filename: str = None) -> Optional[str]:
+    def save_image(self, image_data: bytes, original_filename: str = None, *, owner_id: int | None = None) -> Optional[str]:
         """保存图片文件"""
         try:
             logger.info(f"开始保存图片，数据大小: {len(image_data)} bytes")
@@ -50,7 +50,11 @@ class ImageManager:
             file_hash = hashlib.md5(image_data).hexdigest()
             file_extension = self._get_image_extension(image_data)
             filename = f"{file_hash}_{uuid.uuid4().hex[:8]}.{file_extension}"
-            file_path = os.path.join(self.upload_dir, filename)
+            if type(owner_id) is not int or owner_id < 1:
+                raise ValueError('media_owner_required')
+            folder = os.path.join(self.upload_dir, str(owner_id))
+            os.makedirs(folder, exist_ok=True)
+            file_path = os.path.join(folder, filename)
             
             if os.path.exists(file_path):
                 logger.info(f"图片文件已存在，跳过保存: {filename}")
@@ -145,13 +149,9 @@ class ImageManager:
     
     def _get_relative_path(self, file_path: str) -> str:
         """获取相对路径（以/开头，确保是绝对URL路径）"""
-        rel_path = os.path.relpath(file_path)
-        rel_path = rel_path.replace('\\', '/')
-        # 确保路径以/开头，避免在子路由页面出现路径解析问题
-        if not rel_path.startswith('/'):
-            rel_path = '/' + rel_path
-        return rel_path
-    
+        relative = os.path.relpath(file_path, self.upload_dir).replace('\\', '/')
+        return '/static/uploads/images/' + relative
+
     def delete_image(self, image_path: str) -> bool:
         """删除图片文件"""
         try:

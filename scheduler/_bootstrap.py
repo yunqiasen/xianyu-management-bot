@@ -90,13 +90,22 @@ async def lifespan(app: FastAPI):
     # 启动定时任务
     from app.services.scheduler_service import get_scheduler_service
     scheduler = get_scheduler_service()
-    scheduler.start()
-    logger.info("定时任务管理器已启动")
+    notification_task = None
+    if settings.auto_start_scheduler:
+        scheduler.start()
+        from common.services.notification_worker import run_notification_delivery
+        notification_task = asyncio.create_task(run_notification_delivery())
+        logger.info("定时任务管理器已启动")
+    else:
+        logger.info("调度自动执行已关闭（AUTO_START_SCHEDULER=false）")
     
     yield
     
     # 停止定时任务
     scheduler.stop()
+    if notification_task is not None:
+        notification_task.cancel()
+        await asyncio.gather(notification_task, return_exceptions=True)
     logger.info("定时任务管理器已停止")
 
     log_retention_sync_task.cancel()
@@ -128,7 +137,10 @@ app = FastAPI(
 # 全局异常处理器
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request, exc: HTTPException):
-    """将 HTTP 异常转换为项目统一的 HTTP 200 业务错误响应。"""
+    """Internal RPC keeps HTTP semantics; the legacy public API keeps its envelope."""
+    if request.url.path.startswith('/internal/'):
+        detail = exc.detail if isinstance(exc.detail, dict) else {'code': 'internal_request_rejected'}
+        return JSONResponse(status_code=exc.status_code, content={'detail': detail})
     logger.warning(
         "HTTP异常: {} - {}\n请求路径: {}\n请求方法: {}",
         exc.status_code,
@@ -149,7 +161,9 @@ async def http_exception_handler(request, exc: HTTPException):
 
 @app.exception_handler(RequestValidationError)
 async def request_validation_exception_handler(request: Request, exc: RequestValidationError):
-    """将请求参数校验错误转换为统一的 HTTP 200 业务响应。"""
+    """Return only validation field metadata, never the submitted secret values."""
+    if request.url.path.startswith('/internal/'):
+        return JSONResponse(status_code=422, content={'detail': {'code': 'invalid_request'}})
     # 错误对象可能携带完整请求体，禁止把 Cookie/密码等敏感输入写入日志。
     error_fields = [
         {
@@ -182,6 +196,9 @@ async def global_exception_handler(request, exc):
     
     捕获所有未处理的异常,返回统一格式的错误响应
     """
+    if request.url.path.startswith('/internal/'):
+        logger.error("Internal request failed: {}", type(exc).__name__)
+        return JSONResponse(status_code=500, content={'detail': {'code': 'internal_error'}})
     # 通过参数传递动态异常文本，避免异常 repr 中的 ``{}`` 被 Loguru 当作模板占位符。
     logger.opt(exception=exc).error(
         "全局异常捕获: {}: {}\n请求路径: {}\n请求方法: {}",
@@ -219,39 +236,20 @@ async def global_exception_handler(request, exc):
 from app.api.routes import internal
 
 app.include_router(internal.router)
+from app.api.routes.account_configuration import router as account_configuration_router
+app.include_router(account_configuration_router)
+
+
+from common.middleware.correlation import CorrelationMiddleware
+app.add_middleware(CorrelationMiddleware)
 
 
 @app.get("/health")
 async def health_check():
-    """
-    健康检查接口
-    
-    Returns:
-        服务健康状态
-    """
-    from common.db.session import async_engine
-    from sqlalchemy import text
-    
-    # 检查数据库连接
-    db_status = "unknown"
-    try:
-        async with async_engine.connect() as conn:
-            await conn.execute(text("SELECT 1"))
-            db_status = "connected"
-    except Exception as e:
-        logger.error(f"数据库连接检查失败: {str(e)}")
-        db_status = "disconnected"
-    
-    return {
-        "success": True,
-        "code": 200,
-        "message": "服务运行正常",
-        "data": {
-            "service": settings.project_name,
-            "status": "running",
-            "database": db_status,
-        },
-    }
+    from common.runtime_health import service_health
+    from fastapi.responses import JSONResponse
+    result = await service_health(settings.project_name, settings.auto_start_scheduler)
+    return JSONResponse(result, status_code=result["code"])
 
 
 def run_server():

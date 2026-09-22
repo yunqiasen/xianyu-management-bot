@@ -146,136 +146,16 @@ class PolishTaskService:
         Returns:
             (成功数量, 失败数量)
         """
-        logger.info(f"【{self.task_name}】开始处理账号: {account.account_id}")
-
-        try:
-            # 1. 查询该账号下未擦亮的商品
-            items = await self._get_unpolished_items(session, account.id)
-            
-            if not items:
-                logger.info(f"【{self.task_name}】账号 {account.account_id} 没有需要擦亮的商品")
-                return 0, 0
-
-            logger.info(f"【{self.task_name}】账号 {account.account_id} 找到 {len(items)} 个需要擦亮的商品")
-
-            # 2. 遍历商品，执行擦亮
-            success_count = 0
-            failed_count = 0
-
-            # 使用可变的cookie_str，令牌过期刷新后后续商品能用新cookie
-            current_cookie_str = account.cookie
-            
-            for item in items:
-                try:
-                    # 执行擦亮
-                    result = await self._polish_item(current_cookie_str, item.item_id)
-                    
-                    # 如果返回了更新后的cookie，写入数据库并用于后续商品
-                    if result.get("cookie_str") and result["cookie_str"] != current_cookie_str:
-                        current_cookie_str = result["cookie_str"]
-                        await update_account_cookies_in_db(account.account_id, current_cookie_str)
-                        logger.info(f"【{self.task_name}】账号 {account.account_id} Cookie已通过Set-Cookie更新并写入数据库")
-                    
-                    # 判断是否成功（包括"一天只能擦亮一次"的情况）
-                    is_success = result.get("success")
-                    error_msg = result.get("message", "")
-                    
-                    # 如果返回"一天只能擦亮一次"，也视为成功
-                    if not is_success and ("一天只能擦亮一次" in error_msg or "POLISH_DUPLICATE" in error_msg):
-                        is_success = True
-                        logger.info(f"【{self.task_name}】账号 {account.account_id} 商品 {item.item_id} 今天已擦亮过，视为成功")
-                    
-                    if is_success:
-                        # 擦亮成功，更新商品状态
-                        item.is_polished = True
-                        session.add(item)
-                        success_count += 1
-                        logger.info(f"【{self.task_name}】账号 {account.account_id} 商品 {item.item_id} 擦亮成功")
-                        
-                        # 记录成功日志
-                        await self._log_execution(
-                            session=session,
-                            batch_id=batch_id,
-                            account_id=account.account_id,
-                            item_id=item.item_id,
-                            success=True,
-                            error_message=None
-                        )
-                    else:
-                        failed_count += 1
-                        logger.warning(f"【{self.task_name}】账号 {account.account_id} 商品 {item.item_id} 擦亮失败: {error_msg}")
-                        
-                        # 缺少令牌或Session过期时，标记账号冷却并触发后台异步密码登录，跳过该账号剩余商品
-                        if 'SESSION_EXPIRED' in error_msg or 'Cookie中没有找到_m_h5_tk' in error_msg or 'TOKEN_EMPTY' in error_msg or '令牌为空' in error_msg or '已掉线' in error_msg or '请重新登录' in error_msg:
-                            from common.utils.cookie_refresh import (
-                                mark_account_session_expired, trigger_password_login_async
-                            )
-                            mark_account_session_expired(account.account_id)
-                            trigger_password_login_async(account.account_id)
-                            logger.warning(
-                                f"【{self.task_name}】账号 {account.account_id} 登录态异常，"
-                                f"已标记冷却并触发后台密码登录，跳过剩余商品: {error_msg}"
-                            )
-                            # 记录失败日志后跳出循环
-                            await self._log_execution(
-                                session=session,
-                                batch_id=batch_id,
-                                account_id=account.account_id,
-                                item_id=item.item_id,
-                                success=False,
-                                error_message=error_msg
-                            )
-                            break
-                        
-                        # 已下架商品，直接删除商品记录
-                        if 'UNSUPPORTED_ITEM_STATUS' in error_msg or '已下架商品不支持该操作' in error_msg:
-                            await session.delete(item)
-                            logger.info(
-                                f"【{self.task_name}】账号 {account.account_id} 商品 {item.item_id} "
-                                f"已下架，已删除商品记录"
-                            )
-                        
-                        # 记录失败日志
-                        await self._log_execution(
-                            session=session,
-                            batch_id=batch_id,
-                            account_id=account.account_id,
-                            item_id=item.item_id,
-                            success=False,
-                            error_message=error_msg
-                        )
-                    
-                    # 避免请求过快
-                    await asyncio.sleep(2)
-                    
-                except Exception as e:
-                    failed_count += 1
-                    error_msg = str(e)
-                    logger.error(f"【{self.task_name}】账号 {account.account_id} 商品 {item.item_id} 擦亮异常: {error_msg}")
-                    
-                    # 记录异常日志
-                    await self._log_execution(
-                        session=session,
-                        batch_id=batch_id,
-                        account_id=account.account_id,
-                        item_id=item.item_id,
-                        success=False,
-                        error_message=error_msg
-                    )
-
-            # 3. 提交数据库更新
-            await session.commit()
-            
-            logger.info(
-                f"【{self.task_name}】账号 {account.account_id} 处理完成，"
-                f"成功: {success_count}, 失败: {failed_count}"
-            )
-            
-            return success_count, failed_count
-
-        except Exception as e:
-            logger.error(f"【{self.task_name}】处理账号 {account.account_id} 失败: {e}")
-            raise
+        from common.services.product_admission import product_admission
+        state = product_admission(account)
+        if not state['allowed']:
+            await self._log_execution(session, batch_id, account.account_id, '-', False,
+                                      f"skipped:{state['status']}; next={state.get('next_retry_at', '-')}" )
+            return 0, 0
+        from common.services.product_polish_service import ProductPolishService
+        result = await ProductPolishService(session).run(account, source='scheduled', batch_id=batch_id)
+        entries = result.get('items', [])
+        return sum(r['status'] == 'success' for r in entries), sum(r['status'] in ('failed', 'unknown') for r in entries)
 
     async def _get_unpolished_items(self, session: AsyncSession, account_pk: int) -> List[XYCatalogItem]:
         """
@@ -475,7 +355,7 @@ class PolishTaskService:
                 batch_id=batch_id,
                 account_id=account_id,
                 item_id=item_id,
-                status="success" if success else "failed",
+                status="skipped" if error_message and error_message.startswith("skipped:") else ("success" if success else "failed"),
                 error_message=error_message[:500] if error_message else None,
             )
             session.add(log)

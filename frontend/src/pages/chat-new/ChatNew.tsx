@@ -1,3 +1,5 @@
+import { mergeChatMessage, applyOutboundVerification, chatCacheKey, chatScopeMatches } from './replyEventState'
+import { verifyOutboundReply } from '@/api/replyControls'
 /**
  * 在线聊天 主页面
  *
@@ -208,6 +210,7 @@ export function ChatNew() {
     if (exists) {
       const updated = convs.map((c) => {
         if (c.cid !== cid) return c
+        if (msg.time < c.lastMessageTime) return c
         return { ...c, lastMessageSummary: summary, lastMessageTime: msg.time, unreadCount: isViewing ? 0 : c.unreadCount + 1 }
       })
       const target = updated.find((c) => c.cid === cid)!
@@ -226,12 +229,7 @@ export function ChatNew() {
   }
 
   /** 追加消息到消息列表（去重自己发的） */
-  const appendMsg = (msgs: ChatMessage[], msg: ChatMessage): ChatMessage[] => {
-    if (msg.isSelf && msgs.some((m) => m.isSelf && m.text === msg.text && Math.abs(m.time - msg.time) < 5000)) {
-      return msgs
-    }
-    return [...msgs, msg]
-  }
+  const appendMsg = mergeChatMessage
 
   const handleWsNewMessage = useCallback((accountId: string, cid: string, msg: ChatMessage) => {
     const summary = msg.type === 'image' ? '[图片]' : (msg.text || '').slice(0, 50)
@@ -371,9 +369,10 @@ export function ChatNew() {
       try {
         const cursor = append ? convCursor : undefined
         const res = await getConversations(accountId, cursor ?? undefined)
+        if (activeAccountIdRef.current !== accountId) return
         // 从本地缓存补填已有的头像和昵称，避免刷新后信息消失
         const withCachedAvatar = res.conversations.map((c: Conversation) => {
-          const cached = userInfoCacheRef.current[c.otherUserId]
+          const cached = userInfoCacheRef.current[chatCacheKey(accountId, c.otherUserId)]
           if (!cached) return c
           const updates: Partial<Conversation> = {}
           if (cached.avatar && !c.otherUserAvatar) updates.otherUserAvatar = cached.avatar
@@ -473,7 +472,7 @@ export function ChatNew() {
       const hasValidName = !!c.otherUserName && !isPureDigits(c.otherUserName)
       if (c.otherUserAvatar && hasValidName) return false
       // 缓存中已有完整信息则跳过
-      const cached = userInfoCacheRef.current[c.otherUserId]
+      const cached = userInfoCacheRef.current[chatCacheKey(activeAccountId, c.otherUserId)]
       if (cached && cached.avatar && cached.nick) return false
       return true
     },
@@ -500,10 +499,11 @@ export function ChatNew() {
     let cancelled = false
 
     const applyInfos = (infos: Record<string, { avatar: string; nick: string }>) => {
+      if (cancelled || activeAccountIdRef.current !== activeAccountId) return
       for (const [uid, info] of Object.entries(infos)) {
         // 同时缓存 avatar 和 nick
-        const prev = userInfoCacheRef.current[uid] || { avatar: '', nick: '' }
-        userInfoCacheRef.current[uid] = {
+        const prev = userInfoCacheRef.current[chatCacheKey(activeAccountId, uid)] || { avatar: '', nick: '' }
+        userInfoCacheRef.current[chatCacheKey(activeAccountId, uid)] = {
           avatar: info.avatar || prev.avatar,
           nick: info.nick || prev.nick,
         }
@@ -547,11 +547,12 @@ export function ChatNew() {
       try {
         const cursor = append ? msgCursor : undefined
         const res = await getMessages(accountId, cid, cursor ?? undefined)
+        if (!chatScopeMatches(accountId, cid, activeAccountIdRef.current, activeCidRef.current)) return
         if (append) {
           // 追加历史消息到前面
-          setMessages((prev) => [...res.messages, ...prev])
+          setMessages(prev => res.messages.reduce(mergeChatMessage, prev).sort((a, b) => a.time - b.time))
         } else {
-          setMessages(res.messages)
+          setMessages(prev => res.messages.reduce(mergeChatMessage, prev).sort((a, b) => a.time - b.time))
         }
         setMsgHasMore(res.hasMore)
         setMsgCursor(res.nextCursor)
@@ -595,7 +596,7 @@ export function ChatNew() {
     let cancelled = false
     setIsOfficiallyBlocked(false)
     if (!activeAccountId || !activeCid) return
-    getOfficialBlacklistStatus(activeAccountId, activeCid)
+    getOfficialBlacklistStatus(activeAccountId, activeCid, conversations.find(c => c.cid === activeCid)?.otherUserId || '')
       .then((blocked) => { if (!cancelled) setIsOfficiallyBlocked(blocked) })
       .catch(() => { if (!cancelled) setIsOfficiallyBlocked(false) })
     return () => { cancelled = true }
@@ -763,7 +764,7 @@ export function ChatNew() {
     }))) return
     setBlacklisting(true)
     try {
-      const res = await changeOfficialBlacklist(activeAccountId, activeConversation.cid, action)
+      const res = await changeOfficialBlacklist(activeAccountId, activeConversation.cid, action, activeConversation.otherUserId)
       if (!res.success) throw new Error(res.message || '黑名单操作失败')
       setIsOfficiallyBlocked(action === 'add')
       addToast({ message: res.message || `${label}成功`, type: 'success' })
@@ -801,6 +802,22 @@ export function ChatNew() {
     }
   }
 
+  const [verifyingMessage, setVerifyingMessage] = useState('')
+  const verifyMessage = async (message: ChatMessage) => {
+    if (!activeAccountId || !activeCid || !message.messageId.startsWith('out:') || verifyingMessage) return
+    const account = activeAccountId, chat = activeCid
+    setVerifyingMessage(message.messageId)
+    try {
+      const result = await verifyOutboundReply(account, chat, message.messageId.slice(4))
+      if (activeAccountIdRef.current === account && activeCidRef.current === chat) {
+        setMessages(previous => previous.map(row => row.messageId === message.messageId ? applyOutboundVerification(row, result) : row))
+      }
+      addToast({message: result.status === 'confirmed' ? '平台证据已确认发送' : result.verification || '已取得发送状态', type: result.status === 'confirmed' ? 'success' : 'info'})
+    } catch (error: any) {
+      addToast({message: error.message || '核实暂未完成，消息未重发', type: 'error'})
+    } finally { setVerifyingMessage('') }
+  }
+
   const prevMsgCountRef = useRef(0)
   useEffect(() => {
     if (!msgContainerRef.current) return
@@ -824,13 +841,17 @@ export function ChatNew() {
     }
 
     const text = rawText.trim()
+    const requestId = crypto.randomUUID()
     setSending(true)
     try {
-      const res = await sendTextMessage(activeAccountId, activeCid, conv.otherUserId, text)
+      const res = await sendTextMessage(activeAccountId, activeCid, conv.otherUserId, text, requestId)
+      if (!chatScopeMatches(activeAccountId, activeCid, activeAccountIdRef.current, activeCidRef.current)) return
       // 无论成功失败，都把这条消息展示在聊天记录中；
       // 失败时标记 failed + failReason，气泡前显示红色感叹号，点击查看原因
       const sentMsg: ChatMessage = {
-        messageId: res.data?.messageId || '',
+        messageId: res.data?.requestId ? `out:${res.data.requestId}` : (res.data?.messageId || ''),
+        status: res.data?.status || 'unknown',
+        version: 2,
         senderId: activeAccountId,
         senderName: '',
         isSelf: true,
@@ -838,11 +859,11 @@ export function ChatNew() {
         text,
         images: [],
         time: Date.now(),
-        failed: !res.success,
+        failed: res.data?.status === 'failed' || !res.success,
         failReason: res.success ? undefined : (res.message || '发送失败'),
       }
       if (clearInput) setInputText('')
-      setMessages((prev) => [...prev, sentMsg])
+      setMessages((prev) => mergeChatMessage(prev, sentMsg))
       if (res.success) {
         // 成功才更新会话列表摘要
         setConversations((prev) =>
@@ -856,10 +877,12 @@ export function ChatNew() {
         addToast({ message: res.message || '发送失败', type: 'error' })
       }
     } catch (e: any) {
+      if (!chatScopeMatches(activeAccountId, activeCid, activeAccountIdRef.current, activeCidRef.current)) return
       // 网络等异常：同样以失败态展示该条消息
       const failReason = e?.message || '发送失败'
       const sentMsg: ChatMessage = {
-        messageId: '',
+        messageId: `out:${requestId}`,
+        version: 1,
         senderId: activeAccountId,
         senderName: '',
         isSelf: true,
@@ -867,11 +890,12 @@ export function ChatNew() {
         text,
         images: [],
         time: Date.now(),
-        failed: true,
-        failReason,
+        status: 'unknown',
+        failed: false,
+        failReason: `结果待核实：${failReason}`,
       }
       if (clearInput) setInputText('')
-      setMessages((prev) => [...prev, sentMsg])
+      setMessages((prev) => mergeChatMessage(prev, sentMsg))
       addToast({ message: failReason, type: 'error' })
     } finally {
       setSending(false)
@@ -936,14 +960,18 @@ export function ChatNew() {
       return false
     }
 
+    const requestId = crypto.randomUUID()
     setSending(true)
     try {
-      const res = await sendImageMessage(activeAccountId, activeCid, conv.otherUserId, file)
+      const res = await sendImageMessage(activeAccountId, activeCid, conv.otherUserId, file, requestId)
+      if (!chatScopeMatches(activeAccountId, activeCid, activeAccountIdRef.current, activeCidRef.current)) return false
       // 成功用CDN地址；失败则用本地预览地址，保证用户都能看到所发图片
       const displayUrl = res.success && res.data?.imageUrl ? res.data.imageUrl : URL.createObjectURL(file)
       // 无论成功失败，都把这条图片消息展示在聊天记录中
       const sentMsg: ChatMessage = {
-        messageId: res.data?.messageId || '',
+        messageId: res.data?.requestId ? `out:${res.data.requestId}` : (res.data?.messageId || ''),
+        status: res.data?.status || 'unknown',
+        version: 2,
         senderId: activeAccountId,
         senderName: '',
         isSelf: true,
@@ -951,10 +979,10 @@ export function ChatNew() {
         text: '',
         images: [displayUrl],
         time: Date.now(),
-        failed: !res.success,
+        failed: res.data?.status === 'failed' || !res.success,
         failReason: res.success ? undefined : (res.message || '发送失败'),
       }
-      setMessages((prev) => [...prev, sentMsg])
+      setMessages((prev) => mergeChatMessage(prev, sentMsg))
       if (res.success) {
         setConversations((prev) =>
           prev.map((c) =>
@@ -968,10 +996,12 @@ export function ChatNew() {
       }
       return res.success
     } catch (e: any) {
+      if (!chatScopeMatches(activeAccountId, activeCid, activeAccountIdRef.current, activeCidRef.current)) return false
       const failReason = e?.message || '发送失败'
       const displayUrl = URL.createObjectURL(file)
       const sentMsg: ChatMessage = {
-        messageId: '',
+        messageId: `out:${requestId}`,
+        version: 1,
         senderId: activeAccountId,
         senderName: '',
         isSelf: true,
@@ -979,10 +1009,11 @@ export function ChatNew() {
         text: '',
         images: [displayUrl],
         time: Date.now(),
-        failed: true,
-        failReason,
+        status: 'unknown',
+        failed: false,
+        failReason: `结果待核实：${failReason}`,
       }
-      setMessages((prev) => [...prev, sentMsg])
+      setMessages((prev) => mergeChatMessage(prev, sentMsg))
       addToast({ message: failReason, type: 'error' })
       return false
     } finally {
@@ -1381,6 +1412,8 @@ export function ChatNew() {
                           <span className="whitespace-pre-wrap">{msg.text}</span>
                         )}
                       </div>
+                      {msg.isSelf && msg.status && msg.status !== 'confirmed' && <span className="text-xs text-amber-600" title={msg.failReason}>{({ submitted: '已提交', unknown: '待核实', failed: '明确失败' } as Record<string, string>)[msg.status]}</span>}
+                      {msg.isSelf && (msg.status === 'unknown' || msg.status === 'submitted') && msg.messageId.startsWith('out:') && <button type="button" disabled={!!verifyingMessage} onClick={() => void verifyMessage(msg)} className="text-xs text-blue-600 hover:underline disabled:opacity-40">{verifyingMessage === msg.messageId ? '核实中…' : '核实发送结果'}</button>}
                       {msg.isSelf && msg.failed && (
                         <button
                           type="button"

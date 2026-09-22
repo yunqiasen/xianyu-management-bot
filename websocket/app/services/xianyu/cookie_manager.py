@@ -343,6 +343,60 @@ class CookieManager:
         except Exception as e:
             logger.error(f"停止Cookie任务失败: {cookie_id}, {safe_str(e)}")
 
+    async def apply_configuration(self, request, sessions, *, stop_timeout=10):
+        """Apply one saved version, waiting for the old task before starting its replacement."""
+        from common.services.account_configuration import ConfigurationStore
+        from common.services import account_policy
+        store = ConfigurationStore(sessions)
+        account_id, owner, version = request.account_id, request.owner_id, request.config_version
+        result = {'consumer':'websocket', 'config_version':version, 'applied':False}
+        lock = await self._get_task_lock(account_id)
+        async with lock:
+            await store.read(owner, account_id, version)
+            previous = self.tasks.get(account_id)
+            live = self.instances.get(account_id)
+            runtime = getattr(live, '_account_runtime', None)
+            if runtime is not None and runtime.owner_id != owner:
+                return {**result, 'status':'executor_identity_mismatch'}
+            if live is not None and previous is None:
+                return {**result, 'status':'executor_task_untracked'}
+            was_running = previous is not None and not previous.done()
+            if was_running:
+                previous.cancel()
+                try:
+                    await asyncio.wait_for(asyncio.shield(previous), stop_timeout)
+                except asyncio.TimeoutError:
+                    return {**result, 'status':'previous_executor_pending'}
+                except asyncio.CancelledError:
+                    if not previous.done():
+                        raise
+                except Exception:
+                    pass  # A terminated old task does not block a fresh version.
+            if previous is not None and not previous.done():
+                return {**result, 'status':'previous_executor_pending'}
+            self.tasks.pop(account_id, None)
+            self.instances.pop(account_id, None)
+            account = await store.read(owner, account_id, version)
+            state = account_policy.snapshot(account)
+            if (not was_running or account.status != 'active' or state['business_state'] in
+                    {'paused', 'verification_required', 'proxy_error', 'cooldown', 'recovering'}):
+                return await store.acknowledge(owner, account_id, version, 'websocket', 'applied_offline')
+            self.cookies[account_id], self.user_ids[account_id] = account.cookie, owner
+            replacement = self._get_loop().create_task(self._run_xianyu(account_id, account.cookie, owner))
+            self.tasks[account_id] = replacement
+        deadline = asyncio.get_running_loop().time() + stop_timeout
+        while asyncio.get_running_loop().time() < deadline:
+            account = await store.read(owner, account_id, version)
+            live = self.instances.get(account_id)
+            runtime = getattr(live, '_account_runtime', None)
+            if (runtime is not None and runtime.version is not None and runtime.version[1] == version
+                    and account_policy.snapshot(account)['consumers'].get('websocket') == version):
+                return {**result, 'applied':True, 'status':'reconnecting'}
+            if replacement.done():
+                return {**result, 'status':'executor_start_failed'}
+            await asyncio.sleep(.05)
+        return {**result, 'status':'executor_start_pending'}
+
     def _run_in_loop(self, coro):
         """在事件循环中运行协程"""
         loop = self._get_loop()

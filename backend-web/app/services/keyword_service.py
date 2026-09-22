@@ -440,3 +440,61 @@ class KeywordService:
             )
         )
         await self.session.commit()
+
+    async def import_rows(self, account, rows):
+        """Excel局部导入：逐行校验并更新原规则身份，不清空未出现在文件中的规则。"""
+        from common.services.reply_state import ReplyState, identity
+        from common.services.reply_images import ReplyImages
+        from common.models.reply_state import reply_image_refs
+        from sqlalchemy import insert
+        added, updated, errors = 0, 0, []
+        for row_number, entry in rows:
+            try:
+                keyword = '\n'.join(self._split_keyword_lines(entry.get('keyword', '')))
+                item_id = entry.get('item_id', '').strip() or None
+                kind = entry.get('type', 'text').lower()
+                if not keyword or len(keyword) > 120 or (item_id and len(item_id) > 64):
+                    raise ValueError('关键词或商品ID无效')
+                if kind not in {'text', 'image', 'external_contact'}:
+                    raise ValueError('回复类型无效')
+                image_url = entry.get('image_url', '').strip()
+                if kind == 'image' and not image_url.startswith(('https://', '/static/uploads/replies/')):
+                    raise ValueError('图片地址应为受管资源或HTTPS地址')
+                if kind == 'external_contact':
+                    await self._validate_external_contact(account, entry)
+                await ReplyState()._stream_lock(self.session, account.account_id)
+                existing = list((await self.session.execute(select(XYKeywordRule).where(
+                    XYKeywordRule.owner_id == account.owner_id, XYKeywordRule.account_pk == account.id,
+                    XYKeywordRule.item_id == item_id))).scalars())
+                current = next((rule for rule in existing if rule.keyword.casefold() == keyword.casefold()), None)
+                keys = self._keyword_line_keys(keyword, item_id)
+                if any(rule is not current and keys & self._keyword_line_keys(rule.keyword, item_id) for rule in existing):
+                    raise ValueError('关键词与既有多行规则重叠')
+                is_new = current is None
+                if current is None:
+                    current = XYKeywordRule(owner_id=account.owner_id, account_pk=account.id, keyword=keyword,
+                        item_id=item_id, is_active=True, priority=100)
+                    self.session.add(current)
+                current.reply_type = kind.upper()
+                current.reply_content = entry.get('reply', '')
+                current.image_url = image_url if kind == 'image' else None
+                for key, value in self._location_values(entry).items():
+                    setattr(current, key, value if kind == 'external_contact' else None)
+                await self.session.flush()
+                image_id = None
+                if kind == 'image' and image_url.startswith('/static/uploads/replies/'):
+                    image_id = image_url.rsplit('/', 1)[-1].split('.')[0]
+                    image = await ReplyImages(None)._owned(self.session, account.owner_id, image_id, lock=True)
+                    if image['url'] != image_url:
+                        raise ValueError('图片地址与归属不一致')
+                await self.session.execute(delete(reply_image_refs).where(reply_image_refs.c.owner_id == account.owner_id,
+                    reply_image_refs.c.source == 'keyword', reply_image_refs.c.source_id == str(current.id)))
+                if image_id:
+                    await self.session.execute(insert(reply_image_refs).values(id=identity(image_id, 'keyword', str(current.id)),
+                        image_id=image_id, owner_id=account.owner_id, source='keyword', source_id=str(current.id)))
+                await self.session.commit()
+                added += int(is_new); updated += int(not is_new)
+            except ValueError as exc:
+                await self.session.rollback()
+                errors.append({'row': row_number, 'message': str(exc)})
+        return {'added': added, 'updated': updated, 'errors': errors}

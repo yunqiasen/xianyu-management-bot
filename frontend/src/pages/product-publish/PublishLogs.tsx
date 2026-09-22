@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 发布日志页面
  *
  * 功能：
@@ -14,10 +14,13 @@ import { useUIStore } from '@/store/uiStore'
 import { useAuthStore } from '@/store/authStore'
 import { clearPublishLogs, getPublishLogs, type PublishLog } from '@/api/productPublish'
 import { getAccountDetails } from '@/api/accounts'
+import { PublishReconcileControls } from './ProductBatchControls'
 import { PageLoading } from '@/components/common/Loading'
 
 const STATUS_CONFIG: Record<string, { label: string; cls: string }> = {
+  cancelled: { label: '已取消', cls: 'badge-gray' },
   pending:    { label: '待处理', cls: 'badge-gray' },
+  unknown: { label: '结果待核实', cls: 'badge-warning' },
   publishing: { label: '发布中', cls: 'badge-warning' },
   success:    { label: '成功',   cls: 'badge-success' },
   failed:     { label: '失败',   cls: 'badge-danger' },
@@ -46,6 +49,7 @@ export function PublishLogs() {
   const [filterStatus, setFilterStatus] = useState('')
   const [showClearConfirm, setShowClearConfirm] = useState(false)
   const [clearing, setClearing] = useState(false)
+  const [evidence, setEvidence] = useState('')
 
   const load = async (p = page, size = pageSize, account = filterAccount, status = filterStatus) => {
     setTableLoading(true)
@@ -117,6 +121,7 @@ export function PublishLogs() {
 
   return (
     <div className="space-y-3 sm:space-y-4">
+      {evidence && <details open className="vben-card p-3"><summary>操作证据 <button onClick={() => setEvidence('')}>关闭</button></summary><pre className="whitespace-pre-wrap text-xs">{evidence}</pre></details>}
       {/* 标题栏 */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
         <div>
@@ -248,7 +253,8 @@ export function PublishLogs() {
                         <span className="text-slate-400">-</span>
                       )}
                     </td>
-                    <td><span className={s.cls}>{s.label}</span></td>
+                    <td><span className={s.cls}>{s.label}</span><PublishReconcileControls logId={log.id} status={log.status}
+                      onChanged={message => { addToast({ type: 'info', message }); load() }} onEvidence={setEvidence} /></td>
                     <td className="max-w-[200px]">
                       {log.item_url ? (
                         <a href={log.item_url} target="_blank" rel="noopener noreferrer"

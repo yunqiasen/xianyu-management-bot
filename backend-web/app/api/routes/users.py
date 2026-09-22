@@ -81,6 +81,7 @@ async def change_password(
     
     # 更新密码
     current_user.password_hash = get_password_hash(payload.new_password)
+    current_user.token_version = (current_user.token_version or 0) + 1
     await user_service.update(current_user, UserUpdate())
     
     return ApiResponse(success=True, message="密码修改成功")

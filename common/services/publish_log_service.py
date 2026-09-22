@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.models.publish_log import PublishLog
@@ -34,6 +34,13 @@ class PublishLogService:
         )
         return result.scalar_one_or_none()
 
+    async def claim_failed(self, log_id: int) -> bool:
+        result = await self.session.execute(update(PublishLog).where(
+            PublishLog.id == log_id, PublishLog.status == "failed",
+        ).values(status="publishing", error_message=None))
+        await self.session.commit()
+        return result.rowcount == 1
+
     async def create_log(
         self,
         user_id: int,
@@ -45,6 +52,7 @@ class PublishLogService:
         batch_id: str = None,
         publish_request_id: str = None,
         source_event_id: int = None,
+        publish_snapshot: dict | None = None,
         status: str = "pending",
         error_message: str = None,
         resolved_address_id: int = None,
@@ -52,6 +60,7 @@ class PublishLogService:
         address_source: str = None,
     ) -> PublishLog:
         """创建发布日志条目。"""
+        from copy import deepcopy
         log = PublishLog(
             user_id=user_id,
             account_id=account_id,
@@ -62,6 +71,7 @@ class PublishLogService:
             batch_id=batch_id,
             publish_request_id=publish_request_id,
             source_event_id=source_event_id,
+            publish_snapshot=deepcopy(publish_snapshot),
             status=status,
             error_message=str(error_message)[:1000] if error_message is not None else None,
             resolved_address_id=resolved_address_id,
@@ -148,6 +158,7 @@ def _log_to_dict(log: PublishLog) -> dict:
         "batch_id": log.batch_id,
         "publish_request_id": log.publish_request_id,
         "source_event_id": log.source_event_id,
+        "publish_snapshot": log.publish_snapshot,
         "status": log.status,
         "item_url": log.item_url,
         "item_id": log.item_id,

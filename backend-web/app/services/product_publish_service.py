@@ -26,69 +26,83 @@ class MaterialSpecificationError(ValueError):
 
 
 def _normalize_specifications(value: Any) -> list[dict]:
-    """规范化规格 JSON，确保规格值名称和图片字段完整保存。"""
-    if not isinstance(value, list):
+    """Validate without truncating dimensions or dropping source identities."""
+    from copy import deepcopy
+    if value is None:
         return []
-    normalized: list[dict] = []
-    for specification in value[:2]:
-        if not isinstance(specification, dict):
-            continue
-        name = str(specification.get("name") or "").strip()
-        if not name:
-            continue
-        values: list[dict] = []
-        seen_values: set[str] = set()
-        for item in specification.get("values") or []:
+    if not isinstance(value, list) or len(value) > 2:
+        raise MaterialSpecificationError("规格应为列表且至多两组")
+    normalized, names = [], set()
+    for spec in value:
+        if not isinstance(spec, dict):
+            raise MaterialSpecificationError("规格结构错误")
+        name = str(spec.get("name") or "").strip()
+        if not name or name in names:
+            raise MaterialSpecificationError("规格名称缺失或重复")
+        names.add(name)
+        values, seen = [], set()
+        raw_values = spec.get("values")
+        if not isinstance(raw_values, list) or not 1 <= len(raw_values) <= 50:
+            raise MaterialSpecificationError(f"规格“{name}”需要1至50个值")
+        for item in raw_values:
             if not isinstance(item, dict):
-                continue
-            value_name = str(item.get("name") or "").strip()
-            if not value_name:
-                continue
-            if value_name in seen_values:
-                raise MaterialSpecificationError(f"规格“{name}”存在重复规格值：{value_name}")
-            seen_values.add(value_name)
-            values.append({"name": value_name, "image": item.get("image") or None})
-        normalized.append({
-            "name": name,
-            "support_image": bool(specification.get("support_image")),
-            "values": values,
-        })
+                raise MaterialSpecificationError("规格值结构错误")
+            label = str(item.get("name") or "").strip()
+            if not label or label in seen:
+                raise MaterialSpecificationError(f"规格“{name}”存在缺失或重复规格值")
+            seen.add(label)
+            values.append({**deepcopy(item), "name": label, "image": item.get("image") or None})
+        normalized.append({**deepcopy(spec), "name": name,
+                           "support_image": as_bool(spec.get("support_image", False)), "values": values})
     return normalized
 
 
 def _normalize_sku_rows(value: Any) -> list[dict]:
-    """规范化 SKU JSON，保留每个规格组合的价格和库存。"""
-    if not isinstance(value, list):
+    from copy import deepcopy
+    from decimal import Decimal, InvalidOperation
+    if value is None:
         return []
-    normalized: list[dict] = []
-    for row in value[:200]:
-        if not isinstance(row, dict):
-            continue
-        specs = row.get("specs") if isinstance(row.get("specs"), dict) else {}
+    if not isinstance(value, list) or len(value) > 200:
+        raise MaterialSpecificationError("SKU应为列表且至多200条")
+    normalized = []
+    for row in value:
+        if not isinstance(row, dict) or not isinstance(row.get("specs"), dict):
+            raise MaterialSpecificationError("SKU规格结构错误")
         try:
-            price = float(row.get("price"))
-            stock = int(row.get("stock"))
-        except (TypeError, ValueError):
-            continue
-        if price <= 0 or stock < 0:
-            continue
-        normalized.append({
-            "specs": {str(key): str(item) for key, item in specs.items()},
-            "price": price,
-            "stock": stock,
-        })
+            price, stock = Decimal(str(row.get("price"))), Decimal(str(row.get("stock")))
+            if not price.is_finite() or price <= 0 or not stock.is_finite() or stock < 0 or stock != stock.to_integral_value():
+                raise ValueError()
+        except (ValueError, InvalidOperation):
+            raise MaterialSpecificationError("SKU价格需为正数，库存需为非负整数") from None
+        normalized.append({**deepcopy(row), "specs": {str(k): str(v) for k, v in row["specs"].items()},
+                           "price": float(price), "stock": int(stock)})
     return normalized
 
 
 def _normalize_material_json(data: dict) -> dict:
-    """统一处理素材中嵌套 JSON，避免 Pydantic/ORM 转换时丢字段。"""
-    normalized = dict(data)
-    normalized["specifications"] = _normalize_specifications(data.get("specifications"))
-    normalized["sku_rows"] = _normalize_sku_rows(data.get("sku_rows"))
-    normalized["platform_category_path"] = data.get("platform_category_path") or []
-    normalized["platform_attributes"] = data.get("platform_attributes") or []
-    normalized["videos"] = data.get("videos") or []
-    normalized["images"] = data.get("images") or []
+    from copy import deepcopy
+    from itertools import product
+    normalized = deepcopy(data)
+    specs = _normalize_specifications(data.get("specifications"))
+    rows = _normalize_sku_rows(data.get("sku_rows"))
+    names = [spec["name"] for spec in specs]
+    expected = set(product(*[[v["name"] for v in s["values"]] for s in specs])) if specs else set()
+    seen, source_ids = set(), set()
+    for row in rows:
+        key = tuple(row["specs"].get(name) for name in names)
+        if set(row["specs"]) != set(names) or key not in expected or key in seen:
+            raise MaterialSpecificationError("SKU组合缺失、重复或引用未知规格")
+        seen.add(key)
+        source_id = row.get("source_id")
+        if source_id and str(source_id) in source_ids:
+            raise MaterialSpecificationError("SKU来源ID重复")
+        if source_id:
+            source_ids.add(str(source_id))
+    if seen != expected:
+        raise MaterialSpecificationError("SKU未覆盖全部规格组合")
+    normalized.update(specifications=specs, sku_rows=rows)
+    for key in ("platform_category_path", "platform_attributes", "videos", "images"):
+        normalized[key] = deepcopy(data.get(key) or [])
     return normalized
 
 
@@ -226,10 +240,11 @@ class ProductMaterialService:
         if not material:
             return None
 
-        if "specifications" in data:
-            data["specifications"] = _normalize_specifications(data.get("specifications"))
-        if "sku_rows" in data:
-            data["sku_rows"] = _normalize_sku_rows(data.get("sku_rows"))
+        if "specifications" in data or "sku_rows" in data:
+            merged = _normalize_material_json({
+                "specifications": material.specifications, "sku_rows": material.sku_rows, **data,
+            })
+            data = {**data, "specifications": merged["specifications"], "sku_rows": merged["sku_rows"]}
 
         updatable = [
             "title", "description", "price", "original_price", "category",

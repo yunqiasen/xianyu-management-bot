@@ -6,6 +6,7 @@
  * 2. 新建、编辑、启停、批量删除监控任务
  */
 import { useEffect, useState } from 'react'
+import { MonitorReliabilityPanel } from './MonitorReliabilityPanel'
 import {
   CheckSquare,
   ChevronLeft,
@@ -274,6 +275,7 @@ export function ListingMonitor() {
 
   return (
     <div className="space-y-4">
+      <MonitorReliabilityPanel tasks={tasks} />
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
           <h1 className="page-title">商品监控</h1>

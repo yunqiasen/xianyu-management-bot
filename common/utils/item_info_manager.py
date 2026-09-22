@@ -19,7 +19,7 @@ class ItemInfoManager:
     管理商品信息的获取、保存等操作（纯 HTTP API 调用，不需要 WebSocket）
     """
     
-    def __init__(self, cookie_id: str, cookies_str: str, session=None):
+    def __init__(self, cookie_id: str, cookies_str: str, session=None, *, owner_id: int | None = None):
         """初始化商品信息管理器
         
         Args:
@@ -27,6 +27,7 @@ class ItemInfoManager:
             cookies_str: Cookie字符串
             session: aiohttp session（可选）
         """
+        self.owner_id = owner_id
         self.cookie_id = cookie_id
         self.cookies_str = cookies_str
         self.cookies = self._parse_cookies(cookies_str)
@@ -47,33 +48,6 @@ class ItemInfoManager:
         self.cookies_str = cookies_str
         self.cookies = self._parse_cookies(cookies_str)
     
-    async def _ensure_session(self):
-        """确保session已创建
-        
-        参照旧框架backend/app/services/xianyu/xianyu_async.py的create_session方法
-        """
-        if not self.session:
-            import aiohttp
-            headers = {
-                'accept': 'application/json',
-                'accept-encoding': 'gzip, deflate, br',  # 排除zstd，aiohttp不支持
-                'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
-                'cache-control': 'no-cache',
-                'content-type': 'application/x-www-form-urlencoded',
-                'origin': 'https://www.goofish.com',
-                'pragma': 'no-cache',
-                'referer': 'https://www.goofish.com/',
-                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'cookie': self.cookies_str
-            }
-            connector = aiohttp.TCPConnector(limit=100, limit_per_host=30)
-            self.session = aiohttp.ClientSession(
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=30),
-                connector=connector
-            )
-            self._own_session = True
-    
     async def close(self):
         """关闭session"""
         if self._own_session and self.session:
@@ -81,151 +55,44 @@ class ItemInfoManager:
             self.session = None
             self._own_session = False
 
-    async def get_item_list_info(self, page_number=1, page_size=20, retry_count=0, 
-                                  update_config_cookies_callback=None, myid=None):
-        """获取商品列表信息，自动处理token失效的情况
-
-        Args:
-            page_number (int): 页码，从1开始
-            page_size (int): 每页数量，默认20
-            retry_count (int): 重试次数，内部使用
-            update_config_cookies_callback: 更新Cookie的回调函数
-            myid: 用户ID
-
-        Returns:
-            dict: 包含商品列表的字典
-        """
-        from common.utils.xianyu_utils import trans_cookies, generate_sign
-        
-        if retry_count >= 4:
-            logger.error("获取商品信息失败，重试次数过多")
-            return {"success": False, "error": "获取商品信息失败，重试次数过多"}
-
-        # 确保session已创建
-        await self._ensure_session()
-
-        params = {
-            'jsv': '2.7.2',
-            'appKey': '34839810',
-            't': str(int(time.time()) * 1000),
-            'sign': '',
-            'v': '1.0',
-            'type': 'originaljson',
-            'accountSite': 'xianyu',
-            'dataType': 'json',
-            'timeout': '20000',
-            'api': 'mtop.idle.web.xyh.item.list',
-            'sessionOption': 'AutoLoginOnly',
-            'spm_cnt': 'a21ybx.im.0.0',
-            'spm_pre': 'a21ybx.collection.menu.1.272b5141NafCNK'
-        }
-
-        data = {
-            'needGroupInfo': False,
-            'pageNumber': page_number,
-            'pageSize': page_size,
-            'groupName': '在售',
-            'groupId': '58877261',
-            'defaultGroup': True,
-            "userId": myid or self.cookie_id
-        }
-
-        # 从cookies中获取token
-        token = trans_cookies(self.cookies_str).get('_m_h5_tk', '').split('_')[0] if trans_cookies(self.cookies_str).get('_m_h5_tk') else ''
-
-        # 生成签名
-        data_val = json.dumps(data, separators=(',', ':'))
-        sign = generate_sign(params['t'], token, data_val)
-        params['sign'] = sign
-
-        try:
-            headers = {
-                'Cookie': self.cookies_str,
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Referer': 'https://www.goofish.com/',
-                'Origin': 'https://www.goofish.com'
-            }
-            
-            # 打印请求参数和请求头
-            logger.info(f"【{self.cookie_id}】请求参数 params: {params}")
-            logger.info(f"【{self.cookie_id}】请求数据 data: {data}")
-            logger.info(f"【{self.cookie_id}】请求数据 data_val: {data_val}")
-            logger.info(f"【{self.cookie_id}】请求头 headers: {dict(headers)}")
-            
-            async with self.session.post(
-                'https://h5api.m.goofish.com/h5/mtop.idle.web.xyh.item.list/1.0/',
-                params=params,
-                data={'data': data_val},
-                headers=headers
-            ) as response:
-                res_json = await response.json()
-
-                # 检查并更新Cookie
-                if 'set-cookie' in response.headers:
-                    new_cookies = {}
-                    for cookie in response.headers.getall('set-cookie', []):
-                        if '=' in cookie:
-                            name, value = cookie.split(';')[0].split('=', 1)
-                            new_cookies[name.strip()] = value.strip()
-
-                    if new_cookies:
-                        self.cookies.update(new_cookies)
-                        self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
-                        if update_config_cookies_callback:
-                            await update_config_cookies_callback()
-
-                # 检查响应是否成功
-                if res_json.get('ret') and res_json['ret'][0] == 'SUCCESS::调用成功':
-                    items_data = res_json.get('data', {})
-                    card_list = items_data.get('cardList', [])
-
-                    # 解析cardList中的商品信息
-                    items_list = []
-                    for card in card_list:
-                        card_data = card.get('cardData', {})
-                        if card_data:
-                            item_info = {
-                                'id': card_data.get('id', ''),
-                                'title': card_data.get('title', ''),
-                                'price': card_data.get('priceInfo', {}).get('price', ''),
-                                'price_text': card_data.get('priceInfo', {}).get('preText', '') + card_data.get('priceInfo', {}).get('price', ''),
-                                'category_id': card_data.get('categoryId', ''),
-                                'auction_type': card_data.get('auctionType', ''),
-                                'item_status': card_data.get('itemStatus', 0),
-                                'detail_url': card_data.get('detailUrl', ''),
-                                'pic_info': card_data.get('picInfo', {}),
-                                'detail_params': card_data.get('detailParams', {}),
-                                'track_params': card_data.get('trackParams', {}),
-                                'item_label_data': card_data.get('itemLabelDataVO', {}),
-                                'card_type': card.get('cardType', 0)
-                            }
-                            items_list.append(item_info)
-
-                    logger.info(f"成功获取到 {len(items_list)} 个商品")
-
-                    return {
-                        "success": True,
-                        "page_number": page_number,
-                        "page_size": page_size,
-                        "current_count": len(items_list),
-                        "items": items_list,
-                        "raw_data": items_data
-                    }
-                else:
-                    error_msg = res_json.get('ret', [''])[0] if res_json.get('ret') else ''
-                    if 'FAIL_SYS_TOKEN_EXOIRED' in error_msg or 'token' in error_msg.lower():
-                        logger.warning(f"Token失效，准备重试: {error_msg}")
-                        await asyncio.sleep(0.5)
-                        return await self.get_item_list_info(page_number, page_size, retry_count + 1, update_config_cookies_callback, myid)
-                    else:
-                        logger.error(f"获取商品信息失败: {res_json}")
-                        return {"success": False, "error": f"获取商品信息失败: {error_msg}"}
-
-        except Exception as e:
-            logger.error(f"商品信息API请求异常: {self._safe_str(e)}")
-            await asyncio.sleep(0.5)
-            return await self.get_item_list_info(page_number, page_size, retry_count + 1, update_config_cookies_callback, myid)
+    async def get_item_list_info(self, page_number=1, page_size=20, retry_count=0,
+                                 update_config_cookies_callback=None, myid=None):
+        """One page via the account executor; no local session, credential writes or retry."""
+        from common.services.xianyu_mtop import mtop_call
+        from common.services.account_dispatch import CURRENT_OPERATION
+        context = CURRENT_OPERATION.get()
+        owner = self.owner_id
+        if owner is None and context is not None and context.request.account_id == self.cookie_id:
+            owner = context.request.owner_id
+        if owner is None or page_number < 1 or not 1 <= page_size <= 100:
+            return {'success':False, 'error':'catalog_identity_or_page_invalid'}
+        response = await mtop_call(self.cookie_id, self.cookies_str, 'mtop.idle.web.xyh.item.list',
+            '1.0', {'needGroupInfo':False, 'pageNumber':page_number, 'pageSize':page_size,
+                    'groupName':'在售', 'groupId':'58877261', 'defaultGroup':True,
+                    'userId':myid or self.cookie_id}, owner_id=owner)
+        if not response.get('success'):
+            return {'success':False, 'error':response.get('error','catalog_request_failed'),
+                    'message':response.get('error','catalog_request_failed')}
+        body = (response.get('res') or {}).get('data')
+        if not isinstance(body, dict) or not isinstance(body.get('cardList'), list):
+            return {'success':False, 'error':'catalog_schema_error', 'message':'catalog_schema_error'}
+        items = []
+        for card in body['cardList']:
+            data = card.get('cardData') if isinstance(card,dict) else None
+            if not isinstance(data,dict) or not data.get('id'):
+                return {'success':False, 'error':'catalog_schema_error', 'message':'catalog_schema_error'}
+            price = data.get('priceInfo') or {}
+            if not isinstance(price,dict):
+                return {'success':False, 'error':'catalog_schema_error', 'message':'catalog_schema_error'}
+            items.append({'id':str(data['id']), 'title':data.get('title',''),
+                'price':price.get('price',''), 'price_text':str(price.get('preText',''))+str(price.get('price','')),
+                'category_id':data.get('categoryId',''), 'auction_type':data.get('auctionType',''),
+                'item_status':data.get('itemStatus',0), 'detail_url':data.get('detailUrl',''),
+                'pic_info':data.get('picInfo',{}), 'detail_params':data.get('detailParams',{}),
+                'track_params':data.get('trackParams',{}), 'item_label_data':data.get('itemLabelDataVO',{}),
+                'card_type':card.get('cardType',0)})
+        return {'success':True, 'items':items, 'page_number':page_number, 'page_size':page_size,
+                'current_count':len(items), 'raw_data':body}
 
     async def get_all_items(self, page_size=20, max_pages=None, update_config_cookies_callback=None, myid=None):
         """获取所有商品信息（自动分页）
@@ -240,6 +107,7 @@ class ItemInfoManager:
             dict: 包含所有商品信息的字典
         """
         all_items = []
+        seen = set()
         page_number = 1
 
         logger.info(f"开始获取所有商品信息，每页{page_size}条")
@@ -253,15 +121,30 @@ class ItemInfoManager:
             result = await self.get_item_list_info(page_number, page_size, 0, update_config_cookies_callback, myid)
 
             if not result.get("success"):
-                logger.error(f"获取第 {page_number} 页失败: {result}")
-                break
+                error = result.get('error') or 'catalog_request_failed'
+                logger.warning("商品同步在第 {} 页停止: {}", page_number, error)
+                return {
+                    'success': False, 'partial': bool(all_items), 'complete': False,
+                    'failed_page': page_number, 'total_pages': page_number - 1,
+                    'total_count': len(all_items), 'items': all_items,
+                    'error': error, 'retry_after': result.get('retry_after'),
+                }
 
             current_items = result.get("items", [])
             if not current_items:
                 logger.info(f"第 {page_number} 页没有数据，获取完成")
                 break
 
-            all_items.extend(current_items)
+            fresh_items = []
+            for item in current_items:
+                if item['id'] not in seen:
+                    seen.add(item['id'])
+                    fresh_items.append(item)
+            if not fresh_items and len(current_items) >= page_size:
+                return {'success': False, 'partial': bool(all_items), 'complete': False,
+                        'error': 'catalog_pagination_stalled', 'failed_page': page_number,
+                        'total_pages': page_number - 1, 'total_count': len(all_items), 'items': all_items}
+            all_items.extend(fresh_items)
 
             logger.info(f"第 {page_number} 页获取到 {len(current_items)} 个商品")
 

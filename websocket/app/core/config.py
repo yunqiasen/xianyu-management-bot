@@ -30,7 +30,7 @@ class WebSocketConfig(BaseConfig):
     service_port: int = Field(default=8090, alias="WEBSOCKET_PORT")
     
     # 启动时是否自动连接WebSocket
-    auto_start_websocket: bool = Field(default=True, alias="AUTO_START_WEBSOCKET")
+    auto_start_websocket: bool = Field(default=False, alias="AUTO_START_WEBSOCKET")
     
     # 浏览器配置
     max_captcha_concurrent: int = Field(default=3, alias="MAX_CAPTCHA_CONCURRENT")

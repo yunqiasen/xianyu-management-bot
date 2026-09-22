@@ -391,6 +391,8 @@ async def send_email_verification_code(
 
         from app.services.user_service import UserService
         user_service = UserService(db)
+        if request.type == "register" and not await user_service.registration_enabled():
+            return ApiResponse(success=False, message="注册已关闭")
 
         # 忘记密码场景：参照登录逻辑，开启滑动验证时必须先通过极验二次验证
         if request.type == "reset_password":

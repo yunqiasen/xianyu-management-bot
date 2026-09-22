@@ -56,6 +56,7 @@ TABLE_MAP = {
 
 LEGACY_TABLE_ALIASES = {
     "cookies": "xy_accounts",
+    "orders": "xy_orders",
     "item_info": "xy_catalog_items",
     "default_replies": "xy_keyword_rules",
     "notification_channels": "xy_notification_channels",
@@ -217,7 +218,7 @@ async def update_user(
             return ApiResponse(success=False, message="邮箱已存在")
 
     try:
-        updated_user = await user_service.update_admin_user(user, payload)
+        updated_user = await user_service.update_admin_user(user, payload, actor_id=current_admin.id)
     except Exception as exc:
         await session.rollback()
         return ApiResponse(success=False, message=f"更新用户失败: {str(exc)}")
@@ -277,6 +278,8 @@ async def delete_user(
 
     try:
         user.status = UserStatus.INACTIVE
+        from common.models.admin_control import AdminAudit
+        session.add(AdminAudit(actor_id=current_admin.id,action="user_disable",target=str(user_id),details={}))
         await session.commit()
     except Exception as exc:
         await session.rollback()
@@ -312,13 +315,14 @@ async def clear_risk_logs(
         if processing_status:
             stmt = stmt.where(XYRiskControlLog.processing_status == processing_status)
 
-        result = await session.execute(stmt)
+        from app.services.admin_log_archive_service import archive_log_delete
+        result = await archive_log_delete(session, stmt)
         await session.commit()
 
         deleted_count = result.rowcount
         status_label = {"processing": "处理中", "success": "成功", "failed": "失败", "cancelled": "已取消"}.get(processing_status or "", "")
         scope = f"账号 {cookie_id} 的" if cookie_id else ""
-        return ApiResponse(success=True, message=f"已清空{scope} {deleted_count} 条{status_label}风控日志")
+        return ApiResponse(success=True, message=f"已归档{scope} {deleted_count} 条{status_label}风控日志")
     except Exception as e:
         await session.rollback()
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"清空风控日志失败: {str(e)}")
@@ -348,14 +352,15 @@ async def clear_account_login_logs(
         if cookie_id:
             stmt = stmt.where(XYAccountLoginLog.account_identifier == cookie_id)
 
-        result = await session.execute(stmt)
+        from app.services.admin_log_archive_service import archive_log_delete
+        result = await archive_log_delete(session, stmt)
         await session.commit()
 
         deleted_count = int(result.rowcount or 0)
         scope_label = f"账号 {cookie_id} 的" if cookie_id else ""
         if days is not None:
-            return ApiResponse(success=True, message=f"已清理{scope_label} {days} 天前的 {deleted_count} 条账号登录日志")
-        return ApiResponse(success=True, message=f"已清空{scope_label} {deleted_count} 条账号登录日志")
+            return ApiResponse(success=True, message=f"已归档{scope_label} {days} 天前的 {deleted_count} 条账号登录日志")
+        return ApiResponse(success=True, message=f"已归档{scope_label} {deleted_count} 条账号登录日志")
     except Exception as e:
         await session.rollback()
         raise HTTPException(
@@ -364,107 +369,40 @@ async def clear_account_login_logs(
         )
 
 
-@router.get("/data/{table_name}")
-async def get_table_data(
-    table_name: str,
-    _: User = Depends(deps.get_current_admin_user),
-    session: AsyncSession = Depends(deps.get_db_session),
-) -> dict:
-    normalized = table_name.lower()
-    mapped_name = LEGACY_TABLE_ALIASES.get(normalized, normalized)
-    table = TABLE_MAP.get(mapped_name)
-    if table is None:
-        return {"success": True, "data": [], "columns": [], "count": 0}
-
-    stmt = select(table)
-    result = await session.execute(stmt)
-    rows = result.mappings().all()
-    data = jsonable_encoder(rows)
-    columns = [column.name for column in table.columns]
-    return {"success": True, "data": data, "columns": columns, "count": len(data)}
+def _data_service(session):
+    from app.services.admin_data_service import AdminDataService
+    return AdminDataService(session, TABLE_MAP, LEGACY_TABLE_ALIASES)
 
 
-@router.delete("/data/{table_name}")
-async def clear_table_placeholder(table_name: str) -> JSONResponse:
-    return JSONResponse(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        content={"success": False, "message": f"尚未支持清空表 {table_name} 的接口"},
-    )
+@router.get('/data/{table_name}')
+async def get_table_data(table_name: str, limit: int = Query(100, ge=1, le=100), offset: int = Query(0, ge=0), owner_id: int | None = Query(None), _: User = Depends(deps.get_current_admin_user), session: AsyncSession = Depends(deps.get_db_session)):
+    return await _data_service(session).read(table_name, limit, offset, owner_id)
 
 
-@router.delete("/data/{table_name}/{record_id}")
-async def delete_table_record_placeholder(table_name: str, record_id: str) -> JSONResponse:
-    return JSONResponse(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        content={"success": False, "message": f"尚未支持删除 {table_name} 记录 {record_id}"},
-    )
+@router.post('/data/{table_name}/preview')
+async def preview_table_data(table_name: str, record_id: int | None = Query(None), admin: User = Depends(deps.get_current_admin_user), session: AsyncSession = Depends(deps.get_db_session)):
+    return await _data_service(session).preview(table_name, admin.id, record_id)
 
 
-@router.get("/logs")
-async def get_system_logs(
-    lines: int = Query(100, ge=1, le=1000),
-    level: str | None = Query(None),
-    _: User = Depends(deps.get_current_admin_user),
-) -> dict:
-    backend_dir = Path(__file__).resolve().parents[3]
-    log_dir = backend_dir / "logs"
- 
-    if not log_dir.exists():
-        return {"success": False, "message": "日志目录不存在", "logs": [], "total": 0}
- 
-    # 普通日志已经包含 ERROR 及以上级别；error.log 是其副本，聚合展示时排除，避免同一条错误重复出现。
-    log_files = sorted(
-        (
-            log_file
-            for log_file in log_dir.glob("*.log")
-            if log_file.name != "error.log" and not log_file.name.startswith("error.")
-        ),
-        key=lambda item: item.stat().st_mtime,
-    )
-    if not log_files:
-        return {"success": True, "logs": [], "total": 0}
- 
-    collected_lines: list[str] = []
-    level_filter = level.upper() if level else None
- 
-    try:
-        for log_file in log_files:
-            with log_file.open("r", encoding="utf-8", errors="ignore") as fh:
-                for line in fh:
-                    normalized_line = line.rstrip("\r\n")
-                    if not normalized_line:
-                        continue
-                    if level_filter and level_filter not in normalized_line.upper():
-                        continue
-                    collected_lines.append(normalized_line)
-    except Exception as exc:
-        return {"success": False, "message": f"读取系统日志失败: {str(exc)}", "logs": [], "total": 0}
- 
-    return {
-        "success": True,
-        "logs": collected_lines[-lines:],
-        "total": len(collected_lines),
-    }
+@router.delete('/data/{table_name}')
+async def clear_table_data(table_name: str, preview_id: str = Query(...), confirmation: str = Query(...), admin: User = Depends(deps.get_current_admin_user), session: AsyncSession = Depends(deps.get_db_session)):
+    return await _data_service(session).remove(table_name, admin.id, preview_id, confirmation)
 
 
-@router.post("/logs/clear", response_model=ApiResponse)
-async def clear_system_logs(
-    _: User = Depends(deps.get_current_admin_user),
-) -> ApiResponse:
-    """清空系统日志"""
-    backend_dir = Path(__file__).resolve().parents[3]
-    log_dir = backend_dir / "logs"
-    
-    try:
-        cleared = 0
-        for log_file in log_dir.glob("*.log"):
-            # 清空文件内容而不是删除
-            with log_file.open("w", encoding="utf-8") as fh:
-                fh.write("")
-            cleared += 1
-        return ApiResponse(success=True, message=f"已清空 {cleared} 个日志文件")
-    except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"清空日志失败: {str(e)}")
+@router.delete('/data/{table_name}/{record_id}')
+async def delete_table_record(table_name: str, record_id: int, preview_id: str = Query(...), confirmation: str = Query(...), admin: User = Depends(deps.get_current_admin_user), session: AsyncSession = Depends(deps.get_db_session)):
+    return await _data_service(session).remove(table_name, admin.id, preview_id, confirmation, record_id)
+
+
+@router.get('/logs')
+async def get_system_logs(lines: int = Query(100,ge=1,le=1000), offset: int = Query(0,ge=0,le=100000), level: str | None = None, correlation_id: str | None = None, service: str | None = None, _: User = Depends(deps.get_current_admin_user)):
+    from app.services.admin_log_service import collect_logs
+    return collect_logs(Path(__file__).resolve().parents[4],correlation=correlation_id,level=level,service=service,limit=lines,offset=offset)
+
+@router.post('/logs/clear',response_model=ApiResponse)
+async def clear_system_logs(_: User = Depends(deps.get_current_admin_user)):
+    # 不截断仍被待核实业务引用的当前日志；归档策略由统一保留任务处理。
+    return ApiResponse(success=False,message='当前日志保留30天；待核实关联记录继续保留，请使用归档流程')
 
 
 @router.get("/logs/export")
@@ -484,13 +422,14 @@ async def export_log_file(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="只能导出.log文件")
     
     log_path = log_dir / safe_name
-    if not log_path.exists():
+    if log_path.is_symlink() or not log_path.exists():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="日志文件不存在")
     
     def iter_file():
-        with log_path.open("rb") as f:
-            while chunk := f.read(8192):
-                yield chunk
+        with log_path.open("r", encoding="utf-8", errors="replace") as f:
+            from common.utils.logging_utils import redact_secrets
+            for line in f:
+                yield redact_secrets(line).encode("utf-8")
     
     return StreamingResponse(
         iter_file(),
@@ -546,53 +485,20 @@ async def get_log_files(
     return {"success": True, "files": files}
 
 
-@router.get("/backup/list")
-async def list_backup_files(
-    _: User = Depends(deps.get_current_admin_user),
-) -> dict:
-    """列出备份文件"""
-    import glob
-    import os
-    
-    backup_files = []
-    # 查找data目录下的备份文件
-    for pattern in ["data/*.db", "data/*backup*.json"]:
-        for file_path in glob.glob(pattern):
-            try:
-                stat = os.stat(file_path)
-                backup_files.append({
-                    "filename": os.path.basename(file_path),
-                    "size": stat.st_size,
-                    "size_mb": round(stat.st_size / 1024 / 1024, 2),
-                    "modified_time": stat.st_mtime,
-                })
-            except Exception:
-                pass
-    
-    backup_files.sort(key=lambda x: x["modified_time"], reverse=True)
-    return {"backups": backup_files, "total": len(backup_files)}
+@router.get('/backup/list')
+async def list_backup_files(_: User = Depends(deps.get_current_admin_user), session: AsyncSession = Depends(deps.get_db_session)):
+    from app.services.db_backup_log_service import DbBackupLogService
+    items,total=await DbBackupLogService(session).list_logs(limit=100,offset=0)
+    return {'success':True,'backups':items,'total':total,'entry':'/api/v1/db-backup-logs'}
 
+@router.get('/backup/download')
+async def download_database_backup(log_id: int, _: User = Depends(deps.get_current_admin_user)):
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(f'/api/v1/db-backup-logs/{log_id}/download',status_code=307)
 
-@router.get("/backup/download")
-async def download_database_backup(
-    _: User = Depends(deps.get_current_admin_user),
-) -> JSONResponse:
-    """下载数据库备份（MySQL不支持直接下载）"""
-    return JSONResponse(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        content={"success": False, "message": "MySQL数据库不支持直接下载，请使用mysqldump工具"},
-    )
-
-
-@router.post("/backup/upload")
-async def upload_database_backup(
-    _: User = Depends(deps.get_current_admin_user),
-) -> JSONResponse:
-    """上传数据库备份（MySQL不支持直接上传恢复）"""
-    return JSONResponse(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        content={"success": False, "message": "MySQL数据库不支持直接上传恢复，请使用mysql命令行工具"},
-    )
+@router.post('/backup/upload')
+async def upload_database_backup(_: User = Depends(deps.get_current_admin_user)):
+    return JSONResponse(status_code=409,content={'success':False,'message':'请从SQL.gz备份日志选择记录，先校验再作隔离恢复','entry':'/api/v1/db-backup-logs','restore_entry':'/api/v1/db-backup-logs/{log_id}/verify?restore=true'})
 
 
 @router.post("/reload-cache", response_model=ApiResponse)
@@ -977,29 +883,30 @@ async def clear_redelivery_logs(
     _: User = Depends(deps.get_current_admin_user),
     session: AsyncSession = Depends(deps.get_db_session),
 ) -> ApiResponse:
-    """清空定时补发货日志（只清空10天前的数据）"""
+    """清空定时补发货日志（只清空30天前的数据）"""
     from datetime import datetime, timedelta
     from sqlalchemy import delete
     from loguru import logger
     
     try:
-        # 计算10天前的时间
-        ten_days_ago = get_beijing_now_naive() - timedelta(days=10)
+        # 计算30天前的时间
+        ten_days_ago = get_beijing_now_naive() - timedelta(days=30)
         
-        # 删除10天前的日志
+        # 删除30天前的日志
         stmt = delete(ScheduledRedeliveryLog).where(
             ScheduledRedeliveryLog.created_at < ten_days_ago
         )
         
-        result = await session.execute(stmt)
+        from app.services.admin_log_archive_service import archive_log_delete
+        result = await archive_log_delete(session, stmt)
         await session.commit()
         
         deleted_count = result.rowcount
-        logger.info(f"[定时补发货日志] 已清空 {deleted_count} 条10天前的日志")
+        logger.info(f"[定时补发货日志] 已归档 {deleted_count} 条30天前的日志")
         
         return ApiResponse(
             success=True,
-            message=f"已清空 {deleted_count} 条10天前的补发货日志"
+            message=f"已归档 {deleted_count} 条30天前的补发货日志"
         )
     except Exception as e:
         await session.rollback()
@@ -1015,29 +922,30 @@ async def clear_rate_logs(
     _: User = Depends(deps.get_current_admin_user),
     session: AsyncSession = Depends(deps.get_db_session),
 ) -> ApiResponse:
-    """清空定时补评价日志（只清空10天前的数据）"""
+    """清空定时补评价日志（只清空30天前的数据）"""
     from datetime import datetime, timedelta
     from sqlalchemy import delete
     from loguru import logger
     
     try:
-        # 计算10天前的时间
-        ten_days_ago = get_beijing_now_naive() - timedelta(days=10)
+        # 计算30天前的时间
+        ten_days_ago = get_beijing_now_naive() - timedelta(days=30)
         
-        # 删除10天前的日志
+        # 删除30天前的日志
         stmt = delete(ScheduledRateLog).where(
             ScheduledRateLog.created_at < ten_days_ago
         )
         
-        result = await session.execute(stmt)
+        from app.services.admin_log_archive_service import archive_log_delete
+        result = await archive_log_delete(session, stmt)
         await session.commit()
         
         deleted_count = result.rowcount
-        logger.info(f"[定时补评价日志] 已清空 {deleted_count} 条10天前的日志")
+        logger.info(f"[定时补评价日志] 已归档 {deleted_count} 条30天前的日志")
         
         return ApiResponse(
             success=True,
-            message=f"已清空 {deleted_count} 条10天前的补评价日志"
+            message=f"已归档 {deleted_count} 条30天前的补评价日志"
         )
     except Exception as e:
         await session.rollback()
@@ -1053,29 +961,30 @@ async def clear_polish_logs(
     _: User = Depends(deps.get_current_admin_user),
     session: AsyncSession = Depends(deps.get_db_session),
 ) -> ApiResponse:
-    """清空定时擦亮日志（只清空10天前的数据）"""
+    """清空定时擦亮日志（只清空30天前的数据）"""
     from datetime import datetime, timedelta
     from sqlalchemy import delete
     from loguru import logger
     
     try:
-        # 计算10天前的时间
-        ten_days_ago = get_beijing_now_naive() - timedelta(days=10)
+        # 计算30天前的时间
+        ten_days_ago = get_beijing_now_naive() - timedelta(days=30)
         
-        # 删除10天前的日志
+        # 删除30天前的日志
         stmt = delete(ScheduledPolishLog).where(
             ScheduledPolishLog.created_at < ten_days_ago
         )
         
-        result = await session.execute(stmt)
+        from app.services.admin_log_archive_service import archive_log_delete
+        result = await archive_log_delete(session, stmt)
         await session.commit()
         
         deleted_count = result.rowcount
-        logger.info(f"[定时擦亮日志] 已清空 {deleted_count} 条10天前的日志")
+        logger.info(f"[定时擦亮日志] 已归档 {deleted_count} 条30天前的日志")
         
         return ApiResponse(
             success=True,
-            message=f"已清空 {deleted_count} 条10天前的擦亮日志"
+            message=f"已归档 {deleted_count} 条30天前的擦亮日志"
         )
     except Exception as e:
         await session.rollback()
@@ -1138,24 +1047,25 @@ async def clear_red_flower_logs(
     _: User = Depends(deps.get_current_admin_user),
     session: AsyncSession = Depends(deps.get_db_session),
 ) -> ApiResponse:
-    """清空求小红花日志（只清空10天前的数据）"""
+    """清空求小红花日志（只清空30天前的数据）"""
     from datetime import datetime, timedelta
     from sqlalchemy import delete
     from loguru import logger
 
     try:
-        ten_days_ago = get_beijing_now_naive() - timedelta(days=10)
+        ten_days_ago = get_beijing_now_naive() - timedelta(days=30)
         stmt = delete(ScheduledRedFlowerLog).where(
             ScheduledRedFlowerLog.created_at < ten_days_ago
         )
-        result = await session.execute(stmt)
+        from app.services.admin_log_archive_service import archive_log_delete
+        result = await archive_log_delete(session, stmt)
         await session.commit()
 
         deleted_count = result.rowcount
-        logger.info(f"[求小红花日志] 已清空 {deleted_count} 条10天前的日志")
+        logger.info(f"[求小红花日志] 已归档 {deleted_count} 条30天前的日志")
         return ApiResponse(
             success=True,
-            message=f"已清空 {deleted_count} 条10天前的求小红花日志"
+            message=f"已归档 {deleted_count} 条30天前的求小红花日志"
         )
     except Exception as e:
         await session.rollback()
@@ -1308,29 +1218,30 @@ async def clear_login_renew_logs(
     _: User = Depends(deps.get_current_admin_user),
     session: AsyncSession = Depends(deps.get_db_session),
 ) -> ApiResponse:
-    """清空登录续期日志（只清空10天前的数据）"""
+    """清空登录续期日志（只清空30天前的数据）"""
     from datetime import datetime, timedelta
     from sqlalchemy import delete
     from loguru import logger
     
     try:
-        # 计算10天前的时间
-        ten_days_ago = get_beijing_now_naive() - timedelta(days=10)
+        # 计算30天前的时间
+        ten_days_ago = get_beijing_now_naive() - timedelta(days=30)
         
-        # 删除10天前的日志
+        # 删除30天前的日志
         stmt = delete(ScheduledLoginRenewLog).where(
             ScheduledLoginRenewLog.created_at < ten_days_ago
         )
         
-        result = await session.execute(stmt)
+        from app.services.admin_log_archive_service import archive_log_delete
+        result = await archive_log_delete(session, stmt)
         await session.commit()
         
         deleted_count = result.rowcount
-        logger.info(f"[登录续期日志] 已清空 {deleted_count} 条10天前的日志")
+        logger.info(f"[登录续期日志] 已归档 {deleted_count} 条30天前的日志")
         
         return ApiResponse(
             success=True,
-            message=f"已清空 {deleted_count} 条10天前的登录续期日志"
+            message=f"已归档 {deleted_count} 条30天前的登录续期日志"
         )
     except Exception as e:
         await session.rollback()
@@ -1472,29 +1383,30 @@ async def clear_close_notice_logs(
     _: User = Depends(deps.get_current_admin_user),
     session: AsyncSession = Depends(deps.get_db_session),
 ) -> ApiResponse:
-    """清空账号消息通知关闭日志（只清空10天前的数据）"""
+    """清空账号消息通知关闭日志（只清空30天前的数据）"""
     from datetime import timedelta
     from sqlalchemy import delete
     from loguru import logger
 
     try:
-        # 计算10天前的时间
-        ten_days_ago = get_beijing_now_naive() - timedelta(days=10)
+        # 计算30天前的时间
+        ten_days_ago = get_beijing_now_naive() - timedelta(days=30)
 
-        # 删除10天前的日志
+        # 删除30天前的日志
         stmt = delete(ScheduledCloseNoticeLog).where(
             ScheduledCloseNoticeLog.created_at < ten_days_ago
         )
 
-        result = await session.execute(stmt)
+        from app.services.admin_log_archive_service import archive_log_delete
+        result = await archive_log_delete(session, stmt)
         await session.commit()
 
         deleted_count = result.rowcount
-        logger.info(f"[消息通知关闭日志] 已清空 {deleted_count} 条10天前的日志")
+        logger.info(f"[消息通知关闭日志] 已归档 {deleted_count} 条30天前的日志")
 
         return ApiResponse(
             success=True,
-            message=f"已清空 {deleted_count} 条10天前的消息通知关闭日志"
+            message=f"已归档 {deleted_count} 条30天前的消息通知关闭日志"
         )
     except Exception as e:
         await session.rollback()
@@ -1503,3 +1415,64 @@ async def clear_close_notice_logs(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"清空消息通知关闭日志失败: {str(e)}"
         )
+
+
+class LoginUnlockRequest(BaseModel):
+    dimension: str
+    subject: str = Field(min_length=1, max_length=255)
+
+
+@router.get('/login-protection')
+async def list_login_protection(limit: int = Query(100, ge=1, le=100), offset: int = Query(0, ge=0), _: User = Depends(deps.get_current_admin_user), session: AsyncSession = Depends(deps.get_db_session)):
+    from app.services.login_protection_service import LoginProtectionService
+    return {'success': True, 'data': await LoginProtectionService(session).list(limit, offset)}
+
+
+@router.post('/login-protection/unlock')
+async def unlock_login_protection(payload: LoginUnlockRequest, admin: User = Depends(deps.get_current_admin_user), session: AsyncSession = Depends(deps.get_db_session)):
+    from app.services.login_protection_service import LoginProtectionService
+    try:
+        await LoginProtectionService(session).unlock(payload.dimension, payload.subject, admin.id)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    return {'success': True}
+
+from common.schemas.login_protection import LoginProtectionUpdate
+
+
+@router.get('/login-protection/config')
+async def get_login_protection_config(_: User = Depends(deps.get_current_admin_user), session: AsyncSession = Depends(deps.get_db_session)):
+    from app.services.login_protection_service import LoginProtectionService
+    return {'success': True, 'data': await LoginProtectionService(session).configuration()}
+
+
+@router.put('/login-protection/config')
+async def update_login_protection_config(payload: LoginProtectionUpdate, admin: User = Depends(deps.get_current_admin_user), session: AsyncSession = Depends(deps.get_db_session)):
+    from app.services.login_protection_service import LoginProtectionService
+    try:
+        result = await LoginProtectionService(session).configure(payload, admin.id)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
+    return {'success': True, 'data': result}
+
+
+@router.get('/operating-summary')
+async def operating_summary(start: str, end: str, timezone: str = 'Asia/Shanghai', user: User = Depends(deps.get_current_active_user), session: AsyncSession = Depends(deps.get_db_session)):
+    try:
+        return {'success':True,'data':await DashboardStatsService(session).operating_summary(user.id,start,end,timezone)}
+    except ValueError as exc:
+        raise HTTPException(422,str(exc))
+
+@router.get('/log-archive')
+async def list_log_archive(source_table: str | None = None, limit: int = Query(50,ge=1,le=100), offset: int = Query(0,ge=0), _: User = Depends(deps.get_current_admin_user), session: AsyncSession = Depends(deps.get_db_session)):
+    from common.models.admin_control import AdminLogArchive, AdminAuditArchive
+    if source_table == 'xy_admin_audit':
+        rows = await session.scalars(select(AdminAuditArchive)
+            .order_by(AdminAuditArchive.created_at.desc(), AdminAuditArchive.id).limit(limit).offset(offset))
+        return {'success': True, 'data': [
+            {'id': row.id, 'source_table': 'xy_admin_audit', 'source_id': row.id, 'payload': row.payload}
+            for row in rows]}
+    stmt=select(AdminLogArchive).order_by(AdminLogArchive.created_at.desc()).limit(limit).offset(offset)
+    if source_table:stmt=stmt.where(AdminLogArchive.source_table==source_table)
+    rows=(await session.execute(stmt)).scalars()
+    return {'success':True,'data':[{'id':r.id,'source_table':r.source_table,'source_id':r.source_id,'payload':r.payload} for r in rows]}

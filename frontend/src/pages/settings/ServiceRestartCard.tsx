@@ -37,6 +37,7 @@ const CONFIRM_MESSAGE: Record<ServiceKey, string> = {
 
 export function ServiceRestartCard() {
   const { addToast } = useUIStore()
+  const [details, setDetails] = useState<Record<string, ServiceStatusItem>>({})
   // 三服务在线状态：key -> online
   const [statusMap, setStatusMap] = useState<Record<string, boolean>>({})
   const [statusLoading, setStatusLoading] = useState(false)
@@ -52,6 +53,7 @@ export function ServiceRestartCard() {
       const res = await getServicesStatus()
       if (res.success && res.data) {
         const map: Record<string, boolean> = {}
+        setDetails(Object.fromEntries(res.data.services.map(s => [s.key, s])))
         res.data.services.forEach((s: ServiceStatusItem) => {
           map[s.key] = s.online
         })
@@ -60,6 +62,7 @@ export function ServiceRestartCard() {
     } catch {
       // 状态查询失败不打扰用户，仅置为未知（不显示在线）
       setStatusMap({})
+      setDetails({})
     } finally {
       setStatusLoading(false)
     }
@@ -165,9 +168,14 @@ export function ServiceRestartCard() {
                     <span
                       className={`w-1.5 h-1.5 rounded-full ${online ? 'bg-green-500' : 'bg-slate-400'}`}
                     />
-                    {online ? '在线' : '离线'}
+                    {online ? '健康' : '异常/离线'}
                   </span>
                 </div>
+                {details[key] && <div className="text-xs text-slate-500 space-y-1">
+                  <p>数据库：{details[key].database === 'connected' ? '正常' : '异常'} · Redis：{details[key].redis === 'connected' ? '正常' : '异常'}</p>
+                  <p>自动业务：{details[key].workers_enabled ? '已开启' : '已关闭'}</p>
+                  <p className="break-all">{details[key].version || '版本未知'}</p>
+                </div>}
                 <button
                   onClick={() => setConfirmKey(key)}
                   disabled={isRestarting}

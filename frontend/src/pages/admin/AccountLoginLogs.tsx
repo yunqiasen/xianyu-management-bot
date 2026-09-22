@@ -1,3 +1,4 @@
+import { AccountEventSummary } from './AccountEventSummary'
 /**
  * 账号登录日志页面
  *
@@ -249,6 +250,7 @@ export function AccountLoginLogs() {
 
   return (
     <div className="space-y-4">
+      <AccountEventSummary />
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>

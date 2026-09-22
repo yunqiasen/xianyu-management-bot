@@ -7,12 +7,14 @@ import type { MaterialVideo, PlatformCategoryPathItem, PlatformMaterialAttribute
 export type ShippingMethod = 'free' | 'distance' | 'fixed' | 'template' | 'none'
 
 export interface SpecificationValue {
+  source_id?: string | null
   id: string
   name: string
   image?: string | null
 }
 
 export interface ProductSpecification {
+  source_id?: string | null
   id: string
   name: string
   values: SpecificationValue[]
@@ -20,6 +22,7 @@ export interface ProductSpecification {
 }
 
 export interface SkuRow {
+  source_id?: string | null
   key: string
   specs: Record<string, string>
   price: string

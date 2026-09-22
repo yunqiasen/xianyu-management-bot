@@ -195,6 +195,11 @@ class RateTask:
         account: XYAccount
     ) -> None:
         """处理单个账号"""
+        from common.services.product_admission import product_admission
+        admission = product_admission(account)
+        if not admission['allowed']:
+            logger.info("账号运营任务跳过: {} {}", account.account_id, admission['status'])
+            return
         account_id = account.account_id
         
         # 检查账号是否处于Session过期冷却期内
@@ -225,10 +230,7 @@ class RateTask:
         # 处理每个订单
         for order in orders:
             # 检查订单是否在冷却期内
-            if is_order_in_cooldown(order.order_no):
-                logger.debug(f"[定时补评价] 订单 {order.order_no} 在冷却期内，跳过")
-                continue
-            
+
             try:
                 success, error_message, updated_cookie = await self._process_order(account, order, current_cookie_str)
                 
@@ -310,7 +312,7 @@ class RateTask:
                 batch_id=batch_id,
                 account_id=account_id,
                 order_no=order_no,
-                status="success" if success else "failed",
+                status="unknown" if error_message and error_message.startswith("unknown:") else "skipped" if error_message and error_message.startswith("skipped:") else ("success" if success else "failed"),
                 error_message=error_message[:500] if error_message else None
             )
             session.add(log)
@@ -342,6 +344,10 @@ class RateTask:
         Returns:
             (是否成功, 错误信息, 最新cookie字符串)
         """
+        from common.services.product_feedback_policy import feedback_eligibility
+        eligibility = feedback_eligibility(account, order, kind='rate')
+        if eligibility != 'ready':
+            return False, f"skipped:{eligibility}", cookie_str or account.cookie
         order_no = order.order_no
         account_id = account.account_id
         cookie_string = cookie_str or account.cookie
@@ -409,6 +415,8 @@ class RateTask:
                 return True, None, cookie_string
             else:
                 error_msg = result.get('message', '评价失败')
+                if result.get('status') == 'skipped': error_msg = 'skipped:' + str(result.get('reason'))
+                elif result.get('unknown'): error_msg = 'unknown:' + error_msg
                 logger.warning(f"[定时补评价] 订单 {order_no} 评价失败: {error_msg}")
                 
                 # 超出30天不允许评价等永久性错误，标记为已评价，避免反复重试

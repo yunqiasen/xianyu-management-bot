@@ -1,9 +1,9 @@
-﻿"""
+"""
 自动确认发货服务
 
 功能:
 1. 调用闲鱼API确认发货
-2. 支持重试机制(最多4次)
+2. 单次请求；重试由持久履约预算调度
 3. 自动处理Cookie更新
 4. 处理已发货订单
 
@@ -26,7 +26,7 @@ from common.utils.xianyu_utils import generate_sign, trans_cookies
 class ConfirmShippingService(BaseShippingService):
     """自动确认发货服务
     
-    调用闲鱼API确认订单发货,支持重试和错误处理
+    调用闲鱼API确认订单发货；结果不明先核实
     """
 
     # API配置
@@ -105,7 +105,7 @@ class ConfirmShippingService(BaseShippingService):
         # 获取Token并生成签名
         token = self._get_token_from_cookies()
         if token:
-            logger.info(f"使用cookies中的_m_h5_tk token: {token}")
+            logger.debug("发货签名凭据已加载")
         else:
             logger.warning("cookies中没有找到_m_h5_tk token")
 
@@ -126,7 +126,7 @@ class ConfirmShippingService(BaseShippingService):
                 # 处理响应中的Cookie更新
                 await self._handle_response_cookies(response)
 
-                logger.info(f"【{self.account_id}】自动确认发货响应: {res_json}")
+                logger.debug(f"【{self.account_id}】收到确认发货响应")
 
                 # 检查响应结果
                 ret_msg = res_json.get('ret', ['未知错误'])[0] if res_json.get('ret') else '未知错误'
@@ -139,25 +139,12 @@ class ConfirmShippingService(BaseShippingService):
                     logger.info(f"【{self.account_id}】✅ 订单已发货,无需重复确认,订单ID: {order_id}")
                     return {"success": True, "order_id": order_id, "already_delivered": True, "message": ret_msg}
                 else:
-                    logger.warning(f"【{self.account_id}】❌ 自动确认发货失败: {ret_msg}")
-                    
-                    # 重试
-                    return await self.auto_confirm(
-                        order_id, item_id, retry_count + 1, trade_text=normalized_trade_text
-                    )
+                    logger.warning(f"【{self.account_id}】平台未接受本次确认发货")
+                    return {"success": False, "outcome": "not_sent", "error": "平台未接受确认发货", "order_id": order_id}
 
-        except Exception as e:
-            logger.error(f"【{self.account_id}】自动确认发货API请求异常: {self._safe_str(e)}")
-            await asyncio.sleep(0.5)
-
-            # 网络异常也进行重试
-            if retry_count < 2:
-                logger.info(f"【{self.account_id}】网络异常,准备重试...")
-                return await self.auto_confirm(
-                    order_id, item_id, retry_count + 1, trade_text=normalized_trade_text
-                )
-
-            return {"error": f"网络异常: {self._safe_str(e)}", "order_id": order_id}
+        except Exception:
+            logger.warning(f"【{self.account_id}】确认发货结果待核实")
+            return {"success": False, "outcome": "unknown", "error": "确认发货结果待核实", "order_id": order_id}
 
     def _build_headers(self) -> Dict[str, str]:
         """构建请求头

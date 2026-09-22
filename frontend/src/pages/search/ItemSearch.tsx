@@ -1,19 +1,27 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { motion } from 'framer-motion'
 import { Search, ShoppingBag, ExternalLink, MapPin, Heart } from 'lucide-react'
+import { getAccountDetails } from '@/api/accounts'
 import { searchItems, SearchResultItem } from '@/api/search'
 import { useUIStore } from '@/store/uiStore'
+import { ProductPageFailure, type ProductPageFailureData } from '@/pages/items/ProductPageFailure'
 import { ButtonLoading } from '@/components/common/Loading'
 
 export function ItemSearch() {
   const { addToast } = useUIStore()
+  const [failure, setFailure] = useState<ProductPageFailureData|null>(null)
   const [loading, setLoading] = useState(false)
   const [keyword, setKeyword] = useState('')
   const [results, setResults] = useState<SearchResultItem[]>([])
   const [total, setTotal] = useState(0)
+  const [accountId, setAccountId] = useState('')
+  const [accounts, setAccounts] = useState<{ id: string }[]>([])
+  const [pages, setPages] = useState(1)
+  useEffect(() => { getAccountDetails().then(setAccounts).catch(() => addToast({ type: 'error', message: '加载账号失败' })) }, [addToast])
 
   const handleSearch = async (e?: React.FormEvent) => {
     e?.preventDefault()
+    if (!accountId) { addToast({ type: 'warning', message: '请选择搜索账号' }); return }
     if (!keyword.trim()) {
       addToast({ type: 'warning', message: '请输入搜索关键词' })
       return
@@ -23,12 +31,14 @@ export function ItemSearch() {
     
     try {
       setLoading(true)
-      setResults([])
-      const result = await searchItems(keyword.trim())
+      const result = await searchItems(keyword.trim(), 1, 20, pages, accountId)
       
-      if (result.success) {
-        setResults(result.data || [])
-        setTotal(result.total || result.data.length)
+      setFailure(result.success ? null : result)
+      setResults(result.data || [])
+      setTotal(result.total ?? result.data.length)
+      if (!result.success) {
+        addToast({ type: 'error', message: result.error || '搜索失败，已保留确认结果' })
+      } else {
         
         if ((result.data || []).length === 0) {
           addToast({ type: 'info', message: '未找到相关商品' })
@@ -49,6 +59,7 @@ export function ItemSearch() {
 
   return (
     <div className="space-y-4">
+      <ProductPageFailure data={failure} />
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
@@ -78,6 +89,10 @@ export function ItemSearch() {
                 className="input-ios pl-12"
               />
             </div>
+            <select aria-label="搜索账号" className="input-ios" value={accountId} onChange={e => setAccountId(e.target.value)} disabled={loading}>
+              <option value="">选择搜索账号</option>{accounts.map(a => <option key={a.id} value={a.id}>{a.id}</option>)}
+            </select>
+            <input aria-label="搜索页数" className="input-ios md:w-24" type="number" min={1} max={20} value={pages} onChange={e => setPages(Math.max(1, Math.min(20, Number(e.target.value) || 1)))} />
             <button
               type="submit"
               disabled={loading}

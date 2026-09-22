@@ -1,3 +1,4 @@
+import ReplyControls from './ReplyControls'
 import { useState, useEffect, useRef } from 'react'
 import type { FormEvent, ChangeEvent } from 'react'
 import { motion } from 'framer-motion'
@@ -409,7 +410,7 @@ export function Keywords() {
         })
         await loadKeywords()
       } else {
-        addToast({ type: 'error', message: result.message || '导入失败' })
+        addToast({ type: 'error', message: result.data?.errors?.length ? `已保存 ${(result.data.added || 0) + (result.data.updated || 0)} 条；${result.data.errors.map(e => `第${e.row}行：${e.message}`).join('；')}` : result.message || '导入失败' }); await loadKeywords()
       }
     } catch {
       addToast({ type: 'error', message: '导入关键词失败' })
@@ -697,6 +698,8 @@ export function Keywords() {
           />
         </div>
       </div>
+
+      {selectedAccount && <ReplyControls key={selectedAccount} accountId={selectedAccount} />}
 
       {/* Account Select */}
       <motion.div

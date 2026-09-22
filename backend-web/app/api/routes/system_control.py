@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+from urllib.parse import urlparse
 
 import aiohttp
 from fastapi import APIRouter, Depends
@@ -36,7 +37,7 @@ router = APIRouter(prefix="/system-control", tags=["系统管理"])
 settings = get_settings()
 
 # 探测服务在线状态的 HTTP 超时（秒）：无重试，避免离线服务拖慢状态查询
-_HEALTH_PROBE_TIMEOUT = 30.0
+_HEALTH_PROBE_TIMEOUT = 5.0
 
 # 三个服务对应的 HTTP 基址（用于 docker 环境远程触发自重启）
 _SERVICE_URL_MAP = {
@@ -49,11 +50,11 @@ def _health_url(service_key: str) -> str:
     """
     构建各服务的健康检查 URL
 
-    - backend-web：本机 127.0.0.1:<port>/api/v1/health/ping
+    - backend-web：本机 127.0.0.1:<port>/health
     - websocket / scheduler：使用服务间通信地址 + /health（dev 为 localhost，docker 为容器名）
     """
     if service_key == "backend-web":
-        return f"http://127.0.0.1:{settings.service_port}/api/v1/health/ping"
+        return f"http://127.0.0.1:{settings.service_port}/health"
     base = _SERVICE_URL_MAP[service_key]().rstrip("/")
     return f"{base}/health"
 
@@ -67,7 +68,7 @@ async def get_services_status(
 
     统一通过调用各服务的健康检查接口判断（而非仅检测端口占用），
     能真实反映 HTTP 服务是否可响应：
-    - backend-web：/api/v1/health/ping
+    - backend-web：/health
     - websocket / scheduler：/health
     三个探测并行执行，单个超时 15 秒且不重试。
     """
@@ -75,13 +76,13 @@ async def get_services_status(
     keys = list(SERVICE_META.keys())
     results = await asyncio.gather(*[_probe_health(_health_url(k)) for k in keys])
     services = []
-    for key, online in zip(keys, results):
+    for key, health in zip(keys, results):
         meta = SERVICE_META[key]
         services.append({
             "key": key,
             "label": meta["label"],
-            "port": meta["port"],
-            "online": online,
+            "port": urlparse(_health_url(key)).port,
+            **health,
         })
     return ApiResponse(
         success=True,
@@ -90,23 +91,24 @@ async def get_services_status(
     )
 
 
-async def _probe_health(url: str) -> bool:
-    """
-    调用健康检查接口判断服务是否在线（单次请求，短超时，无重试）
-
-    Args:
-        url: 健康检查完整 URL
-
-    Returns:
-        True 表示服务 HTTP 可响应（HTTP 状态码 < 400）
-    """
+async def _probe_health(url: str) -> dict:
+    """Only dependency-healthy JSON counts as ready, never just HTTP 200."""
+    unavailable = {"online": False, "status": "unavailable", "database": "unknown",
+                   "redis": "unknown", "workers_enabled": False, "version": "", "commit": ""}
     timeout = aiohttp.ClientTimeout(total=_HEALTH_PROBE_TIMEOUT)
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url) as resp:
-                return resp.status < 400
+        async with aiohttp.ClientSession(timeout=timeout, trust_env=False) as session:
+            async with session.get(url, allow_redirects=False) as resp:
+                body = await resp.json()
+                data = body.get("data", {})
+                ready = (resp.status == 200 and body.get("success") is True
+                         and data.get("database") == "connected" and data.get("redis") == "connected")
+                return {"online": ready, "status": "running" if ready else "degraded",
+                        "database": data.get("database", "unknown"), "redis": data.get("redis", "unknown"),
+                        "workers_enabled": data.get("workers_enabled") is True,
+                        "version": str(data.get("version", "")), "commit": str(data.get("commit", ""))}
     except Exception:
-        return False
+        return unavailable
 
 
 @router.post("/restart/{service_key}")

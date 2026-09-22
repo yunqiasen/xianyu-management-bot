@@ -52,3 +52,10 @@ async def list_account_login_logs(
             "limit": limit,
             "offset": offset,
         }
+
+@router.get('/account-login-logs/summary')
+async def account_event_summary(days: int = Query(7,ge=1,le=366), _: User = Depends(deps.get_current_admin_user), service: AccountLoginLogService = Depends(deps.get_account_login_log_service)):
+    from common.utils.time_utils import get_beijing_now_naive
+    from datetime import timedelta
+    now=get_beijing_now_naive()
+    return {'success':True,'data':await service.event_summary(None,now-timedelta(days=days),now),'source':'account_login_logs','timezone':'Asia/Shanghai','days':days}

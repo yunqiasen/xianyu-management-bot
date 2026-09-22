@@ -105,6 +105,13 @@ async def lifespan(app: FastAPI):
     from app.services.xianyu.cookie_manager import get_manager
     cookie_manager = get_manager()
     logger.info("CookieManager已初始化")
+    from common.db.session import async_session_maker
+    from common.db.redis_client import get_redis_client
+    from common.services.account_request_budget import AccountRequestBudget
+    from app.services.account_dispatcher import AccountDispatcher
+    app.state.account_dispatcher = AccountDispatcher(
+        cookie_manager, async_session_maker, AccountRequestBudget(await get_redis_client()))
+
     
     # 启动CookieManager(加载启用的账号)，可通过配置禁用
     if settings.auto_start_websocket:
@@ -162,8 +169,14 @@ setup_error_handlers(app)
 from app.api.routes import cookies_refresh, internal, password_login
 
 app.include_router(internal.router)
+from app.api.routes.account_configuration import router as account_configuration_router
+app.include_router(account_configuration_router)
 app.include_router(cookies_refresh.router)
 app.include_router(password_login.router)
+from app.api.routes.account_operations import router as account_operations_router
+app.include_router(account_operations_router)
+from app.services.shipping.commerce_routes import router as commerce_router
+app.include_router(commerce_router)
 
 # 开启本进程内浏览器续期执行：所有浏览器续期（含 scheduler / backend-web 的 HTTP 委托）
 # 统一收敛到 WebSocket 进程，与滑块验证同进程串行，复用持久化目录与账号级互斥锁。
@@ -172,37 +185,16 @@ from common.services.cookie_renew_browser_service import enable_local_browser_re
 enable_local_browser_renew()
 
 
+from common.middleware.correlation import CorrelationMiddleware
+app.add_middleware(CorrelationMiddleware)
+
+
 @app.get("/health")
 async def health_check():
-    """
-    健康检查接口
-    
-    Returns:
-        服务健康状态
-    """
-    from common.db.session import async_engine
-    from sqlalchemy import text
-    
-    # 检查数据库连接
-    db_status = "unknown"
-    try:
-        async with async_engine.connect() as conn:
-            await conn.execute(text("SELECT 1"))
-            db_status = "connected"
-    except Exception as e:
-        logger.error(f"数据库连接检查失败: {str(e)}")
-        db_status = "disconnected"
-    
-    return {
-        "success": True,
-        "code": 200,
-        "message": "服务运行正常",
-        "data": {
-            "service": settings.project_name,
-            "status": "running",
-            "database": db_status,
-        },
-    }
+    from common.runtime_health import service_health
+    from fastapi.responses import JSONResponse
+    result = await service_health(settings.project_name, settings.auto_start_websocket)
+    return JSONResponse(result, status_code=result["code"])
 
 
 def run_server():

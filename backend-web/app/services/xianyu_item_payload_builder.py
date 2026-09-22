@@ -406,7 +406,7 @@ async def build_item_payload(
             try:
                 uploaded = await upload_publish_image(
                     image_url,
-                    cookie,
+                    cookie, account_id=account_id, owner_id=owner_id,
                     static_root=static_root,
                 )
             except PublishMediaError as exc:
@@ -430,7 +430,7 @@ async def build_item_payload(
                 try:
                     uploaded = await upload_publish_image(
                         image_source["source"],
-                        cookie,
+                        cookie, account_id=account_id, owner_id=owner_id,
                         static_root=static_root,
                     )
                 except PublishMediaError as exc:

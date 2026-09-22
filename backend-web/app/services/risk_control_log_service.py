@@ -195,7 +195,8 @@ class RiskControlLogService:
             }
             for log in logs
         ]
-        return items, total
+        from common.utils.logging_utils import redact_secrets
+        return redact_secrets(items), total
 
     async def get_today_success_rate(self, *, owner_id: int | None = None) -> dict:
         """

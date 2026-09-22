@@ -179,7 +179,10 @@ class ListingMonitorTaskService:
             if not task:
                 return {"success": False, "message": "监控任务不存在、已删除或未启用"}
             try:
-                await self._process_task(task, trigger_type=trigger_type)
+                result = await self._process_task(task, trigger_type=trigger_type)
+                if result is not None:
+                    return {"success": result.status in {"complete", "baseline_complete"},
+                            "message": f"增强监控：{result.status}"}
                 return {"success": True, "message": "采集已执行"}
             except Exception as exc:  # noqa: BLE001
                 logger.error(f"【{self.task_name}】手动执行任务 {task_id} 异常: {exc}")
@@ -352,6 +355,32 @@ class ListingMonitorTaskService:
         return rank
 
     async def _process_task(self, task: ListingMonitorTask, trigger_type: str = "auto"):
+        from common.services.listing_monitor_reliability import monitor_v2_enabled
+        if monitor_v2_enabled():
+            return await self._process_task_v2(task, trigger_type)
+        return await self._process_task_legacy(task, trigger_type)
+
+    async def _process_task_v2(self, task: ListingMonitorTask, trigger_type: str = "auto"):
+        from common.core.config import get_settings
+        from common.services.account_dispatch import AccountDispatchClient
+        from common.services.listing_monitor_reliability import run_monitor_cycle, ScanResult
+        settings = get_settings()
+        try:
+            dispatcher = AccountDispatchClient(settings.websocket_service_url, settings.internal_api_token)
+            result = await run_monitor_cycle(task.id, async_session_maker, dispatcher)
+        except ValueError:
+            result = ScanResult("blocked_configuration")
+        except Exception:
+            result = ScanResult("runtime_unavailable")
+        status = "success" if result.status in {"complete", "baseline_complete"} else "partial"
+        if result.status in {"http_error", "platform_error", "structure_error", "runtime_unavailable"}:
+            status = "failed"
+        await self._write_log(task, None, [], result.pages, result.fetched, result.inserted, result.updated, status,
+                              f"P5 candidate: {result.status}; events={result.events}", trigger_type)
+        await self._update_last_run(task.id)
+        return result
+
+    async def _process_task_legacy(self, task: ListingMonitorTask, trigger_type: str = "auto"):
         """处理单个监控任务：采集 + 入库 + 写日志 + 更新执行时间。"""
         sort_field, sort_value = _MONITOR_SORT_MAP.get(task.monitor_type, _MONITOR_SORT_MAP["listing"])
         accounts = await self._resolve_and_load_accounts(task)

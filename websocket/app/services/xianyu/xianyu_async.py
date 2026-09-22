@@ -9,6 +9,8 @@ XianyuAsync核心类
 5. 管理WebSocket连接生命周期
 """
 import asyncio
+from common.services import account_policy
+from common.services.account_execution import ExecutionLost, FencedSocket
 import json
 import time
 import os
@@ -200,6 +202,7 @@ class XianyuAsync:
                 stmt = (
                     select(
                         XYAccount.status,
+                        XYAccount.owner_id,
                         XYAccount.proxy_type,
                         XYAccount.proxy_host,
                         XYAccount.proxy_port,
@@ -220,6 +223,7 @@ class XianyuAsync:
                 row = rows[0]
                 return {
                     'status': row.status or 'disabled',
+                    'owner_id': row.owner_id,
                     'proxy_type': row.proxy_type or 'none',
                     'proxy_host': row.proxy_host or '',
                     'proxy_port': row.proxy_port or 0,
@@ -258,21 +262,7 @@ class XianyuAsync:
             形如 'http://host:port'、'socks5://user:pass@host:port' 的代理 URL；
             未配置代理时返回 None（调用方应走直连）。
         """
-        proxy_type = self.proxy_config.get('proxy_type', 'none')
-        if proxy_type == 'none':
-            return None
-
-        host = self.proxy_config.get('proxy_host')
-        port = self.proxy_config.get('proxy_port')
-        user = self.proxy_config.get('proxy_user')
-        password = self.proxy_config.get('proxy_pass')
-
-        if not host or not port:
-            return None
-
-        if user and password:
-            return f"{proxy_type}://{user}:{password}@{host}:{port}"
-        return f"{proxy_type}://{host}:{port}"
+        return account_policy.proxy_url(self.proxy_config)
 
     async def _load_system_proxy_settings(self) -> Optional[dict]:
         """读取系统级代理设置（xy_system_settings 表）
@@ -413,51 +403,56 @@ class XianyuAsync:
         return len(cls._instances)
     
     def _build_session_connector(self):
-        """根据当前 self.proxy_config 构造 aiohttp 的 connector
+        """Build the selected transport; proxy failure never selects a direct connector."""
+        from common.services.account_proxy import account_connector
+        return account_connector(self.proxy_config or {'proxy_type':'none'}, limit=100, limit_per_host=30)
 
-        - SOCKS5 / HTTP / HTTPS：用 aiohttp_socks.ProxyConnector，所有请求自动走代理
-        - 无代理或依赖缺失：用普通 TCPConnector 直连
+    async def _check_account_execution(self, *args):
+        runtime = getattr(self, '_account_runtime', None)
+        if runtime is None:
+            raise ExecutionLost('账号执行权尚未取得')
+        await runtime.check()
 
-        统一所有 aiohttp 出站（含 Token 刷新、订单查询等）走同一代理，
-        避免与 WebSocket 出站 IP 不一致触发闲鱼风控。
-        """
-        proxy_type = self.proxy_config.get('proxy_type', 'none')
-        if proxy_type == 'none':
-            return aiohttp.TCPConnector(limit=100, limit_per_host=30)
+    async def _guard_business_outbound(self, *args):
+        from common.services.account_dispatch import CURRENT_OPERATION, DispatchError
+        context = CURRENT_OPERATION.get()
+        if context is not None:
+            if context.live is not self:
+                raise DispatchError('not_account_executor')
+            await context.before_transport()
+        else:
+            runtime = getattr(self, '_account_runtime', None)
+            if runtime is None:
+                raise ExecutionLost('账号执行权尚未取得')
+            await runtime.before_business_request()
 
-        host = self.proxy_config.get('proxy_host')
-        port = self.proxy_config.get('proxy_port')
-        if not host or not port:
-            return aiohttp.TCPConnector(limit=100, limit_per_host=30)
-
+    async def _guard_socket_outbound(self, wire):
+        from common.services.account_request_budget import BudgetError
         try:
-            from aiohttp_socks import ProxyConnector, ProxyType
-            if proxy_type == 'socks5':
-                socks_type = ProxyType.SOCKS5
-            elif proxy_type == 'socks4':
-                socks_type = ProxyType.SOCKS4
-            elif proxy_type in ('http', 'https'):
-                socks_type = ProxyType.HTTP
-            else:
-                logger.warning(f"【{self.cookie_id}】未知代理类型: {proxy_type}，回退直连")
-                return aiohttp.TCPConnector(limit=100, limit_per_host=30)
+            packet = json.loads(wire)
+        except (TypeError, ValueError) as exc:
+            raise BudgetError('invalid_platform_message') from exc
+        if not isinstance(packet, dict):
+            raise BudgetError('invalid_platform_message')
+        lwp = packet.get('lwp')
+        # Registration, heartbeat and receipt ACKs do not consume business request slots.
+        if lwp in {'/reg', '/!', '/r/SyncStatus/ackDiff'}:
+            return
+        if lwp is None and packet.get('code') in (200, '200') and not packet.get('body'):
+            return
+        await self._guard_business_outbound()
 
-            connector = ProxyConnector(
-                proxy_type=socks_type,
-                host=host,
-                port=port,
-                username=self.proxy_config.get('proxy_user') or None,
-                password=self.proxy_config.get('proxy_pass') or None,
-                rdns=True,
-            )
-            logger.info(f"【{self.cookie_id}】HTTP Session 走代理: {proxy_type}://{host}:{port}")
-            return connector
-        except ImportError:
-            logger.error(f"【{self.cookie_id}】aiohttp-socks 未安装，HTTP 代理无法生效，回退直连")
-            return aiohttp.TCPConnector(limit=100, limit_per_host=30)
-        except Exception as e:
-            logger.error(f"【{self.cookie_id}】构造代理 connector 失败: {e}，回退直连")
-            return aiohttp.TCPConnector(limit=100, limit_per_host=30)
+    async def _record_http_rate_limit(self, session, trace_context, params):
+        if params.response.status != 429:
+            return
+        from common.services.account_request_budget import AccountRequestBudget, parse_retry_after
+        runtime = getattr(self, '_account_runtime', None)
+        if runtime is not None:
+            delay = parse_retry_after(params.response.headers.get('Retry-After')) or 60
+            await AccountRequestBudget(runtime.lease.redis).defer(self.cookie_id, delay)
+
+    def fenced_socket(self, socket):
+        return FencedSocket(socket, self._check_account_execution, before_send=self._guard_socket_outbound)
 
     async def create_session(self):
         """创建aiohttp session（按当前 proxy_config 接入代理）"""
@@ -465,11 +460,21 @@ class XianyuAsync:
             headers = DEFAULT_HEADERS.copy()
             headers['cookie'] = self.cookies_str.replace('\n', '').replace('\r', '') if self.cookies_str else ''
 
-            connector = self._build_session_connector()
+            trace = aiohttp.TraceConfig()
+            trace.on_request_start.append(self._guard_business_outbound)
+            trace.on_request_end.append(self._record_http_rate_limit)
+            try:
+                connector = self._build_session_connector()
+            except Exception:
+                if getattr(self, '_account_runtime', None):
+                    await self._account_runtime.pause('proxy')
+                raise
             self.session = aiohttp.ClientSession(
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=30),
                 connector=connector,
+                trust_env=False,
+                trace_configs=[trace],
             )
             # 记录当前 session 绑定的代理 URL，用于检测代理变化时重建 session
             self._current_session_proxy_url = self._get_proxy_url()
@@ -596,6 +601,7 @@ class XianyuAsync:
                 "mid": generate_mid()
             }
         }
+        self._registration_mid = msg['headers']['mid']
         await ws.send(json.dumps(msg))
         await asyncio.sleep(1)
         
@@ -618,7 +624,7 @@ class XianyuAsync:
             ]
         }
         await ws.send(json.dumps(msg))
-        logger.info(f'【{self.cookie_id}】连接注册完成')
+        logger.info(f'【{self.cookie_id}】连接注册已提交，等待平台确认')
     
     def _create_tracked_task(self, coro):
         """创建并追踪后台任务，确保异常不会被静默忽略"""
@@ -1882,7 +1888,7 @@ class XianyuAsync:
                 if os.path.exists(local_image_path):
                     logger.info(f"[{msg_time}] 【{self.cookie_id}】准备上传确认收货图片到闲鱼CDN: {local_image_path}")
                     
-                    uploader = ImageUploader(self.cookies_str)
+                    uploader = ImageUploader(self.cookies_str, account_id=self.cookie_id, owner_id=self.user_id)
                     
                     async with uploader:
                         cdn_url = await uploader.upload_image(local_image_path)
@@ -1924,7 +1930,7 @@ class XianyuAsync:
                                     try:
                                         logger.info(f"[{msg_time}] 【{self.cookie_id}】从backend-web下载图片成功，准备上传到CDN: {tmp_path}")
                                         
-                                        uploader = ImageUploader(self.cookies_str)
+                                        uploader = ImageUploader(self.cookies_str, account_id=self.cookie_id, owner_id=self.user_id)
                                         
                                         async with uploader:
                                             cdn_url = await uploader.upload_image(tmp_path)
@@ -1962,6 +1968,19 @@ class XianyuAsync:
             logger.error(f"[{msg_time}] 【{self.cookie_id}】处理确认收货图片失败: {e}")
             return None
     
+    def _failed_message_send(self, exc, mid, future):
+        from common.services.account_dispatch import DispatchError
+        from common.services.account_request_budget import BudgetError
+        if mid:
+            self._pending_mid_futures.pop(str(mid), None)
+        if future is not None and not future.done():
+            future.cancel()
+        known_unsent = isinstance(exc, (ExecutionLost, DispatchError, BudgetError))
+        code = getattr(exc, 'code', 'execution_lost' if isinstance(exc, ExecutionLost) else 'transport_unverified')
+        logger.warning("【{}】消息提交失败: {}", self.cookie_id, code)
+        return {'success':False, 'definitely_not_sent':known_unsent, 'error_code':code,
+                'error_message':code, 'retry_after':getattr(exc, 'retry_after', None), 'mid':mid}
+
     async def send_msg(self, websocket, chat_id: str, send_user_id: str, content: str):
         """发送文本消息（参照旧框架实现）
 
@@ -1969,6 +1988,7 @@ class XianyuAsync:
         同时注册 mid 等待队列，返回结果中携带 mid，供上层在写入日志后
         异步等待服务端响应、回写发送状态（识别 CSI_FORBID 安全拦截等失败）。
         """
+        registered_mid, send_future = None, None
         try:
             import base64
             from common.utils.xianyu_utils import generate_mid, generate_uuid
@@ -2028,7 +2048,7 @@ class XianyuAsync:
                 logger.warning(f"【{self.cookie_id}】注册发送结果检测失败（不影响发送）: {self._safe_str(reg_e)}")
 
             await websocket.send(msg_str)
-            logger.info(f"【{self.cookie_id}】发送消息成功: {content[:50]}...")
+            logger.info(f"【{self.cookie_id}】消息已提交，等待平台回执")
             return {
                 "success": True,
                 "mode": "text",
@@ -2039,16 +2059,12 @@ class XianyuAsync:
                 # 持有引用仍能拿到结果，避免漏判拦截
                 "send_future": send_future,
             }
-        except Exception as e:
-            logger.error(f"【{self.cookie_id}】发送消息失败: {e}")
-            import traceback
-            logger.error(f"【{self.cookie_id}】发送消息异常堆栈: {traceback.format_exc()}")
-            return {
-                "success": False,
-                "mode": "text",
-                "content": content,
-                "error_message": str(e),
-            }
+        except asyncio.CancelledError as exc:
+            self._failed_message_send(exc, registered_mid, send_future)
+            raise
+        except Exception as exc:
+            return {"mode":"text", "content":content,
+                    **self._failed_message_send(exc, registered_mid, send_future)}
 
     async def send_raw_message(self, websocket, message: dict):
         """将远程接口返回的完整 LWP JSON 原样转发到闲鱼 WebSocket。"""
@@ -2081,16 +2097,12 @@ class XianyuAsync:
                 "mid": str(mid) if mid else None,
                 "send_future": send_future,
             }
-        except Exception as exc:  # noqa: BLE001
-            if mid:
-                self._pending_mid_futures.pop(str(mid), None)
-            logger.error(f"【{self.cookie_id}】转发远程位置消息报文失败: {exc}")
-            return {
-                "success": False,
-                "mode": "external_contact",
-                "mid": str(mid) if mid else None,
-                "error_message": str(exc),
-            }
+        except asyncio.CancelledError as exc:
+            self._failed_message_send(exc, str(mid) if mid else None, send_future)
+            raise
+        except Exception as exc:
+            return {"mode":"external_contact",
+                    **self._failed_message_send(exc, str(mid) if mid else None, send_future)}
 
     async def wait_send_reject_reason(
         self,
@@ -2617,6 +2629,7 @@ class XianyuAsync:
                 - 具体值: 更新指定商品的默认回复图片
             image_index: 多图片索引（可选，用于更新卡券多图片列表中指定索引的URL）
         """
+        registered_mid, send_future = None, None
         try:
             import base64
             import os
@@ -2666,7 +2679,7 @@ class XianyuAsync:
                         logger.warning(f"【{self.cookie_id}】获取图片尺寸失败，使用默认尺寸: {e}")
                     
                     from app.utils.image_uploader import ImageUploader
-                    uploader = ImageUploader(self.cookies_str)
+                    uploader = ImageUploader(self.cookies_str, account_id=self.cookie_id, owner_id=self.user_id)
                     
                     async with uploader:
                         cdn_url = await uploader.upload_image(local_image_path)
@@ -2792,22 +2805,25 @@ class XianyuAsync:
             # 打印完整的发送消息用于调试
             logger.debug(f"【{self.cookie_id}】发送图片WebSocket消息: {json.dumps(msg, ensure_ascii=False)[:500]}...")
             
+            registered_mid = msg['headers']['mid']
+            send_future = asyncio.get_running_loop().create_future()
+            self._pending_mid_futures[registered_mid] = send_future
             await websocket.send(json.dumps(msg))
-            logger.info(f"【{self.cookie_id}】发送图片消息成功: {cdn_url}")
+            logger.info(f"【{self.cookie_id}】图片消息已提交，等待平台回执")
             return {
                 "success": True,
                 "mode": "image",
                 "image_url": cdn_url,
                 "original_image_url": image_url,
+                "mid": registered_mid,
+                "send_future": send_future,
             }
-        except Exception as e:
-            logger.error(f"【{self.cookie_id}】发送图片消息失败: {e}")
-            return {
-                "success": False,
-                "mode": "image",
-                "image_url": image_url,
-                "error_message": str(e),
-            }
+        except asyncio.CancelledError as exc:
+            self._failed_message_send(exc, registered_mid, send_future)
+            raise
+        except Exception as exc:
+            return {"mode":"image", "image_url":image_url,
+                    **self._failed_message_send(exc, registered_mid, send_future)}
     
     async def _cancel_background_tasks(self):
         """取消并清理所有后台任务"""
@@ -2872,15 +2888,66 @@ class XianyuAsync:
         self._using_expired_startup_token = False
         return True
     
+    async def consume_socket(self, websocket):
+        """Main receive pump: registration confirmation and correlated business receipts."""
+        try:
+            async for message in websocket:
+                try:
+                    message_data = json.loads(message)
+                    if not isinstance(message_data, dict):
+                        continue
+                    registration_mid = getattr(self, '_registration_mid', None)
+                    headers = message_data.get('headers') or {}
+                    if registration_mid and isinstance(headers, dict) and headers.get('mid') == registration_mid:
+                        if await self._account_runtime.confirm_registration(message_data, registration_mid):
+                            self._registration_mid = None
+                            logger.info("【{}】账号注册已确认，业务可用", self.cookie_id)
+                        elif message_data.get('code') is not None:
+                            await self._account_runtime.pause('registration_rejected')
+                            await websocket.close()
+                            return
+                        continue
+                    if self.connection_manager.handle_heartbeat_response(message_data):
+                        continue
+                    self._dispatch_mid_response(message_data)
+                    self._create_tracked_task(self._handle_message_with_semaphore(message_data, websocket))
+                except ExecutionLost:
+                    raise
+                except Exception as exc:
+                    logger.warning("【{}】消息处理失败: {}", self.cookie_id, type(exc).__name__)
+        finally:
+            if self.connection_manager.ws is websocket:
+                try:
+                    await self._account_runtime.record_connection(False)
+                except ExecutionLost:
+                    pass
+
     async def main(self):
         """主程序入口"""
         try:
             logger.info(f"【{self.cookie_id}】开始启动XianyuAsync主程序...")
+            from common.db.redis_client import get_redis_client
+            from common.services.account_runtime import AccountRuntime
+            initial = await self._load_runtime_account_state()
+            if not initial or initial['status'] != 'active':
+                return
+            if self.user_id is not None and self.user_id != initial['owner_id']:
+                raise ExecutionLost('账号会话身份不一致')
+            self.proxy_config = {k: initial[k] for k in self._default_proxy_config()}
+            self._account_runtime = AccountRuntime(self.cookie_id, initial['owner_id'], await get_redis_client())
+            if not await self._account_runtime.start():
+                return
+            binding = await self._account_runtime.load_binding()
+            self.cookies_str = binding['cookie']
+            self.cookies = trans_cookies(self.cookies_str)
+            self.myid, self.user_id = str(binding['unb']), binding['owner_id']
+            self.proxy_config = binding['proxy']
             await self.create_session()
             logger.info(f"【{self.cookie_id}】Session创建完成,开始WebSocket连接循环...")
             
             while True:
                 try:
+                    await self._check_account_execution()
                     runtime_state = await self._load_runtime_account_state()
                     if runtime_state is not None:
                         if runtime_state.get('status') != 'active':
@@ -2895,45 +2962,7 @@ class XianyuAsync:
                             'proxy_pass': runtime_state.get('proxy_pass', ''),
                         }
                     else:
-                        logger.warning(f"【{self.cookie_id}】无法刷新账号运行配置，保留当前代理配置继续运行")
-
-                    # 系统级代理总开关：xy_system_settings.proxy.enabled
-                    # - 关闭时：账号级代理也不生效（强制直连），让用户可通过系统设置一键关闭所有代理
-                    #   （场景：账号级 SOCKS5 代理批量失效时，无需逐个修改账号配置即可切回直连）
-                    # - 开启时：账号级代理正常生效；账号未配置代理时使用系统代理 API
-                    # - DB 读取失败 (None)：保留账号级代理，避免偶发故障导致全量代理被错误关闭
-                    system_proxy_settings = await self._load_system_proxy_settings()
-                    if (
-                        system_proxy_settings is not None
-                        and not system_proxy_settings.get('enabled', False)
-                        and self.proxy_config.get('proxy_type', 'none') != 'none'
-                    ):
-                        original_type = self.proxy_config.get('proxy_type')
-                        original_host = self.proxy_config.get('proxy_host')
-                        original_port = self.proxy_config.get('proxy_port')
-                        logger.info(
-                            f"【{self.cookie_id}】系统代理总开关已关闭，账号级代理"
-                            f"（{original_type}://{original_host}:{original_port}）"
-                            f"暂不启用，本次走直连"
-                        )
-                        self.proxy_config = self._default_proxy_config()
-
-                    # 账号级代理未配置时，尝试使用系统级代理（来自 xy_system_settings.proxy.*）
-                    # 优先级：账号代理（xy_account.proxy_type 非 none）> 系统代理 API > 直连
-                    # 失败兜底：API 调用失败时保持 'none'，走直连让重连机制自愈
-                    # 注意：_fetch_system_proxy_endpoint 内部会再次校验 proxy.enabled，
-                    # 总开关关闭时直接返回 None，无需在此重复判断
-                    if self.proxy_config.get('proxy_type', 'none') == 'none':
-                        system_proxy = await self._fetch_system_proxy_endpoint()
-                        if system_proxy:
-                            host, port = system_proxy
-                            self.proxy_config = {
-                                'proxy_type': 'http',
-                                'proxy_host': host,
-                                'proxy_port': port,
-                                'proxy_user': '',
-                                'proxy_pass': '',
-                            }
+                        raise RuntimeError("账号运行配置读取失败，停止连接")
 
                     # HTTP session 代理状态检测：仅在"代理状态变化"时重建 session
                     # - 首次拿到代理（直连 → 代理）：重建让 HTTP 接入代理
@@ -2942,7 +2971,7 @@ class XianyuAsync:
                     #   （不强求与 WebSocket 同 IP，避免每次重连都重建 session）
                     new_proxy_url = self._get_proxy_url()
                     current_proxy_url = getattr(self, '_current_session_proxy_url', None)
-                    proxy_state_changed = bool(new_proxy_url) != bool(current_proxy_url)
+                    proxy_state_changed = new_proxy_url != current_proxy_url
                     if self.session and proxy_state_changed:
                         logger.info(
                             f"【{self.cookie_id}】HTTP session 代理状态变更"
@@ -3041,7 +3070,10 @@ class XianyuAsync:
                     logger.info(f"【{self.cookie_id}】WebSocket目标地址: {self.base_url}")
                     
                     # 创建WebSocket连接
+                    await self._check_account_execution()
                     async with await self.connection_manager.create_websocket_connection(headers) as websocket:
+                        websocket = self.fenced_socket(websocket)
+                        await self._account_runtime.record_connection(True)
                         self.connection_manager.ws = websocket
                         logger.info(f"【{self.cookie_id}】WebSocket连接建立成功,开始初始化...")
                         
@@ -3104,28 +3136,7 @@ class XianyuAsync:
                             logger.info(f"【{self.cookie_id}】所有后台任务已启动")
                             logger.info(f"【{self.cookie_id}】开始监听WebSocket消息...")
                             
-                            # 消息循环
-                            async for message in websocket:
-                                logger.debug(f"【{self.cookie_id}】收到消息: {len(message) if message else 0} 字节")
-                                try:
-                                    message_data = json.loads(message)
-                                    
-                                    # 处理心跳响应
-                                    if self.connection_manager.handle_heartbeat_response(message_data):
-                                        continue
-                                    
-                                    # 处理LWP请求-响应关联：如果响应的mid命中等待队列，
-                                    # resolve对应Future（用于 create_chat 等需要等待结果的请求）
-                                    self._dispatch_mid_response(message_data)
-                                    
-                                    # 处理其他消息
-                                    # 使用追踪的异步任务处理消息，防止阻塞后续消息接收
-                                    # 并通过信号量控制并发数量，防止内存泄漏
-                                    self._create_tracked_task(self._handle_message_with_semaphore(message_data, websocket))
-                                    
-                                except Exception as e:
-                                    logger.error(f"【{self.cookie_id}】处理消息出错: {e}")
-                                    continue
+                            await self.consume_socket(websocket)
 
                             # 正常关闭码会让 async for 无异常结束，同样需要识别启动
                             # 过期 Token 的短连接，避免下一轮继续复用已被拒绝的 Token。
@@ -3144,8 +3155,14 @@ class XianyuAsync:
                             # 清理WebSocket引用
                             if self.connection_manager.ws == websocket:
                                 self.connection_manager.ws = None
+                                try:
+                                    await self._account_runtime.record_connection(False)
+                                except ExecutionLost:
+                                    pass
                                 logger.info(f"【{self.cookie_id}】WebSocket连接已退出")
                 
+                except ExecutionLost:
+                    break
                 except Exception as e:
                     error_msg = str(e)
                     error_type = type(e).__name__
@@ -3325,6 +3342,9 @@ class XianyuAsync:
             # 关闭session
             await self.close_session()
             
+            if getattr(self, '_account_runtime', None):
+                await self._account_runtime.close()
+
             # 注销实例
             self._unregister_instance()
             logger.info(f"【{self.cookie_id}】XianyuAsync主程序已完全退出")

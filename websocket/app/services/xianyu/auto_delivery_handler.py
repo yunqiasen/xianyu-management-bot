@@ -448,11 +448,12 @@ class AutoDeliveryHandler:
             金额有效或无需执行金额校验返回 True，否则返回 False。
         """
         try:
-            order_info = db_manager.get_order_by_id(order_id)
-            if not order_info:
-                return True
-
-            order_amount = order_info.get('amount')
+            from common.db.session import async_session_maker
+            from common.services.order_service import OrderService
+            async with async_session_maker() as session:
+                order = await OrderService(session).get_order_by_id(order_id, account_id=self.cookie_id)
+            if not order: return True
+            order_amount = order.amount
             if order_amount is None:
                 return True
 
@@ -1102,6 +1103,16 @@ class AutoDeliveryHandler:
 
             # 订单ID已提取，将在自动发货时进行确认发货处理
             logger.info(f'[{msg_time}] 【{self.cookie_id}】提取到订单ID: {order_id}，将在自动发货时处理确认发货')
+
+            # 付款、旧手工和调度入口共用持久桥；既有意图优先于专用配置/临时锁。
+            from types import SimpleNamespace
+            from app.services.shipping.legacy_bridge import maybe_deliver
+            durable = await maybe_deliver(SimpleNamespace(
+                owner_id=None, account_id=self.cookie_id, order_no=order_id,
+                item_id=item_id, buyer_id=send_user_id, chat_id=chat_id, card_id=None,
+            ), live=self.parent, pre_check_result=pre_check_result)
+            if durable is not None:
+                return
 
             # 检查订单金额，金额为0时仅在实际发货入口刷新一次
             if not await self._ensure_order_amount_before_delivery(

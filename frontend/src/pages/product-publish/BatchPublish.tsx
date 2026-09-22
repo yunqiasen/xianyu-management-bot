@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 批量发布页面
  *
  * 功能：
@@ -11,7 +11,8 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { motion } from 'framer-motion'
 import { Layers, CheckCircle, XCircle, Clock, Play, Loader2 } from 'lucide-react'
 import { useUIStore } from '@/store/uiStore'
-import { publishBatch, getBatchStatus, getMaterials, type ProductMaterial, type BatchAccountStatus } from '@/api/productPublish'
+import { getPublishBatches, publishBatch, getBatchStatus, getMaterials, type ProductMaterial, type BatchAccountStatus } from '@/api/productPublish'
+import { ProductBatchControls } from './ProductBatchControls'
 import { getAccountDetails } from '@/api/accounts'
 
 interface BatchProgress {
@@ -19,6 +20,8 @@ interface BatchProgress {
   total: number
   success: number
   failed: number
+  unknown?: number
+  cancelled?: number
   publishing: number
   pending: number
   finished: boolean
@@ -30,6 +33,7 @@ const BATCH_ID_STORAGE_KEY = 'batch_publish_active_batch_id'
 
 export function BatchPublish() {
   const { addToast } = useUIStore()
+  const [batchHistory, setBatchHistory] = useState<{batch_id:string;created_at:string;total:number}[]>([])
   const [accounts, setAccounts] = useState<any[]>([])
   const [materials, setMaterials] = useState<ProductMaterial[]>([])
   const [selectedAccounts, setSelectedAccounts] = useState<Set<string>>(new Set())
@@ -85,8 +89,10 @@ export function BatchPublish() {
             const syncUnknownCount = res.data.account_statuses.filter(item => item.sync_status === 'unknown').length
             const syncProblemCount = syncFailedCount + syncUnknownCount
             addToast({
-              type: res.data.failed === 0 && syncProblemCount === 0 ? 'success' : 'warning',
-              message: syncFailedCount > 0
+              type: res.data.failed === 0 && !res.data.unknown && syncProblemCount === 0 ? 'success' : 'warning',
+              message: (res.data.unknown || 0) > 0
+                ? `批量执行结束，${res.data.unknown} 件结果待核实，请勿重新发布这些商品`
+                : syncFailedCount > 0
                 ? `批量发布完成！成功 ${res.data.success} 条，失败 ${res.data.failed} 条，${syncFailedCount} 个账号自动获取商品失败`
                 : syncUnknownCount > 0
                   ? `批量发布完成！成功 ${res.data.success} 条，失败 ${res.data.failed} 条，${syncUnknownCount} 个账号自动获取商品状态未知`
@@ -323,6 +329,12 @@ export function BatchPublish() {
         </button>
       </div>
 
+      <details className="vben-card p-4"><summary onClick={() => getPublishBatches().then(r => setBatchHistory(r.data)).catch(() => addToast({type:'error',message:'历史批次读取失败'}))}>历史批次（重开浏览器后可恢复）</summary>
+        {batchHistory.map(batch => <button key={batch.batch_id} className="block text-blue-600 my-2" onClick={async () => {
+          const r = await getBatchStatus(batch.batch_id)
+          if(r.success){setProgress(r.data);storeBatchId(batch.batch_id);if(!r.data.finished)startPolling(batch.batch_id)}
+        }}>{batch.created_at} · {batch.total}项 · {batch.batch_id}</button>)}
+      </details>
       {/* 进度面板 */}
       {progress && (
         <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="vben-card">
@@ -333,10 +345,17 @@ export function BatchPublish() {
               : <Loader2 className="w-4 h-4 animate-spin text-blue-500" />}
           </div>
           <div className="vben-card-body">
+            <ProductBatchControls batchId={progress.batch_id} pending={progress.pending} failed={progress.failed} onChanged={(message) => {
+              addToast({ type: 'info', message }); startPolling(progress.batch_id)
+              getBatchStatus(progress.batch_id).then(r => { if (r.success) setProgress(r.data) })
+            }} />
+            <a className="text-blue-600 text-sm" href="/product-publish/logs">发布日志：逐项核对待核实结果</a>
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
               {[
                 { label: '总数', value: progress.total, icon: <Layers className="w-5 h-5" />, cls: 'stat-icon-primary' },
                 { label: '成功', value: progress.success, icon: <CheckCircle className="w-5 h-5" />, cls: 'stat-icon-success' },
+                { label: '待核实', value: progress.unknown || 0, icon: <XCircle className="w-5 h-5" />, cls: 'stat-icon-warning' },
+                { label: '已取消', value: progress.cancelled || 0, icon: <XCircle className="w-5 h-5" />, cls: 'stat-icon-warning' },
                 { label: '失败', value: progress.failed, icon: <XCircle className="w-5 h-5" />, cls: 'stat-icon-warning' },
                 { label: '进行中', value: progress.publishing + progress.pending, icon: <Clock className="w-5 h-5" />, cls: 'stat-icon-info' },
               ].map(item => (
@@ -353,10 +372,10 @@ export function BatchPublish() {
               <>
                 <div className="w-full bg-slate-200 dark:bg-slate-700 rounded-full h-2 mb-1">
                   <div className="bg-blue-500 h-2 rounded-full transition-all duration-500"
-                    style={{ width: `${Math.round((progress.success + progress.failed) / progress.total * 100)}%` }} />
+                    style={{ width: `${Math.round((progress.success + progress.failed + (progress.unknown || 0) + (progress.cancelled || 0)) / progress.total * 100)}%` }} />
                 </div>
                 <div className="flex justify-between text-xs text-slate-400">
-                  <span>进度 {Math.round((progress.success + progress.failed) / progress.total * 100)}%</span>
+                  <span>进度 {Math.round((progress.success + progress.failed + (progress.unknown || 0) + (progress.cancelled || 0)) / progress.total * 100)}%</span>
                   <span>批次 ID：{progress.batch_id.slice(0, 8)}...</span>
                 </div>
               </>

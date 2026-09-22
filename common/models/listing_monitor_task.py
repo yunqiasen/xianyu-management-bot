@@ -43,7 +43,7 @@ class ListingMonitorTask(TimestampMixin, Base):
     dm_batch_size: Mapped[int] = mapped_column(Integer, nullable=False, default=5, server_default="5", comment="每次定时私信任务最多处理条数")
     order_batch_size: Mapped[int] = mapped_column(Integer, nullable=False, default=5, server_default="5", comment="每次定时下单任务最多处理条数")
     direct_order: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0", comment="采集后是否直接下单（开启则新采集商品立即用下单账号下单，下单后再入库，避免与定时下单并发）")
-    is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="1", comment="是否启用监控任务")
+    is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0", comment="是否启用监控任务")
     is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0", comment="是否已删除（软删除）")
     last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), comment="最近一次执行时间")
     created_by: Mapped[int | None] = mapped_column(BigInteger, comment="创建人用户ID")

@@ -18,6 +18,11 @@ export interface FetchItemsSummaryResponse extends ApiResponse {
   success_account_count?: number
   failed_account_count?: number
   failed_accounts?: string[]
+  status?: string
+  failed_page?: number
+  retry_after?: number | null
+  retry_action?: string
+  partial?: boolean
 }
 
 // 获取商品列表
@@ -131,7 +136,7 @@ export const batchOfflineItems = (cookieId: string, itemIds: string[]): Promise<
   return post(`${ITEM_PREFIX}/batch-offline`, { cookie_id: cookieId, item_ids: itemIds })
 }
 
-// 批量删除闲鱼平台商品（本地商品记录保留）
+// 批量删除闲鱼平台商品（成功项同步清理本地，失败项保留）
 export const batchDeleteXianyuItems = (cookieId: string, itemIds: string[]): Promise<ApiResponse> => {
   return post(`${ITEM_PREFIX}/batch-delete-xianyu`, { cookie_id: cookieId, item_ids: itemIds })
 }

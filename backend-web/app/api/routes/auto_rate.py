@@ -267,6 +267,9 @@ async def batch_rate_orders(
             "rated_count": 0,
             "failed_count": 0,
             "total_pending": 0,
+            "items": [],
+            "skipped_count": 0,
+            "unknown_count": 0,
             "message": "",
         }
         
@@ -340,6 +343,7 @@ async def batch_rate_orders(
                 try:
                     rate_service = RateService(current_cookie, account_id=account_id)
                     rate_result = await rate_service.rate_buyer(order_id, feedback=feedback)
+                    account_result['items'].append({'order_no':order_id, **rate_result})
                     
                     # 如果cookie被刷新了，更新本地变量
                     if rate_service.cookie_string != current_cookie:
@@ -349,6 +353,10 @@ async def batch_rate_orders(
                         account_result["rated_count"] += 1
                         # 好评后自动发送致谢消息（#232），失败不影响批量评价结果
                         await _send_thanks_after_rate(db, account_id, order_id)
+                    elif rate_result.get('status') == 'skipped':
+                        account_result['skipped_count'] += 1
+                    elif rate_result.get('unknown'):
+                        account_result['unknown_count'] += 1
                     else:
                         account_result["failed_count"] += 1
                         logger.warning(
@@ -364,7 +372,7 @@ async def batch_rate_orders(
                 # 每笔间隔1秒
                 await asyncio.sleep(1)
             
-            account_result["success"] = True
+            account_result["success"] = account_result["failed_count"] == 0 and account_result["unknown_count"] == 0
             rated = account_result["rated_count"]
             failed = account_result["failed_count"]
             account_result["message"] = f"评价完成: 成功 {rated} 笔，失败 {failed} 笔"
@@ -391,3 +399,132 @@ async def batch_rate_orders(
             "details": results,
         },
     )
+
+
+class FeedbackTaskRequest(BaseModel):
+    account_id: str
+    kind: str = 'rate'
+    order_nos: list[str] = []
+    start_date: str | None = None
+    end_date: str | None = None
+
+
+async def _feedback_account(db, user, account_id):
+    account=(await db.execute(select(XYAccount).where(XYAccount.owner_id==user.id,
+        XYAccount.account_id==account_id))).scalar_one_or_none()
+    if not account: raise HTTPException(404,'账号不存在')
+    return account
+
+
+@router.post('/tasks/run')
+async def run_feedback_tasks(req: FeedbackTaskRequest, current_user: User=Depends(deps.get_current_active_user),
+    db: AsyncSession=Depends(deps.get_db_session)):
+    from datetime import datetime, timedelta
+    from common.models.xy_order import XYOrder
+    from common.services.product_feedback_service import ProductFeedbackService
+    account=await _feedback_account(db,current_user,req.account_id)
+    if req.kind not in ('rate','red_flower'): raise HTTPException(422,'任务类型错误')
+    if len(req.order_nos)>100: raise HTTPException(422,'每次至多100笔')
+    query=select(XYOrder).where(XYOrder.owner_id==current_user.id,XYOrder.account_id==account.account_id)
+    if req.order_nos:
+        query=query.where(XYOrder.order_no.in_(req.order_nos))
+    else:
+        try:
+            start=datetime.fromisoformat(req.start_date or '')
+            end=datetime.fromisoformat(req.end_date or '')+timedelta(days=1)
+            if end<=start or end-start>timedelta(days=31): raise ValueError()
+        except ValueError: raise HTTPException(422,'历史处理请指定至多31天的日期范围')
+        query=query.where(XYOrder.placed_at>=start,XYOrder.placed_at<end)
+    orders=list((await db.execute(query.order_by(XYOrder.id).limit(101))).scalars())
+    if len(orders)>100: raise HTTPException(422,'范围内超过100笔，请缩小范围')
+    svc=ProductFeedbackService(db)
+    results=[await svc.run_order(account,order,req.kind) for order in orders]
+    known={o.order_no for o in orders}
+    for missing in set(req.order_nos)-known:
+        results.append(await svc.record(account,missing,req.kind,'skipped','order_not_found'))
+    return {'success':True,'data':results}
+
+
+@router.get('/tasks/history')
+async def feedback_history(account_id: str,current_user: User=Depends(deps.get_current_active_user),
+    db: AsyncSession=Depends(deps.get_db_session)):
+    from common.services.product_feedback_service import ProductFeedbackService
+    await _feedback_account(db,current_user,account_id)
+    return {'success':True,'data':await ProductFeedbackService(db).history(current_user.id,account_id)}
+
+
+class RateTemplateRequest(BaseModel):
+    name: str
+    content: str
+
+
+@router.get('/templates/{account_id}')
+async def rate_templates(account_id: str,current_user: User=Depends(deps.get_current_active_user),db: AsyncSession=Depends(deps.get_db_session)):
+    from common.models.product_feedback import ProductRateTemplate
+    await _feedback_account(db,current_user,account_id)
+    rows=(await db.execute(select(ProductRateTemplate).where(ProductRateTemplate.owner_id==current_user.id,
+        ProductRateTemplate.account_id==account_id).order_by(ProductRateTemplate.id))).scalars()
+    return {'success':True,'data':[dict(id=r.id,name=r.name,content=r.content,active=r.active) for r in rows]}
+
+
+@router.post('/templates/{account_id}')
+async def create_rate_template(account_id: str,req: RateTemplateRequest,current_user: User=Depends(deps.get_current_active_user),db: AsyncSession=Depends(deps.get_db_session)):
+    from common.models.product_feedback import ProductRateTemplate
+    await _feedback_account(db,current_user,account_id)
+    if not req.name.strip() or not req.content.strip() or len(req.name)>80 or len(req.content)>500:
+        raise HTTPException(422,'名称1至80字，评价内容1至500字')
+    row=ProductRateTemplate(owner_id=current_user.id,account_id=account_id,name=req.name,content=req.content)
+    db.add(row); await db.commit()
+    return {'success':True,'data':{'id':row.id}}
+
+
+@router.put('/templates/{account_id}/{template_id}')
+async def edit_rate_template(account_id: str,template_id: int,req: RateTemplateRequest,current_user: User=Depends(deps.get_current_active_user),db: AsyncSession=Depends(deps.get_db_session)):
+    from common.models.product_feedback import ProductRateTemplate
+    await _feedback_account(db,current_user,account_id)
+    row=await db.get(ProductRateTemplate,template_id)
+    if not row or row.owner_id!=current_user.id or row.account_id!=account_id: raise HTTPException(404,'模板不存在')
+    if not req.name.strip() or not req.content.strip() or len(req.name)>80 or len(req.content)>500: raise HTTPException(422,'模板长度错误')
+    row.name=req.name; row.content=req.content
+    if row.active:
+        config=(await db.execute(select(AutoRateConfig).where(AutoRateConfig.account_id==account_id))).scalar_one_or_none()
+        if config: config.text_content=req.content
+    await db.commit()
+    return {'success':True}
+
+
+@router.post('/templates/{account_id}/{template_id}/activate')
+async def activate_rate_template(account_id: str,template_id: int,current_user: User=Depends(deps.get_current_active_user),db: AsyncSession=Depends(deps.get_db_session)):
+    from sqlalchemy import update
+    from common.models.product_feedback import ProductRateTemplate
+    account=await _feedback_account(db,current_user,account_id)
+    # Lock the account row to serialize simultaneous template switches.
+    await db.execute(select(XYAccount.id).where(XYAccount.id==account.id).with_for_update())
+    row=await db.get(ProductRateTemplate,template_id)
+    if not row or row.owner_id!=current_user.id or row.account_id!=account_id: raise HTTPException(404,'模板不存在')
+    await db.execute(update(ProductRateTemplate).where(ProductRateTemplate.owner_id==current_user.id,
+        ProductRateTemplate.account_id==account_id).values(active=False))
+    row.active=True
+    config=(await db.execute(select(AutoRateConfig).where(AutoRateConfig.account_id==account_id))).scalar_one_or_none()
+    if not config:
+        config=AutoRateConfig(account_id=account_id,enabled=False); db.add(config)
+    config.rate_type='text'; config.text_content=row.content
+    await db.commit()
+    return {'success':True,'message':'模板已激活，自动评价开关保持不变'}
+
+
+@router.delete('/templates/{account_id}/{template_id}')
+async def delete_rate_template(account_id: str,template_id: int,current_user: User=Depends(deps.get_current_active_user),db: AsyncSession=Depends(deps.get_db_session)):
+    from common.models.product_feedback import ProductRateTemplate
+    await _feedback_account(db,current_user,account_id)
+    row=await db.get(ProductRateTemplate,template_id)
+    if not row or row.owner_id!=current_user.id or row.account_id!=account_id: raise HTTPException(404,'模板不存在')
+    if row.active: raise HTTPException(409,'请先激活其他模板再删除')
+    await db.delete(row); await db.commit()
+    return {'success':True}
+
+
+@router.get('/tasks/config/{account_id}')
+async def feedback_task_config(account_id: str,current_user: User=Depends(deps.get_current_active_user),db: AsyncSession=Depends(deps.get_db_session)):
+    account=await _feedback_account(db,current_user,account_id)
+    return {'success':True,'data':{'auto_red_flower':bool(account.auto_red_flower),'scheduled_rate':bool(account.scheduled_rate)}}

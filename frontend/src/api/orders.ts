@@ -99,8 +99,8 @@ export const getOrders = (
 }
 
 // 获取订单详情
-export const getOrderDetail = (orderNo: string, refresh = false): Promise<{ success: boolean; data: OrderDetail }> => {
-  return get(`${ORDER_PREFIX}/${orderNo}?refresh=${refresh}`)
+export const getOrderDetail = (orderNo: string, refresh = false, accountId?: string): Promise<{ success: boolean; data: OrderDetail }> => {
+  return get(`${ORDER_PREFIX}/${encodeURIComponent(orderNo)}?refresh=${refresh}${accountId ? `&account_id=${encodeURIComponent(accountId)}` : ''}`)
 }
 
 // 删除订单
@@ -109,8 +109,8 @@ export const deleteOrder = (id: string): Promise<ApiResponse> => {
 }
 
 // 手动发货
-export const manualDelivery = (orderNo: string): Promise<ManualDeliveryResponse> => {
-  return post(`${ORDER_PREFIX}/manual-delivery`, { order_no: orderNo })
+export const manualDelivery = (orderNo: string, accountId?: string): Promise<ManualDeliveryResponse> => {
+  return post(`${ORDER_PREFIX}/manual-delivery`, { order_no: orderNo, account_id: accountId })
 }
 
 // 获取闲鱼订单并同步到数据库（单独设置10分钟超时）

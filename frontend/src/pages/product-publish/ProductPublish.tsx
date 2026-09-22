@@ -20,17 +20,17 @@ const PERSONAL_SELLER_DEFAULT_STOCK = 1
 function materialSpecifications(material: ProductMaterial): { specifications: ProductSpecification[]; skuRows: SkuRow[] } {
   const specifications = (material.specifications || []).map((spec, specIndex) => ({
     id: `spec-${specIndex}-${Date.now()}`,
-    name: spec.name,
+    name: spec.name, source_id: spec.source_id,
     supportImage: Boolean(spec.support_image),
     values: (spec.values || []).map((value, valueIndex) => ({
       id: `value-${specIndex}-${valueIndex}-${Date.now()}`,
-      name: value.name,
+      name: value.name, source_id: value.source_id,
       image: value.image || null,
     })),
   }))
   const skuRows = (material.sku_rows || []).map((row) => ({
     key: buildSkuKey(specifications, row.specs || {}),
-    specs: row.specs || {},
+    specs: row.specs || {}, source_id: row.source_id,
     price: String(row.price ?? ''),
     stock: row.stock == null ? '' : String(row.stock),
   }))
@@ -206,17 +206,26 @@ export function ProductPublish() {
       const invalidSku = form.sku_rows.find((row) => !row.price || parseFloat(row.price) <= 0 || !row.stock.trim() || Number(row.stock) < 0)
       if (invalidSku) return addToast({ type: 'warning', message: '请完善所有规格的价格和库存' })
     }
+    const fingerprint = JSON.stringify({ form, imagePaths })
+    const key = `xymb-publish:${form.account_id}`
+    let requestId = crypto.randomUUID()
+    try {
+      const previous = JSON.parse(sessionStorage.getItem(key) || 'null')
+      if (previous?.fingerprint === fingerprint) requestId = previous.id
+      sessionStorage.setItem(key, JSON.stringify({ fingerprint, id: requestId }))
+    } catch { /* 请求仍有幂等号，仅当前浏览器持久化不可用 */ }
     setSubmitting(true); setResult(null)
     try {
       const response = await publishSingle({
+        publish_request_id: requestId,
         account_id: form.account_id, title: form.title, description: form.description, price: parseFloat(form.price), original_price: form.original_price ? parseFloat(form.original_price) : undefined, category: form.category || undefined,
         platform_category_id: form.platform_category_id || undefined, platform_category_name: form.platform_category_name || undefined, platform_channel_category_id: form.platform_channel_category_id || undefined, platform_channel_category_name: form.platform_channel_category_name || undefined, platform_leaf_id: form.platform_leaf_id || undefined, platform_tb_category_id: form.platform_tb_category_id || undefined, platform_attributes: form.platform_attributes, platform_category_path: form.platform_category_path, category_source: form.category_source, category_confidence: form.category_confidence,
-        images: imagePaths, videos: accountCapability.is_fish_shop ? form.videos : [], quantity: accountCapability.is_fish_shop ? form.quantity : PERSONAL_SELLER_DEFAULT_STOCK, specifications: form.specifications.map((spec) => ({ name: spec.name, support_image: spec.supportImage, values: spec.values.map((value) => ({ name: value.name, image: value.image || undefined })) })), sku_rows: form.sku_rows.map((row) => ({ specs: row.specs, price: parseFloat(row.price), stock: parseInt(row.stock, 10) || 0 })), stock: accountCapability.is_fish_shop ? form.quantity : PERSONAL_SELLER_DEFAULT_STOCK, address: form.address || undefined, address_expected_text: form.address_expected_text || undefined, delivery_method: form.delivery_method, shipping_method: form.shipping_method, support_pickup: form.support_pickup, postage: parseFloat(form.postage) || 0, brand: form.brand || undefined, condition: form.condition,
+        images: imagePaths, videos: accountCapability.is_fish_shop ? form.videos : [], quantity: accountCapability.is_fish_shop ? form.quantity : PERSONAL_SELLER_DEFAULT_STOCK, specifications: form.specifications.map((spec) => ({ name: spec.name, source_id: spec.source_id, support_image: spec.supportImage, values: spec.values.map((value) => ({ name: value.name, source_id: value.source_id, image: value.image || undefined })) })), sku_rows: form.sku_rows.map((row) => ({ specs: row.specs, source_id: row.source_id, price: parseFloat(row.price), stock: parseInt(row.stock, 10) || 0 })), stock: accountCapability.is_fish_shop ? form.quantity : PERSONAL_SELLER_DEFAULT_STOCK, address: form.address || undefined, address_expected_text: form.address_expected_text || undefined, delivery_method: form.delivery_method, shipping_method: form.shipping_method, support_pickup: form.support_pickup, postage: parseFloat(form.postage) || 0, brand: form.brand || undefined, condition: form.condition,
       })
       const message = response.message || (response.success ? '商品发布成功' : '发布失败')
       setResult({ success: response.success, message, item_url: response.data?.item_url || undefined, sync_status: response.data?.sync_status || undefined, sync_message: response.data?.sync_message || undefined, sync_total_count: response.data?.sync_total_count || 0, sync_saved_count: response.data?.sync_saved_count || 0 })
       addToast({ type: response.success ? 'success' : 'error', message })
-    } catch { addToast({ type: 'error', message: '发布请求失败，请重试' }); setResult({ success: false, message: '网络错误，请重试' }) } finally { setSubmitting(false) }
+    } catch { addToast({ type: 'error', message: '发布结果待核实，请先查看发布日志' }); setResult({ success: false, message: '回执中断，结果待核实。原请求号已保留，请先核对发布日志和平台商品' }) } finally { setSubmitting(false) }
   }
 
   if (loadingAccounts) return <PageLoading />

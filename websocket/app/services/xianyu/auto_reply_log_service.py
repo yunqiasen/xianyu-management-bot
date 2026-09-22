@@ -110,9 +110,10 @@ class AutoReplyLogService:
         async with async_session_maker() as session:
             await session.execute(
                 update(XYAutoReplyMessageLog)
-                .where(XYAutoReplyMessageLog.id == log_id)
+                .where(XYAutoReplyMessageLog.id == log_id, XYAutoReplyMessageLog.account_id == self.cookie_id, XYAutoReplyMessageLog.send_status.notin_(["success", "failed"]))
                 .values(
                     send_status=send_status,
+                    process_status="success" if send_status == "success" else "failed" if send_status == "failed" else "processing",
                     send_fail_reason=self._normalize_optional_str(send_fail_reason),
                 )
             )

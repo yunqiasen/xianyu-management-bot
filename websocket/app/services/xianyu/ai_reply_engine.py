@@ -23,6 +23,8 @@ from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from common.services.ai_gateway import AIGatewayError, generate_text
+from common.core.config import get_settings as get_shared_settings
 from common.db.session import async_session_maker
 from common.models.xy_account import XYAccount
 from common.models.ai_chat_message import AIChatMessage
@@ -55,8 +57,8 @@ class AIReplyEngine:
     def __init__(self):
         """初始化AI回复引擎"""
         self._init_default_prompts()
-        self._chat_locks: Dict[str, asyncio.Lock] = {}
-        self._chat_locks_usage_time: Dict[str, float] = {}  # 锁使用时间记录
+        self._chat_locks: Dict[tuple[str, str], asyncio.Lock] = {}
+        self._chat_locks_usage_time: Dict[tuple[str, str], float] = {}  # 锁使用时间记录
         self._chat_locks_lock = asyncio.Lock()
         self._chat_locks_max_size = 10000  # 最大锁数量
         self._chat_locks_expire_time = 7200  # 锁过期时间（2小时）
@@ -235,7 +237,7 @@ class AIReplyEngine:
             raise last_error
         raise RuntimeError("OpenAI API请求失败")
 
-    async def _get_chat_lock(self, chat_id: str) -> asyncio.Lock:
+    async def _get_chat_lock(self, chat_id: tuple[str, str]) -> asyncio.Lock:
         """获取指定chat_id的锁"""
         async with self._chat_locks_lock:
             current_time = time.time()
@@ -286,6 +288,9 @@ class AIReplyEngine:
         Returns:
             意图类型: price/tech/default
         """
+        if get_shared_settings().xymb_enable_bargaining_v2 is True:
+            from common.services.bargaining_history import classify_intent
+            return classify_intent(message).intent
         try:
             msg_lower = message.lower()
             
@@ -436,6 +441,11 @@ class AIReplyEngine:
         payload["max_bargain_rounds"] = int(payload.get("max_bargain_rounds") or 3)
         payload["max_discount_percent"] = int(payload.get("max_discount_percent") or 10)
         payload["max_discount_amount"] = int(payload.get("max_discount_amount") or 100)
+        if get_shared_settings().xymb_enable_bargaining_v2 is True:
+            # P5 保留 API 已确认的合法零值；关闭时保持 P1–P4 既有解释。
+            for key, default in (("max_bargain_rounds", 3), ("max_discount_percent", 10), ("max_discount_amount", 100)):
+                value = ai_settings.get(key)
+                payload[key] = int(default if value is None else value)
         payload["custom_prompts"] = payload.get("custom_prompts") or ""
         payload["ai_time_range_start"] = payload.get("ai_time_range_start") or ""
         payload["ai_time_range_end"] = payload.get("ai_time_range_end") or ""
@@ -455,255 +465,39 @@ class AIReplyEngine:
             settings.get("model_name"),
         )
 
-    async def _call_openai_api(
-        self,
-        settings: Dict,
-        messages: List[Dict],
-        max_tokens: int = 8192,
-        temperature: float = 0.5,
+    async def _call_ai_api(
+        self, settings: Dict, messages: List[Dict],
+        max_tokens: int | None = None, temperature: float | None = None,
+        *, diagnostics: Optional[Dict[str, Any]] = None,
     ) -> str:
-        """调用OpenAI兼容API"""
-        try:
-            from openai import AsyncOpenAI
-            
-            client = AsyncOpenAI(
-                api_key=settings["api_key"],
-                base_url=normalize_openai_base_url(settings["base_url"]),
-            )
-            
-            request_messages = self._build_openai_messages(messages)
-            response = await self._create_openai_completion_with_fallbacks(
-                client=client,
-                settings=settings,
-                messages=request_messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-            )
+        """与配置测试相同的快照/参数/超时/协议入口；不重试生成。"""
+        snapshot = dict(settings)
+        if max_tokens is not None:
+            snapshot["max_tokens"] = max_tokens
+        if temperature is not None:
+            snapshot["temperature"] = temperature
+        result = await generate_text(snapshot, messages)
+        if diagnostics is not None:
+            diagnostics.pop("reason", None)
+            diagnostics.update(stage=result.stage, call_id=result.call_id, config_version=result.config_version, trimmed_messages=result.trimmed_messages)
+        logger.info(
+            "AI调用成功 provider={} config_version={} call_id={} trimmed={}",
+            snapshot.get("provider_type"), result.config_version, result.call_id, result.trimmed_messages,
+        )
+        return result.text
 
-            choice = response.choices[0]
-            message = choice.message
-            reply_text = self._normalize_text(message.content)
-            if not reply_text:
-                message_keys = []
-                try:
-                    message_data = message.model_dump()
-                    message_keys = [key for key, val in message_data.items() if val]
-                except Exception:
-                    message_keys = []
-                logger.warning(
-                    f"OpenAI API返回空内容: finish_reason={getattr(choice, 'finish_reason', None)}, message字段={message_keys}"
-                )
-                if getattr(choice, "finish_reason", None) == "length":
-                    retry_max_tokens = max(max_tokens * 2, 1024)
-                    logger.warning(
-                        f"OpenAI API输出被截断，使用 max_tokens={retry_max_tokens} 重试一次"
-                    )
-                    retry_response = await self._create_openai_completion_with_fallbacks(
-                        client=client,
-                        settings=settings,
-                        messages=request_messages,
-                        max_tokens=retry_max_tokens,
-                        temperature=temperature,
-                    )
-                    retry_choice = retry_response.choices[0]
-                    retry_message = retry_choice.message
-                    reply_text = self._normalize_text(retry_message.content)
-                    if not reply_text:
-                        retry_keys = []
-                        try:
-                            retry_data = retry_message.model_dump()
-                            retry_keys = [key for key, val in retry_data.items() if val]
-                        except Exception:
-                            retry_keys = []
-                        logger.warning(
-                            f"OpenAI API重试后仍返回空内容: finish_reason={getattr(retry_choice, 'finish_reason', None)}, message字段={retry_keys}"
-                        )
-            return reply_text
-            
-        except Exception as e:
-            logger.error(f"OpenAI API调用失败: {e}")
-            raise
-    
-    async def _call_dashscope_api(
-        self,
-        settings: Dict,
-        messages: List[Dict],
-        max_tokens: int = 100,
-        temperature: float = 0.7,
-    ) -> str:
-        """调用DashScope API"""
-        try:
-            base_url = settings["base_url"]
-            if "/apps/" in base_url:
-                app_id = base_url.split("/apps/")[-1].split("/")[0]
-            else:
-                raise ValueError("DashScope API URL中未找到app_id")
-            
-            url = f"https://dashscope.aliyuncs.com/api/v1/apps/{app_id}/completion"
-            
-            system_content = ""
-            user_content = ""
-            for msg in messages:
-                if msg["role"] == "system":
-                    system_content = msg["content"]
-                elif msg["role"] == "user":
-                    user_content = msg["content"]
-            
-            if system_content and user_content:
-                prompt = f"{system_content}\n\n用户问题：{user_content}\n\n请直接回答用户的问题："
-            elif user_content:
-                prompt = user_content
-            else:
-                prompt = "\n".join([f"{msg['role']}: {msg['content']}" for msg in messages])
-            
-            data = {
-                "input": {"prompt": prompt},
-                "parameters": {"max_tokens": max_tokens, "temperature": temperature},
-                "debug": {},
-            }
-            headers = {
-                "Authorization": f"Bearer {settings['api_key']}",
-                "Content-Type": "application/json",
-            }
-            
-            async with httpx.AsyncClient(timeout=30) as client:
-                response = await client.post(url, headers=headers, json=data)
-                response.raise_for_status()
-                result = response.json()
-            
-            if "output" in result and "text" in result["output"]:
-                reply_text = self._normalize_text(result["output"]["text"])
-                if not reply_text:
-                    logger.warning("DashScope API返回空内容")
-                return reply_text
-            else:
-                raise Exception(f"DashScope API响应格式错误: {result}")
-                
-        except Exception as e:
-            logger.error(f"DashScope API调用失败: {e}")
-            raise
-    
-    async def _call_gemini_api(
-        self,
-        settings: Dict,
-        messages: List[Dict],
-        max_tokens: int = 100,
-        temperature: float = 0.7,
-    ) -> str:
-        """调用Gemini API"""
-        try:
-            api_key = settings["api_key"]
-            model_name = settings["model_name"]
-            base_url = settings.get("base_url", "")
-            
-            url = build_gemini_url(base_url, f"/models/{model_name}:generateContent")
-            
-            system_instruction = ""
-            user_content_parts = []
-            
-            for msg in messages:
-                if msg["role"] == "system":
-                    system_instruction = msg["content"]
-                elif msg["role"] == "user":
-                    user_content_parts.append(msg["content"])
-            
-            user_content = "\n".join(user_content_parts)
-            
-            if not user_content:
-                raise ValueError("未在消息中找到用户内容")
-            
-            payload = {
-                "contents": [
-                    {
-                        "role": "user",
-                        "parts": [{"text": user_content}],
-                    }
-                ],
-                "generationConfig": {
-                    "temperature": temperature,
-                    "maxOutputTokens": max_tokens,
-                },
-            }
-            
-            if system_instruction:
-                payload["systemInstruction"] = {
-                    "parts": [{"text": system_instruction}]
-                }
-            
-            headers = {"Content-Type": "application/json"}
-            
-            async with httpx.AsyncClient(timeout=30) as client:
-                response = await client.post(url, headers=headers, params={"key": api_key}, json=payload)
-                response.raise_for_status()
-                result = response.json()
-            
-            reply_text = result["candidates"][0]["content"]["parts"][0]["text"]
-            normalized_reply = self._normalize_text(reply_text)
-            if not normalized_reply:
-                logger.warning("Gemini API返回空内容")
-            return normalized_reply
-            
-        except Exception as e:
-            logger.error(f"Gemini API调用失败: {e}")
-            raise
-    
-    async def _call_anthropic_api(
-        self,
-        settings: Dict,
-        messages: List[Dict],
-        max_tokens: int = 100,
-        temperature: float = 0.7,
-    ) -> str:
-        """调用Anthropic Claude官方API"""
-        try:
-            api_key = settings["api_key"]
-            model_name = settings["model_name"]
-            base_url = settings.get("base_url", "")
-            
-            url = build_anthropic_url(base_url, "/messages")
-            
-            system_content = ""
-            user_messages: List[Dict[str, Any]] = []
-            for msg in messages:
-                role = msg.get("role")
-                content = msg.get("content", "")
-                if role == "system":
-                    system_content = content
-                elif role in ("user", "assistant"):
-                    user_messages.append({"role": role, "content": content})
-            
-            payload: Dict[str, Any] = {
-                "model": model_name,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                "messages": user_messages or [{"role": "user", "content": ""}],
-            }
-            if system_content:
-                payload["system"] = system_content
-            
-            headers = {
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-                "Content-Type": "application/json",
-            }
-            
-            async with httpx.AsyncClient(timeout=30) as client:
-                response = await client.post(url, headers=headers, json=payload)
-                response.raise_for_status()
-                result = response.json()
-            
-            content_parts = result.get("content", []) if isinstance(result, dict) else []
-            for item in content_parts:
-                if isinstance(item, dict) and item.get("type") == "text" and item.get("text"):
-                    reply_text = self._normalize_text(item["text"])
-                    if not reply_text:
-                        logger.warning("Anthropic API返回空内容")
-                    return reply_text
-            raise RuntimeError(f"Anthropic API响应格式错误: {result}")
-            
-        except Exception as e:
-            logger.error(f"Anthropic API调用失败: {e}")
-            raise
+    # 保留旧私有入口签名，尚未迁移的调用方也走统一协议客户端。
+    async def _call_openai_api(self, settings: Dict, messages: List[Dict], max_tokens: int | None = None, temperature: float | None = None) -> str:
+        return await self._call_ai_api(settings, messages, max_tokens, temperature)
+
+    async def _call_dashscope_api(self, settings: Dict, messages: List[Dict], max_tokens: int | None = None, temperature: float | None = None) -> str:
+        return await self._call_ai_api({**settings, "provider_type": "dashscope_app"}, messages, max_tokens, temperature)
+
+    async def _call_gemini_api(self, settings: Dict, messages: List[Dict], max_tokens: int | None = None, temperature: float | None = None) -> str:
+        return await self._call_ai_api({**settings, "provider_type": "gemini"}, messages, max_tokens, temperature)
+
+    async def _call_anthropic_api(self, settings: Dict, messages: List[Dict], max_tokens: int | None = None, temperature: float | None = None) -> str:
+        return await self._call_ai_api({**settings, "provider_type": "anthropic"}, messages, max_tokens, temperature)
 
     async def generate_reply(
         self,
@@ -715,6 +509,8 @@ class AIReplyEngine:
         item_id: str,
         db_session: AsyncSession,
         skip_wait: bool = False,
+        history: Optional[List[Dict[str, Any]]] = None,
+        diagnostics: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         """生成AI回复
         
@@ -732,12 +528,42 @@ class AIReplyEngine:
             AI回复或None
         """
         try:
+            if diagnostics is not None:
+                diagnostics.update(stage="skipped", reason="not_generated")
+            if history is not None:
+                for row in history:
+                    if str(row.get("account_id")) != str(cookie_id) or str(row.get("chat_id", "")).removesuffix("@goofish") != str(chat_id).removesuffix("@goofish"):
+                        raise ValueError("AI 历史的账号或会话归属不一致")
             # 检查AI是否启用
             if not await self.is_ai_enabled(cookie_id, db_session):
                 return None
             
-            # 检测意图
-            intent = self.detect_intent(message, cookie_id)
+            # DEV43 覆盖门仍由发布验收控制；开关默认关闭，仅显式开启进入候选分支。
+            bargaining_v2 = get_shared_settings().xymb_enable_bargaining_v2 is True
+            bargaining = None
+            if bargaining_v2:
+                from common.services.bargaining_history import BargainingHistory, classify_intent
+                from common.services.reply_state import ReplyState
+                if history is None:
+                    history = await ReplyState(async_session_maker).history(cookie_id, chat_id, limit=200)
+                classification = classify_intent(message)
+                intent = classification.intent
+                # 在裁剪、等待和模型调用前持久确认，模型失败或重放不改变事件次数。
+                ledger = BargainingHistory(async_session_maker)
+                try:
+                    observed = await ledger.record_confirmed(cookie_id, chat_id, history)
+                    bargaining = await ledger.reconcile_shared(cookie_id, chat_id)
+                except Exception:
+                    if diagnostics is not None:
+                        diagnostics.update(stage="persistence", reason="bargaining_events")
+                    raise
+                bargaining["new_events"] += observed["new_events"]
+                bargaining["missing_event_ids"] += observed["missing_event_ids"]
+                bargaining.update(intent=intent, is_bargaining=classification.bargaining)
+                if diagnostics is not None:
+                    diagnostics["bargaining"] = bargaining
+            else:
+                intent = self.detect_intent(message, cookie_id)
             logger.info(f"【{cookie_id}】检测到意图: {intent}")
             
             # 保存用户消息到数据库
@@ -762,7 +588,7 @@ class AIReplyEngine:
                 await asyncio.sleep(3)
             
             # 获取chat锁，确保同一对话串行处理
-            chat_lock = await self._get_chat_lock(chat_id)
+            chat_lock = await self._get_chat_lock((cookie_id, chat_id))
             
             async with chat_lock:
                 # 获取最近消息，检查是否有更新的消息
@@ -803,37 +629,49 @@ class AIReplyEngine:
                     )
                     return None
                 
-                # 获取对话历史
-                context_stmt = (
-                    select(AIChatMessage.role, AIChatMessage.content)
-                    .where(
-                        AIChatMessage.chat_id == chat_id,
-                        AIChatMessage.cookie_id == cookie_id,
+                # P2 连续历史契约：调用方传入 ReplyState.history 的账号隔离结果。
+                if history is not None:
+                    context = [
+                        {"role": row["role"], "content": str(row.get("content") or "")}
+                        for row in history
+                        if row.get("role") in {"user", "assistant"}
+                        and row.get("status", "confirmed") == "confirmed"
+                    ]
+                else:
+                    # 获取对话历史
+                    context_stmt = (
+                        select(AIChatMessage.role, AIChatMessage.content)
+                        .where(
+                            AIChatMessage.chat_id == chat_id,
+                            AIChatMessage.cookie_id == cookie_id,
+                        )
+                        .order_by(AIChatMessage.created_at.desc())
+                        .limit(20)
                     )
-                    .order_by(AIChatMessage.created_at.desc())
-                    .limit(20)
-                )
-                context_result = await db_session.execute(context_stmt)
-                context_rows = context_result.all()
-                context = [{"role": row[0], "content": row[1]} for row in reversed(context_rows)]
-                
-                # 获取议价次数
-                from sqlalchemy import func
-                bargain_stmt = (
-                    select(func.count())
-                    .select_from(AIChatMessage)
-                    .where(
-                        AIChatMessage.chat_id == chat_id,
-                        AIChatMessage.cookie_id == cookie_id,
-                        AIChatMessage.intent == "price",
-                        AIChatMessage.role == "user",
+                    context_result = await db_session.execute(context_stmt)
+                    context_rows = context_result.all()
+                    context = [{"role": row[0], "content": row[1]} for row in reversed(context_rows)]
+
+                if bargaining_v2:
+                    bargain_count = bargaining["count"]
+                else:
+                    # 获取议价次数
+                    from sqlalchemy import func
+                    bargain_stmt = (
+                        select(func.count())
+                        .select_from(AIChatMessage)
+                        .where(
+                            AIChatMessage.chat_id == chat_id,
+                            AIChatMessage.cookie_id == cookie_id,
+                            AIChatMessage.intent == "price",
+                            AIChatMessage.role == "user",
+                        )
                     )
-                )
-                bargain_result = await db_session.execute(bargain_stmt)
-                bargain_count = bargain_result.scalar() or 0
+                    bargain_result = await db_session.execute(bargain_stmt)
+                    bargain_count = bargain_result.scalar() or 0
                 
                 # 检查议价轮数限制
-                if intent == "price":
+                if intent == "price" and (not bargaining_v2 or bargaining["is_bargaining"]):
                     max_bargain_rounds = settings.get("max_bargain_rounds", 3)
                     if bargain_count >= max_bargain_rounds:
                         logger.info(f"【{cookie_id}】议价次数已达上限 ({bargain_count}/{max_bargain_rounds})")
@@ -853,6 +691,8 @@ class AIReplyEngine:
                         db_session.add(refuse_message)
                         await db_session.commit()
                         
+                        if bargaining_v2 and diagnostics is not None:
+                            diagnostics.update(stage="success", reason="bargain_limit")
                         return refuse_reply
                 
                 # 构建提示词
@@ -861,7 +701,7 @@ class AIReplyEngine:
                     try:
                         custom_prompts = json.loads(custom_prompts)
                     except Exception:
-                        custom_prompts = {}
+                        custom_prompts = {intent: custom_prompts}
                 elif not isinstance(custom_prompts, dict):
                     custom_prompts = {}
                 
@@ -882,7 +722,7 @@ class AIReplyEngine:
                 logger.info(f"[AI回复] 商品信息构建完成: {item_desc}")
                 
                 # 构建对话历史
-                context_str = "\n".join([
+                context_str = "" if bargaining_v2 else "\n".join([
                     f"{msg['role']}: {msg['content']}" for msg in context[-10:]
                 ])
                 
@@ -907,6 +747,23 @@ class AIReplyEngine:
 
 请根据以上信息生成回复："""
                 
+                if bargaining_v2:
+                    from common.services.bargaining_history import select_history, render_history
+                    remaining = int(settings.get("max_context_chars", 24000)) - len(system_prompt) - len(user_prompt)
+                    try:
+                        if remaining < 0:
+                            raise ValueError("当前消息及提示超出上下文预算")
+                        selected, window = select_history(history, remaining)
+                    except ValueError:
+                        if diagnostics is not None:
+                            diagnostics["history_window"] = {"source": "shared_confirmed", "reason": "latest_turn_over_budget", "budget_chars": max(0, remaining)}
+                        raise AIGatewayError("budget")
+                    # 保留原来的三种提示与用户配置，只替换历史视图；协议网关不参与业务裁剪。
+                    position = len(f"商品信息：\n{item_desc}\n\n对话历史：\n")
+                    user_prompt = user_prompt[:position] + render_history(selected) + user_prompt[position:]
+                    if diagnostics is not None:
+                        diagnostics["history_window"] = window
+
                 messages = [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
@@ -931,16 +788,21 @@ class AIReplyEngine:
                     settings.get("model_name"),
                 )
                 logger.info(f"【{cookie_id}】使用{provider_name} API生成回复 (provider_type={provider_type})")
-                if provider_type == "dashscope_app":
-                    reply = await self._call_dashscope_api(settings, messages)
-                elif provider_type == "gemini":
-                    reply = await self._call_gemini_api(settings, messages)
-                elif provider_type == "anthropic":
-                    reply = await self._call_anthropic_api(settings, messages)
-                else:
-                    reply = await self._call_openai_api(settings, messages)
-                
+                reply = await self._call_ai_api(settings, messages, diagnostics=diagnostics)
+                if bargaining_v2 and diagnostics is not None:
+                    diagnostics["trimmed_messages"] += window["trimmed_messages"]
+
                 if reply:
+                    # 新读事务核验，避免 MySQL REPEATABLE READ 仍读到调用前快照。
+                    async with async_session_maker() as verify_session:
+                        current_account = await self._get_account(cookie_id, verify_session)
+                        current_settings = self._extract_ai_settings((current_account.metadata_json or {}).get("ai_reply_settings") or {}) if current_account else {}
+                    if (not current_account or current_account.status != "active"
+                            or not current_settings.get("ai_enabled")
+                            or int(current_settings.get("config_version") or 0) != int(settings.get("config_version") or 0)):
+                        if diagnostics is not None:
+                            diagnostics.update(stage="skipped", reason="configuration_changed")
+                        return None
                     # 二次检测：大模型返回后，若人工已介入暂停，则放弃本次回复
                     if (
                         pause_manager.is_chat_paused(chat_id, cookie_id)
@@ -949,6 +811,8 @@ class AIReplyEngine:
                             and pause_manager.is_ai_reply_paused(cookie_id, user_id, item_id)
                         )
                     ):
+                        if diagnostics is not None:
+                            diagnostics.update(stage="skipped", reason="manual_pause")
                         logger.info(f"【{cookie_id}】AI回复生成成功，但检测到会话 {chat_id} 已被人工介入暂停，跳过保存和发送")
                         return None
 
@@ -960,8 +824,14 @@ class AIReplyEngine:
                 
                 return reply
                 
+        except AIGatewayError as exc:
+            if diagnostics is not None:
+                diagnostics.pop("reason", None)
+                diagnostics.update(exc.public_data())
+            logger.warning("AI调用失败 account={} stage={} status={} code={} call_id={}", cookie_id, exc.stage, exc.status_code, exc.provider_code, exc.call_id)
+            return None
         except Exception as e:
-            logger.error(f"【{cookie_id}】AI回复生成失败: {type(e).__name__}: {e}")
+            logger.error(f"【{cookie_id}】AI回复生成失败: {type(e).__name__}")
             return None
     
     async def _save_ai_message_with_retry(

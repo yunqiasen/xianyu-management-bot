@@ -85,6 +85,7 @@ export const mainNavItems: NavEntry[] = [
     ],
   },
   { key: 'accounts', icon: Users, label: '账号管理', path: '/accounts' },
+  { key: 'ai-settings', icon: MessageSquarePlus, label: 'AI 回复配置', path: '/ai-settings' },
   { key: 'online-chat-new', icon: MessageSquare, label: '在线聊天', path: '/online-chat-new' },
   { key: 'items', icon: Package, label: '商品管理', path: '/items' },
   { key: 'cards', icon: Ticket, label: '卡券管理', path: '/cards' },

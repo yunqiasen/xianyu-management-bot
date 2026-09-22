@@ -94,17 +94,20 @@ export interface MaterialVideo {
 }
 
 export interface PublishSpecificationValue {
+  source_id?: string | null
   name: string
   image?: string | null
 }
 
 export interface PublishSpecification {
+  source_id?: string | null
   name: string
   values: PublishSpecificationValue[]
   support_image?: boolean
 }
 
 export interface PublishSkuRow {
+  source_id?: string | null
   specs: Record<string, string>
   price: number
   stock: number
@@ -263,7 +266,7 @@ export interface PublishLog {
   price?: string
   material_id?: number | null
   batch_id?: string | null
-  status: 'pending' | 'publishing' | 'success' | 'failed'
+  status: 'pending' | 'publishing' | 'success' | 'failed' | 'unknown' | 'cancelled'
   item_url?: string | null
   item_id?: string | null
   error_message?: string | null
@@ -307,6 +310,8 @@ export interface BatchStatusResponse {
     total: number
     success: number
     failed: number
+    unknown?: number
+    cancelled?: number
     publishing: number
     pending: number
     finished: boolean
@@ -318,6 +323,7 @@ export interface PublishSingleResponseData {
   item_url?: string | null
   item_id?: string | null
   log_id?: number
+  unknown?: boolean
   sync_status?: 'success' | 'failed' | 'skipped'
   sync_message?: string | null
   sync_total_count?: number
@@ -466,6 +472,7 @@ export const getPublishAccountCapability = (
 
 /** 单品发布（同步调用闲鱼发布接口） */
 export const publishSingle = (params: {
+  publish_request_id?: string
   account_id: string
   title: string
   description: string
@@ -554,3 +561,10 @@ export const getPublishLogs = (
 export const clearPublishLogs = async (): Promise<{ success: boolean; message: string }> => {
   return del<{ success: boolean; message: string }>(`${PREFIX}/logs/clear`)
 }
+
+export const controlPublishBatch = (batchId: string, action: 'cancel' | 'retry-failed' | 'resume'): Promise<{success: boolean; message: string}> =>
+  post(`${PREFIX}/publish/batch/${encodeURIComponent(batchId)}/${action}`)
+export const reconcilePublish = (logId: number, payload: {outcome: 'published' | 'not_published'; item_id?: string; evidence: string}): Promise<{success: boolean; message: string}> =>
+  post(`${PREFIX}/logs/${logId}/reconcile`, payload)
+export const getPublishEvidence = (logId: number): Promise<{success: boolean; data: unknown[]}> => get(`${PREFIX}/logs/${logId}/evidence`)
+export const getPublishBatches = (): Promise<{success:boolean;data:{batch_id:string;created_at:string;total:number}[]}> => get(`${PREFIX}/publish/batches`)

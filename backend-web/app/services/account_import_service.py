@@ -11,6 +11,11 @@ from __future__ import annotations
 
 import json
 from io import BytesIO
+from copy import deepcopy
+from zipfile import ZipFile
+
+MAX_IMPORT_BYTES = 10 * 1024 * 1024
+MAX_IMPORT_ROWS = 50000
 from typing import Any
 
 from loguru import logger
@@ -69,7 +74,13 @@ def _read_sheet_rows(wb, sheet_name: str) -> list[dict[str, str]]:
     if sheet_name not in wb.sheetnames:
         return []
     ws = wb[sheet_name]
-    rows = list(ws.iter_rows(values_only=True))
+    if (ws.max_column or 0) > 128 or (ws.max_row or 0) > MAX_IMPORT_ROWS:
+        raise ValueError('import_sheet_too_large')
+    rows = []
+    for row in ws.iter_rows(values_only=True):
+        if len(rows) >= MAX_IMPORT_ROWS or len(row)>128:
+            raise ValueError('import_sheet_too_large')
+        rows.append(row)
     if len(rows) < 2:
         return []
     headers = [str(h or "").strip() for h in rows[0]]
@@ -98,6 +109,7 @@ class AccountImportService:
         self.started = 0
         self.failed = 0
         self.errors: list[str] = []
+        self.pending_credential_jobs: list[tuple[str, str, str]] = []
         # 导入过程中的映射缓存
         self._account_id_to_pk: dict[str, int] = {}
         self._card_name_spec_to_id: dict[str, int] = {}
@@ -116,12 +128,20 @@ class AccountImportService:
         Returns:
             导入结果统计
         """
+        if len(file_content) > MAX_IMPORT_BYTES:
+            return {'success':False,'message':'import_file_too_large','data':None}
         try:
+            with ZipFile(BytesIO(file_content)) as archive:
+                if sum(entry.file_size for entry in archive.infolist()) > 64*1024*1024:
+                    return {'success':False,'message':'import_workbook_too_large','data':None}
             wb = load_workbook(BytesIO(file_content), read_only=True, data_only=True)
+            if len(wb.sheetnames)>24:
+                wb.close()
+                return {'success':False,'message':'import_too_many_sheets','data':None}
         except Exception as e:
             return {
                 "success": False,
-                "message": f"Excel文件解析失败: {str(e)}",
+                "message": "Excel文件格式错误",
                 "data": None,
             }
 
@@ -138,31 +158,33 @@ class AccountImportService:
             await self._import_message_filters(wb)
             await self._import_confirm_receipt(wb)
             await self._import_auto_rate(wb)
-
-            # 启动需要启用的账号
-            accounts_to_start = await self._get_accounts_to_start(enable_all)
-            for account_id, cookie in accounts_to_start:
-                try:
-                    await self._start_account(account_id, cookie)
-                    self.started += 1
-                except Exception as e:
-                    self.errors.append(f"账号 {account_id} 启动失败: {str(e)}")
+            await self.session.commit()
 
         except Exception as e:
-            logger.error(f"导入过程异常: {e}")
-            self.errors.append(f"导入异常: {str(e)}")
+            await self.session.rollback()
+            logger.error("导入过程异常: {}", type(e).__name__)
+            self.errors.append("部分配置保存失败，请检查导入文件")
+            self.failed += 1
+            self.pending_credential_jobs.clear()
+            self.inserted = self.updated = 0
+        finally:
+            wb.close()
 
         message = (
             f"导入完成：新增 {self.inserted} 个，更新 {self.updated} 个，"
-            f"启动 {self.started} 个，失败 {self.failed} 个"
+            f"凭据检查提交 {len(self.pending_credential_jobs)} 个，失败 {self.failed} 个"
         )
         return {
-            "success": True,
+            "success": not self.errors,
+            "partial": bool(self.errors) and bool(self.inserted or self.updated),
             "message": message,
             "data": {
                 "inserted": self.inserted,
                 "updated": self.updated,
-                "started": self.started,
+                "started": 0,
+                "submitted": len(self.pending_credential_jobs),
+                "credential_jobs": [{'account_id':account_id, 'id':job_id, 'status':'processing'}
+                                    for account_id, job_id, _ in self.pending_credential_jobs],
                 "failed": self.failed,
                 "errors": self.errors[:20],  # 最多返回20条错误
             },
@@ -171,103 +193,60 @@ class AccountImportService:
     # ==================== 各Sheet导入逻辑 ====================
 
     async def _import_accounts_basic(self, wb, enable_all: bool) -> None:
-        """导入账号基本信息"""
-        rows = _read_sheet_rows(wb, "账号基本信息")
-        for row in rows:
-            account_id = _parse_str(row.get("账号ID"))
+        from app.services.account_service import AccountService
+        service = AccountService(self.session)
+        seen = set()
+        for row in _read_sheet_rows(wb, "账号基本信息"):
+            account_id = _parse_str(row.get('账号ID'))
             if not account_id:
                 continue
-
-            cookie = _parse_str(row.get("Cookie"))
-            if not cookie:
-                self.errors.append(f"账号 {account_id}: Cookie为空，跳过")
+            if account_id in seen:
                 self.failed += 1
+                self.errors.append(f'账号 {account_id}: 同一文件存在重复行')
                 continue
-
-            # 确定状态
-            status = _parse_str(row.get("状态")) or "active"
-            if enable_all:
-                status = "active"
-
-            # 查询是否已存在
-            stmt = select(XYAccount).where(
-                XYAccount.account_id == account_id,
-                XYAccount.owner_id == self.owner_id,
-            )
-            result = await self.session.execute(stmt)
-            existing = result.scalars().first()
-
-            if existing:
-                # 更新
-                existing.cookie = cookie
-                existing.status = status
-                existing.remark = _parse_str(row.get("备注")) or existing.remark
-                existing.username = _parse_str(row.get("用户名")) or existing.username
-                existing.login_password = _parse_str(row.get("登录密码")) or existing.login_password
-                existing.pause_duration = _parse_int(row.get("暂停时长(秒)"), existing.pause_duration)
-                existing.message_expire_time = _parse_int(row.get("相同消息等待时间(秒)"), existing.message_expire_time)
-                existing.show_browser = _parse_bool(row.get("显示浏览器"))
-                existing.proxy_type = _parse_str(row.get("代理类型")) or existing.proxy_type
-                existing.proxy_host = _parse_str(row.get("代理地址")) or existing.proxy_host
-                existing.proxy_port = _parse_int(row.get("代理端口"), existing.proxy_port or 0) or None
-                existing.proxy_user = _parse_str(row.get("代理用户名")) or existing.proxy_user
-                existing.proxy_pass = _parse_str(row.get("代理密码")) or existing.proxy_pass
-                if enable_all:
-                    existing.disable_reason = None
-                self.session.add(existing)
-                self._account_id_to_pk[account_id] = existing.id
-                self.updated += 1
-            else:
-                # 全局唯一校验：account_id 若已被其他用户占用，跳过并记录错误（不插入，避免触发唯一约束）
-                dup_stmt = select(XYAccount.id).where(XYAccount.account_id == account_id)
-                dup_result = await self.session.execute(dup_stmt)
-                if dup_result.scalars().first() is not None:
-                    self.errors.append(f"账号 {account_id}: 账号ID已被其他用户占用，跳过")
-                    self.failed += 1
-                    continue
-                # 新增
-                account = XYAccount(
-                    owner_id=self.owner_id,
-                    account_id=account_id,
-                    cookie=cookie,
-                    login_method="import",
-                    status=status,
-                    remark=_parse_str(row.get("备注")),
-                    username=_parse_str(row.get("用户名")),
-                    login_password=_parse_str(row.get("登录密码")),
-                    pause_duration=_parse_int(row.get("暂停时长(秒)"), 10),
-                    message_expire_time=_parse_int(row.get("相同消息等待时间(秒)"), 3600),
-                    show_browser=_parse_bool(row.get("显示浏览器")),
-                    proxy_type=_parse_str(row.get("代理类型")) or "none",
-                    proxy_host=_parse_str(row.get("代理地址")) or None,
-                    proxy_port=_parse_int(row.get("代理端口"), 0) or None,
-                    proxy_user=_parse_str(row.get("代理用户名")) or None,
-                    proxy_pass=_parse_str(row.get("代理密码")) or None,
-                )
-                self.session.add(account)
-                self.inserted += 1
-
-            await self.session.flush()
-
-            # 刷新后获取PK
-            if account_id not in self._account_id_to_pk:
-                stmt2 = select(XYAccount.id).where(
-                    XYAccount.account_id == account_id,
-                    XYAccount.owner_id == self.owner_id,
-                )
-                r = await self.session.execute(stmt2)
-                pk = r.scalar_one_or_none()
-                if pk:
-                    self._account_id_to_pk[account_id] = pk
-
-        await self.session.commit()
+            seen.add(account_id)
+            try:
+                async with self.session.begin_nested():
+                    profile = {}
+                    string_fields = {'备注':'remark', '用户名':'username', '登录密码':'login_password',
+                        '代理类型':'proxy_type', '代理地址':'proxy_host', '代理用户名':'proxy_user', '代理密码':'proxy_pass'}
+                    for source, target in string_fields.items():
+                        value = _parse_str(row.get(source))
+                        if value:
+                            profile[target] = value
+                    for source, target in {'暂停时长(秒)':'pause_duration', '相同消息等待时间(秒)':'message_expire_time', '代理端口':'proxy_port'}.items():
+                        if _parse_str(row.get(source)):
+                            value = int(str(row[source]).strip())
+                            if value < 0:
+                                raise ValueError('时长或端口格式错误')
+                            profile[target] = value
+                    if _parse_str(row.get('显示浏览器')):
+                        profile['show_browser'] = _parse_bool(row['显示浏览器'])
+                    prior = await service.get_account_for_user(self.owner_id, account_id)
+                    source_status = _parse_str(row.get('状态')).lower()
+                    enabled = True if enable_all else (False if source_status in {'inactive','disabled','suspended'} else None)
+                    if prior is None and enabled is None:
+                        enabled = True
+                    account, job, candidate, created = await service.stage_cookie_import(
+                        self.owner_id, account_id, row.get('Cookie'), enabled=enabled, profile=profile, login_method='import', commit=False)
+                    self._account_id_to_pk[account_id] = account.id
+                    self.pending_credential_jobs.append((account_id, job['id'], candidate))
+                    self.inserted += int(created)
+                    self.updated += int(not created)
+            except ValueError as exc:
+                self.failed += 1
+                self.errors.append(f'账号 {account_id}: {exc}')
+            except Exception as exc:
+                self.failed += 1
+                self.errors.append(f'账号 {account_id}: 资料保存失败')
+                logger.warning('账号导入行失败: {}', type(exc).__name__)
 
     async def _import_account_switches(self, wb) -> None:
         """导入账号开关配置"""
         rows = _read_sheet_rows(wb, "账号开关配置")
         for row in rows:
             account_id = _parse_str(row.get("账号ID"))
-            if not account_id:
+            if account_id not in self._account_id_to_pk:
                 continue
             stmt = select(XYAccount).where(
                 XYAccount.account_id == account_id,
@@ -278,39 +257,49 @@ class AccountImportService:
             if not account:
                 continue
 
-            account.auto_confirm = _parse_bool(row.get("自动确认收货"))
-            account.scheduled_redelivery = _parse_bool(row.get("定时补发货"))
-            account.scheduled_rate = _parse_bool(row.get("定时补评价"))
-            account.auto_polish = _parse_bool(row.get("商品擦亮"))
-            account.confirm_before_send = _parse_bool(row.get("发货成功再发卡券"))
-            account.send_before_confirm = _parse_bool(row.get("卡券发送成功再确认发货"))
-            account.only_send_card = _parse_bool(row.get("只发卡券不确认发货"))
-            # 只发卡券与自动确认、两种确认顺序互斥，兼容手工编辑导致的冲突配置。
-            # 只发卡券优先；否则保留“发货成功再发卡券”优先级，清掉冲突的后置确认。
+            fields = {
+                "自动确认收货":"auto_confirm", "定时补发货":"scheduled_redelivery",
+                "定时补评价":"scheduled_rate", "商品擦亮":"auto_polish",
+                "发货成功再发卡券":"confirm_before_send", "卡券发送成功再确认发货":"send_before_confirm",
+                "只发卡券不确认发货":"only_send_card", "自动求小红花":"auto_red_flower",
+                "禁止发货":"delivery_disabled", "主动关闭订单":"auto_close_order",
+                "关闭后发卡券":"delivery_only_card_after_close",
+            }
+            explicit = []
+            for label, field in fields.items():
+                if label in row:
+                    setattr(account, field, _parse_bool(row[label]))
+                    explicit.append(field)
             if account.only_send_card:
                 account.auto_confirm = False
                 account.confirm_before_send = False
                 account.send_before_confirm = False
             elif account.confirm_before_send:
                 account.send_before_confirm = False
-            account.auto_red_flower = _parse_bool(row.get("自动求小红花"))
-            account.delivery_disabled = _parse_bool(row.get("禁止发货"))
-            account.delivery_disabled_reason = _parse_str(row.get("禁止发货原因")) or None
-            account.auto_close_order = _parse_bool(row.get("主动关闭订单"))
-            account.delivery_only_card_after_close = _parse_bool(row.get("关闭后发卡券"))
-            excluded = _parse_json(row.get("禁止发货排除商品"))
-            if isinstance(excluded, list):
-                account.delivery_disabled_excluded_items = excluded
+            if "禁止发货原因" in row:
+                account.delivery_disabled_reason = _parse_str(row["禁止发货原因"]) or None
+                explicit.append("delivery_disabled_reason")
+            if "禁止发货排除商品" in row:
+                excluded = _parse_json(row["禁止发货排除商品"])
+                if isinstance(excluded, list):
+                    account.delivery_disabled_excluded_items = excluded
+            if any(label in row for label in ('禁止发货', '禁止发货原因', '禁止发货排除商品', '主动关闭订单', '关闭后发卡券')):
+                from common.services.delivery_rule_configuration import sync_legacy_credit_rule
+                explicit.extend(await sync_legacy_credit_rule(self.session, account))
+            # All sheets are one transaction/configuration batch, already fenced
+            # by the profile stage. Do not invalidate its pending credential job.
+            from common.services.typed_settings import clear_inheritance
+            clear_inheritance(account, explicit)
             self.session.add(account)
 
-        await self.session.commit()
+        await self.session.flush()
 
     async def _import_ai_settings(self, wb) -> None:
         """导入AI回复设置"""
         rows = _read_sheet_rows(wb, "AI回复设置")
         for row in rows:
             account_id = _parse_str(row.get("账号ID"))
-            if not account_id:
+            if account_id not in self._account_id_to_pk:
                 continue
             ai_json = _parse_json(row.get("AI回复设置JSON"))
             if not ai_json:
@@ -324,12 +313,18 @@ class AccountImportService:
             if not account:
                 continue
 
-            metadata = account.metadata_json or {}
-            metadata["ai_reply_settings"] = ai_json
+            from app.services.ai_reply_service import AIReplySettingsService, merge_ai_settings
+            if not isinstance(ai_json, dict):
+                raise ValueError('AI配置必须为对象')
+            existing = AIReplySettingsService(self.session)._extract_settings(account)
+            merged = merge_ai_settings(existing, ai_json)
+            merged['config_version'] = int(existing.get('config_version') or 0) + 1
+            metadata = deepcopy(account.metadata_json or {})
+            metadata["ai_reply_settings"] = merged
             account.metadata_json = metadata
             self.session.add(account)
 
-        await self.session.commit()
+        await self.session.flush()
 
     async def _import_catalog_items(self, wb) -> None:
         """导入商品目录"""
@@ -366,7 +361,7 @@ class AccountImportService:
                 )
                 self.session.add(item)
 
-        await self.session.commit()
+        await self.session.flush()
 
     async def _import_cards(self, wb) -> None:
         """导入卡券"""
@@ -425,8 +420,10 @@ class AccountImportService:
                 await self.session.flush()
                 self._card_name_spec_to_id[f"{name}|{spec_value}"] = card.id
 
-        await self.session.commit()
+        await self.session.flush()
 
+        if "卡券商品关联" not in wb.sheetnames:
+            return
         # 补充映射：查询所有该用户的卡券
         stmt = select(Card.id, Card.name, Card.spec_value).where(Card.user_id == self.owner_id)
         result = await self.session.execute(stmt)
@@ -471,7 +468,7 @@ class AccountImportService:
             )
             self.session.add(rel)
 
-        await self.session.commit()
+        await self.session.flush()
 
     async def _import_keyword_rules(self, wb) -> None:
         """导入关键词规则"""
@@ -529,14 +526,14 @@ class AccountImportService:
                 )
                 self.session.add(rule)
 
-        await self.session.commit()
+        await self.session.flush()
 
     async def _import_default_replies(self, wb) -> None:
         """导入默认回复"""
         rows = _read_sheet_rows(wb, "默认回复")
         for row in rows:
             account_id = _parse_str(row.get("账号ID"))
-            if not account_id:
+            if account_id not in self._account_id_to_pk:
                 continue
             item_id = _parse_str(row.get("商品ID")) or None
 
@@ -583,7 +580,7 @@ class AccountImportService:
                 reply.location_subtitle = _parse_str(row.get("\u4f4d\u7f6e\u526f\u6807\u9898")) or None
                 self.session.add(reply)
 
-        await self.session.commit()
+        await self.session.flush()
 
     async def _import_message_filters(self, wb) -> None:
         """导入消息过滤规则"""
@@ -592,7 +589,7 @@ class AccountImportService:
             account_id = _parse_str(row.get("账号ID"))
             keyword = _parse_str(row.get("关键词"))
             filter_type = _parse_str(row.get("过滤类型"))
-            if not account_id or not keyword or not filter_type:
+            if account_id not in self._account_id_to_pk or not keyword or not filter_type:
                 continue
 
             # 检查唯一约束
@@ -617,14 +614,14 @@ class AccountImportService:
                 "filter_type": filter_type, "enabled": 1 if enabled else 0,
             })
 
-        await self.session.commit()
+        await self.session.flush()
 
     async def _import_confirm_receipt(self, wb) -> None:
         """导入确认收货消息"""
         rows = _read_sheet_rows(wb, "确认收货消息")
         for row in rows:
             account_id = _parse_str(row.get("账号ID"))
-            if not account_id:
+            if account_id not in self._account_id_to_pk:
                 continue
 
             stmt = select(ConfirmReceiptMessage).where(ConfirmReceiptMessage.account_id == account_id)
@@ -644,14 +641,14 @@ class AccountImportService:
                 )
                 self.session.add(msg)
 
-        await self.session.commit()
+        await self.session.flush()
 
     async def _import_auto_rate(self, wb) -> None:
         """导入自动评价配置"""
         rows = _read_sheet_rows(wb, "自动评价配置")
         for row in rows:
             account_id = _parse_str(row.get("账号ID"))
-            if not account_id:
+            if account_id not in self._account_id_to_pk:
                 continue
 
             stmt = select(AutoRateConfig).where(AutoRateConfig.account_id == account_id)
@@ -673,7 +670,7 @@ class AccountImportService:
                 )
                 self.session.add(cfg)
 
-        await self.session.commit()
+        await self.session.flush()
 
     # ==================== 启动逻辑 ====================
 

@@ -70,6 +70,8 @@ class ApiCookieRenewTaskService:
         browser_renewed_count = 0
         need_password_login_count = 0
         failed_count = 0
+        skipped_count = 0
+        unknown_count = 0
         processed_count = 0
 
         try:
@@ -98,16 +100,15 @@ class ApiCookieRenewTaskService:
                             browser_renewed_count += 1
                         elif result.status == "need_password_login":
                             need_password_login_count += 1
+                        elif result.status == 'skipped':
+                            skipped_count += 1
+                        elif result.status == 'unknown':
+                            unknown_count += 1
                         else:
                             failed_count += 1
 
                         await self._log_result(session, batch_id, account.account_id, result)
 
-                        # 续期成功后重新读取账号最新状态，若期间被并发改为禁用则自动启用
-                        if result.status in ("success", "cookie_updated", "browser_renewed"):
-                            await session.refresh(account)
-                            if self._is_disabled_account(account):
-                                await self._enable_account_after_renew(session, account)
                     except Exception as exc:
                         await session.rollback()
                         failed_count += 1
@@ -136,7 +137,7 @@ class ApiCookieRenewTaskService:
                 f"接口续期成功 {success_count} 个，Cookie更新 {cookie_updated_count} 个，"
                 f"浏览器续期成功 {browser_renewed_count} 个，"
                 f"需要密码登录 {need_password_login_count} 个，"
-                f"失败 {failed_count} 个，"
+                f"失败 {failed_count} 个，跳过 {skipped_count} 个，待核实 {unknown_count} 个，"
                 f"耗时 {duration_seconds:.2f} 秒"
             )
 
@@ -234,108 +235,14 @@ class ApiCookieRenewTaskService:
         account: XYAccount,
     ) -> ApiCookieRenewResult:
         """对单个账号执行接口续期。"""
-        account_id = account.account_id
-        cookies_str = account.cookie or ""
-
-        if not cookies_str.strip():
-            return ApiCookieRenewResult(
-                status="failed",
-                error_message="账号Cookie为空，无法执行接口续期",
-            )
-
-        logger.info(f"【{self.task_name}】开始处理账号: {account_id}")
-
-        # 调用共通服务执行续期（接口续期 → 浏览器续期）
-        renew_result = await cookie_renew_api_service.renew(cookies_str, account_id, source="scheduled_task")
-
-        # 仅在 cookies 真正发生变化时更新数据库
-        if (
-            renew_result.updated_cookie_names
-            and renew_result.new_cookies_str
-            and renew_result.new_cookies_str != cookies_str
-        ):
-            account.cookie = renew_result.new_cookies_str
-            # 清理浏览器 cookie 快照，避免 cookies_refresh_task 下次基于过期快照做差异检测
-            account.metadata_json = clear_cookie_refresh_snapshot(account.metadata_json)
-            account.last_refresh_at = get_beijing_now_naive()
-            session.add(account)
-            await session.commit()
-            logger.info(
-                f"【{self.task_name}】账号 {account_id} Cookie已更新（{renew_result.renew_method}），"
-                f"共更新 {len(renew_result.updated_cookie_names)} 个字段："
-                f"{'、'.join(renew_result.updated_cookie_names)}"
-            )
-
-        # 计算最终状态
-        if renew_result.success:
-            if renew_result.renew_method == "browser":
-                # 浏览器续期成功（接口续期失败，浏览器续期成功）
-                return ApiCookieRenewResult(
-                    status="browser_renewed",
-                    updated_cookie_names=renew_result.updated_cookie_names,
-                    response_content=None,
-                    error_message=None,
-                    renew_method="browser",
-                    step_details=renew_result.step_details,
-                )
-            elif renew_result.updated_cookie_names:
-                # 接口续期成功且有Cookie更新
-                return ApiCookieRenewResult(
-                    status="cookie_updated",
-                    updated_cookie_names=renew_result.updated_cookie_names,
-                    response_content=None,
-                    error_message=None,
-                    renew_method="api",
-                    step_details=renew_result.step_details,
-                )
-            # 接口续期成功但无Cookie变化
-            return ApiCookieRenewResult(
-                status="success",
-                updated_cookie_names=[],
-                response_content=None,
-                error_message=None,
-                renew_method="api",
-                step_details=renew_result.step_details,
-            )
-
-        # 续期失败：判断是否需要密码登录
-        truncated_response = self._truncate_response(renew_result.response_text)
-        if renew_result.need_password_login:
-            # 接口续期和浏览器续期都失败，触发后台密码登录
-            logger.warning(
-                f"【{self.task_name}】账号 {account_id} 接口续期和浏览器续期均失败，"
-                f"触发后台密码登录。详情: {renew_result.step_details}"
-            )
-            try:
-                from common.utils.cookie_refresh import (
-                    mark_account_session_expired,
-                    trigger_password_login_async,
-                )
-                mark_account_session_expired(account_id)
-                trigger_password_login_async(account_id)
-            except Exception as pwd_exc:
-                logger.error(
-                    f"【{self.task_name}】账号 {account_id} 触发密码登录异常: {pwd_exc}"
-                )
-
-            return ApiCookieRenewResult(
-                status="need_password_login",
-                updated_cookie_names=renew_result.updated_cookie_names,
-                response_content=truncated_response,
-                error_message=renew_result.api_message[:500] if renew_result.api_message else "接口续期和浏览器续期均失败，需要账号密码登录",
-                renew_method="none",
-                step_details=renew_result.step_details,
-            )
-
-        # 普通失败
-        return ApiCookieRenewResult(
-            status="failed",
-            updated_cookie_names=renew_result.updated_cookie_names,
-            response_content=truncated_response,
-            error_message=renew_result.api_message[:500] if renew_result.api_message else "续期失败",
-            renew_method="none",
-            step_details=renew_result.step_details,
-        )
+        from common.services.account_renewal import AccountRenewalClient
+        if account.status != 'active':
+            return ApiCookieRenewResult(status='skipped',step_details='account_disabled')
+        settings = get_settings()
+        client = AccountRenewalClient(settings.websocket_service_url,settings.internal_api_token,timeout=120)
+        result = await client.renew(account)
+        return ApiCookieRenewResult(status='success' if result['status']=='verified' else result['status'],
+            error_message=result['reason'] or None,renew_method='executor',step_details=result['status'])
 
     @staticmethod
     def _truncate_response(response_text: str | None) -> str | None:

@@ -119,12 +119,14 @@ export interface SystemLog {
 }
 
 // 获取系统日志
-export const getSystemLogs = async (params?: { page?: number; limit?: number; level?: string }): Promise<{ success: boolean; data?: SystemLog[]; total?: number }> => {
+export const getSystemLogs = async (params?: { page?: number; limit?: number; level?: string; correlation_id?: string; service?: string }): Promise<{ success: boolean; data?: SystemLog[]; total?: number; services?: Record<string,string> }> => {
   const query = new URLSearchParams()
-  if (params?.page) query.set('page', String(params.page))
+  if (params?.page) query.set('offset', String((params.page-1)*(params.limit||100)))
+  if (params?.correlation_id) query.set('correlation_id', params.correlation_id)
+  if (params?.service) query.set('service', params.service)
   if (params?.limit) query.set('lines', String(params.limit))  // 后端用 lines 参数
   if (params?.level) query.set('level', params.level.toUpperCase())
-  const result = await get<{ logs?: string[]; total?: number }>(`${ADMIN_PREFIX}/logs?${query.toString()}`)
+  const result = await get<{ success: boolean; logs?: string[]; total?: number; services?: Record<string,string> }>(`${ADMIN_PREFIX}/logs?${query.toString()}`)
   // 后端返回 { logs: [...] } 格式，转换为 SystemLog 数组
   const logs: SystemLog[] = (result.logs || []).map((log, index) => ({
     id: String(index),
@@ -133,7 +135,7 @@ export const getSystemLogs = async (params?: { page?: number; limit?: number; le
     module: 'system',
     created_at: new Date().toISOString(),
   }))
-  return { success: true, data: logs, total: result.total }
+  return { success: result.success, data: logs, total: result.total, services: result.services }
 }
 
 // 清空系统日志
@@ -458,8 +460,8 @@ export const getTableData = async (tableName: string): Promise<TableData> => {
 }
 
 // 清空表数据
-export const clearTableData = (tableName: string): Promise<ApiResponse> => {
-  return del(`${ADMIN_PREFIX}/data/${tableName}`)
+export const clearTableData = (tableName: string, previewId: string, confirmation: string): Promise<ApiResponse> => {
+  return del(`${ADMIN_PREFIX}/data/${tableName}?${new URLSearchParams({preview_id: previewId, confirmation})}`)
 }
 
 // ========== 管理员统计 ==========

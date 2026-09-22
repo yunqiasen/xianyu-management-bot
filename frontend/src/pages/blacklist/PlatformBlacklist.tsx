@@ -7,6 +7,8 @@ import { useUIStore } from '@/store/uiStore'
 import { useAuthStore } from '@/store/authStore'
 import { PageLoading } from '@/components/common/Loading'
 import { getApiErrorMessage } from '@/utils/request'
+import { getChatAccounts, type ChatAccount } from '@/api/chatNew'
+import { syncPlatformReplyBlacklist } from '@/api/replyControls'
 
 interface Props {
   onRefreshRef: MutableRefObject<() => void>
@@ -20,6 +22,27 @@ export function PlatformBlacklist({ onRefreshRef }: Props) {
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(1)
   const [pageSize] = useState(20)
+
+  const [accounts, setAccounts] = useState<ChatAccount[]>([])
+  const [accountId, setAccountId] = useState('')
+  const [syncing, setSyncing] = useState(false)
+  const [syncCursor, setSyncCursor] = useState(0)
+  const [syncNote, setSyncNote] = useState('同步已知会话，不代表平台全量名单')
+  useEffect(() => {
+    if (!_hasHydrated || !isAuthenticated || !token) return
+    getChatAccounts().then(page => setAccounts(page.data)).catch(() => setSyncNote('账号列表加载失败'))
+  }, [_hasHydrated, isAuthenticated, token])
+  const synchronize = async () => {
+    if (!accountId || syncing) return
+    setSyncing(true)
+    try {
+      const res = await syncPlatformReplyBlacklist(accountId, syncCursor)
+      setSyncCursor(res.data.hasMore ? res.data.nextCursor : 0)
+      setSyncNote(`已同步 ${res.data.synced} 个会话；${res.data.errors[0]?.message || (res.data.hasMore ? '还有下一页' : '本轮已知会话核对结束')}`)
+      await loadData()
+    } catch (error) { setSyncNote(getApiErrorMessage(error, '同步未完成，原名单保留')) }
+    finally { setSyncing(false) }
+  }
 
   const totalPages = Math.ceil(total / pageSize)
 
@@ -54,6 +77,13 @@ export function PlatformBlacklist({ onRefreshRef }: Props) {
 
   return (
     <div className="space-y-4">
+      <div className="flex flex-wrap items-center gap-2 text-sm">
+        <select aria-label="同步名单的账号" value={accountId} disabled={syncing} onChange={event => {setAccountId(event.target.value); setSyncCursor(0)}} className="border rounded px-2 py-1 dark:bg-slate-800">
+          <option value="">选择账号</option>{accounts.map(account => <option key={account.account_id} value={account.account_id}>{account.display_name || account.account_id}</option>)}
+        </select>
+        <button type="button" disabled={syncing || !accountId} onClick={() => void synchronize()} className="border rounded px-2 py-1 disabled:opacity-40">{syncing ? '核对中…' : syncCursor ? '继续核对' : '同步平台名单'}</button>
+        <span role="status" className="text-slate-500">{syncNote}</span>
+      </div>
       {/* 表格 */}
       <div className="overflow-x-auto bg-white dark:bg-slate-800 rounded-lg border border-slate-200 dark:border-slate-700">
         <table className="w-full text-sm">

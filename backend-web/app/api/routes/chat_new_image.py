@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import os
 import tempfile
+import uuid
+from common.services.reply_state import ReplyState, platform_send_result
+from common.services.reply_images import ReplyImages, MAX_BYTES
 
 from fastapi import APIRouter, Depends, File, Form, UploadFile
 from loguru import logger
@@ -46,92 +49,38 @@ async def send_image(
     account_id: str,
     cid: str = Form(...),
     toUserId: str = Form(...),
+    requestId: str = Form(default=''),
     image: UploadFile = File(...),
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
 ):
-    """
-    发送图片消息
-
-    流程：
-    1. 校验账号归属与IM连接状态
-    2. 校验图片类型与大小
-    3. 将图片上传到闲鱼CDN，获取可访问的CDN URL
-    4. 通过IM协议发送图片消息
-
-    Args:
-        account_id: 账号ID
-        cid: 会话ID（不含@goofish后缀）
-        toUserId: 对方用户ID
-        image: 上传的图片文件
-    """
-    # 1. 校验归属
-    if not await _get_owned_chat_account(account_id, current_user, db):
+    account = await _get_owned_chat_account(account_id, current_user, db)
+    if not account:
         return ApiResponse(success=False, message="账号不存在或无权操作")
-
-    # 2. 校验连接状态
-    manager = get_im_session_manager()
-    client = manager.clients.get(account_id)
+    client = get_im_session_manager().clients.get(account_id)
     if not client or not client.is_connected:
-        return ApiResponse(success=False, message="账号未连接，请先连接")
-
-    # 3. 校验图片类型
-    if not image.content_type or not image.content_type.startswith(_ALLOWED_CONTENT_PREFIX):
-        return ApiResponse(success=False, message="请上传图片文件")
-
-    image_data = await image.read()
-    if not image_data:
-        return ApiResponse(success=False, message="上传文件为空")
-    if len(image_data) > _MAX_IMAGE_SIZE:
-        return ApiResponse(success=False, message="图片大小不能超过10MB")
-
-    # 4. 落盘临时文件，读取尺寸并上传到闲鱼CDN
-    temp_path = None
+        return ApiResponse(success=False, message="账号未连接")
+    request_id = requestId or uuid.uuid4().hex
+    if len(request_id) > 128:
+        return ApiResponse(success=False, message="请求身份过长")
+    store = ReplyState()
+    images = ReplyImages(store.sessions)
     try:
-        suffix = os.path.splitext(image.filename or "")[1] or ".jpg"
-        fd, temp_path = tempfile.mkstemp(suffix=suffix)
-        with os.fdopen(fd, "wb") as f:
-            f.write(image_data)
-
-        # 读取原图尺寸，用于前端按比例渲染（失败则用默认尺寸）
-        width, height = 800, 600
-        try:
-            with Image.open(temp_path) as img:
-                width, height = img.size
-        except Exception as e:
-            logger.warning(f"【{account_id}】读取图片尺寸失败，使用默认尺寸: {e}")
-
-        uploader = ImageUploader(client.cookies_str)
-        async with uploader:
-            cdn_url = await uploader.upload_image(temp_path)
-
+        resource = await images.upload(account.owner_id, await image.read(MAX_BYTES + 1))
+        await images.reference(account.owner_id, resource['id'], 'chat', request_id)
+    except ValueError as exc:
+        return ApiResponse(success=False, message=str(exc))
+    async def transport():
+        cdn_url = await client.upload_image(str(images.root / resource['path']), request_id=request_id)
         if not cdn_url:
-            return ApiResponse(success=False, message="图片上传失败，请检查账号Cookie是否有效或稍后重试")
-
-        # 5. 发送图片消息
-        send_result = await client.send_image_message(
-            cid=cid,
-            to_user_id=toUserId,
-            image_url=cdn_url,
-            width=width,
-            height=height,
-        )
-        logger.info(f"【{account_id}】发送图片消息到 {toUserId}: {cdn_url}")
-        return ApiResponse(
-            success=True,
-            message="发送成功",
-            data={
-                "messageId": send_result.get("messageId", ""),
-                "imageUrl": cdn_url,
-            },
-        )
-    except Exception as e:
-        # IM 安全拦截等业务错误会抛出明文原因，直接透传给前端展示
-        logger.warning(f"【{account_id}】发送图片消息失败: {e}")
-        return ApiResponse(success=False, message=f"发送失败：{str(e)}")
-    finally:
-        if temp_path and os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except Exception:
-                pass
+            return {'status': 'failed', 'error': '图片上传失败，消息未发送'}
+        result = await client.send_image_message(cid=cid, to_user_id=toUserId, image_url=cdn_url,
+            width=resource['width'], height=resource['height'], request_id=request_id)
+        return {**platform_send_result(result), 'imageUrl': cdn_url}
+    try:
+        result = await store.send(account_id, cid, request_id, resource['url'], transport,
+            pause_minutes=account.pause_duration, content_type='image', fingerprint=toUserId, sender_id=client.myid)
+    except ValueError as exc:
+        return ApiResponse(success=False, message=str(exc))
+    labels = {'submitted': '已提交', 'confirmed': '平台已确认', 'failed': '明确失败', 'unknown': '结果待核实，请先核对聊天记录'}
+    return ApiResponse(success=result['status'] != 'failed', message=labels[result['status']], data=result)

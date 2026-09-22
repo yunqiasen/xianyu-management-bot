@@ -22,14 +22,22 @@ def _function_source(path: Path, class_name: str, function_name: str) -> str:
 
 class ManualAiReplyPauseTest(unittest.TestCase):
     def test_pause_key_includes_account_buyer_and_item(self):
-        source = _function_source(
-            ROOT / "websocket/app/services/xianyu/resource_manager.py",
-            "AutoReplyPauseManager",
-            "pause_ai_reply_for_manual_message",
-        )
-        self.assertIn("self.buyer_contexts.get", source)
-        self.assertIn("self.paused_ai_contexts[(cookie_id, buyer_id, target_item_id)]", source)
-        self.assertIn("target_item_id = str(item_id or remembered_item_id).strip()", source)
+        import importlib.util
+        from unittest.mock import patch
+        path = ROOT / 'websocket/app/services/xianyu/resource_manager.py'
+        spec = importlib.util.spec_from_file_location('pause_behavior',path)
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        manager=module.AutoReplyPauseManager()
+        with patch.object(module.time,'time',return_value=1000):
+            manager.remember_buyer_context('chat','account','buyer','remembered-item')
+            self.assertEqual(manager.pause_ai_reply_for_manual_message('chat','account','',2),('buyer','remembered-item'))
+            self.assertTrue(manager.is_ai_reply_paused('account','buyer','remembered-item'))
+            for args in [('other','buyer','remembered-item'),('account','other','remembered-item'),('account','buyer','other')]:
+                self.assertFalse(manager.is_ai_reply_paused(*args))
+            self.assertIsNone(manager.pause_ai_reply_for_manual_message('chat','other','',2))
+            self.assertEqual(manager.pause_ai_reply_for_manual_message('chat','account','explicit-item',2),('buyer','explicit-item'))
+        with patch.object(module.time,'time',return_value=1121):
+            self.assertFalse(manager.is_ai_reply_paused('account','buyer','remembered-item'))
 
     def test_ai_only_pause_is_configurable_and_checked_before_sending(self):
         schema = (ROOT / "common/schemas/ai_reply.py").read_text(encoding="utf-8")
@@ -41,7 +49,10 @@ class ManualAiReplyPauseTest(unittest.TestCase):
         self.assertIn("manual_reply_ai_pause_minutes", schema)
         self.assertIn("get_remaining_ai_pause_time", auto_reply)
         self.assertIn("is_ai_reply_paused(cookie_id, user_id, item_id)", ai_engine)
-        self.assertIn("人工回复后暂停 AI", frontend)
+        self.assertIn('AISettingsPanel', frontend)
+        panel = (ROOT / 'frontend/src/pages/accounts/AISettingsPanel.tsx').read_text()
+        self.assertIn('人工回复后暂停 AI', panel)
+        self.assertIn('settings.manual_reply_ai_pause_enabled',panel)
 
     def test_paused_ai_reply_is_recorded_as_a_dedicated_log(self):
         auto_reply = (ROOT / "websocket/app/services/xianyu/auto_reply_service.py").read_text(encoding="utf-8")

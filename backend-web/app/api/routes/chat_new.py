@@ -21,12 +21,15 @@ from urllib.parse import unquote
 
 from fastapi import APIRouter, Depends
 from loguru import logger
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+import uuid
+from common.services.reply_state import ReplyState, platform_send_result
 
 from app.api.deps import get_current_active_user, get_db_session
 from app.services.chat_new import get_im_session_manager
 from app.services.chat_new.avatar_service import get_owner_user_info, get_user_info, AVATAR_CACHE_PREFIX, AVATAR_CACHE_TTL
-from app.services.chat_new.official_blacklist_service import official_blacklist_request
+from app.services.chat_new.official_blacklist_service import official_blacklist_request, parse_blacklist_status
+from app.services.blacklist_service import BlacklistService
 from common.db.redis_client import get_redis_client
 from common.models import User, XYAccount
 from common.schemas.common import ApiResponse
@@ -196,10 +199,13 @@ async def connect_account(
 async def disconnect_account(
     account_id: str,
     current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db_session),
 ):
     """
     断开指定账号的IM WebSocket
     """
+    if not await _get_owned_chat_account(account_id, current_user, db):
+        return ApiResponse(success=False, message="账号不存在或无权操作")
     try:
         manager = get_im_session_manager()
         await manager.disconnect(account_id)
@@ -216,6 +222,7 @@ async def get_conversations(
     cursor: int = None,
     limit: int = 20,
     current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db_session),
 ):
     """
     获取指定账号的会话列表
@@ -225,6 +232,8 @@ async def get_conversations(
         cursor: 分页游标（首页不传，翻页传nextCursor）
         limit: 每页数量，默认20
     """
+    if not await _get_owned_chat_account(account_id, current_user, db):
+        return ApiResponse(success=False, message="账号不存在或无权操作")
     try:
         manager = get_im_session_manager()
         client = manager.clients.get(account_id)
@@ -263,7 +272,7 @@ async def get_conversations(
             redis_client = await get_redis_client()
             read_pipe = redis_client.pipeline()
             for c in conversations:
-                read_pipe.get(f"{AVATAR_CACHE_PREFIX}{c['cid']}")
+                read_pipe.get(f"{AVATAR_CACHE_PREFIX}{account_id}:{c['cid']}")
             results = await read_pipe.execute()
 
             write_pipe = redis_client.pipeline()
@@ -293,7 +302,7 @@ async def get_conversations(
                     if not cached_nick or ("***" in cached_nick and "***" not in conv_nick):
                         new_cache = {"avatar": cached_avatar, "nick": conv_nick}
                         write_pipe.set(
-                            f"{AVATAR_CACHE_PREFIX}{c['cid']}",
+                            f"{AVATAR_CACHE_PREFIX}{account_id}:{c['cid']}",
                             json.dumps(new_cache, ensure_ascii=False),
                             ex=AVATAR_CACHE_TTL,
                         )
@@ -334,6 +343,7 @@ async def get_messages(
     cursor: int = None,
     limit: int = 20,
     current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db_session),
 ):
     """
     获取指定会话的聊天记录
@@ -344,6 +354,8 @@ async def get_messages(
         cursor: 分页游标（首页不传，翻页传nextCursor）
         limit: 每页数量，默认20
     """
+    if not await _get_owned_chat_account(account_id, current_user, db):
+        return ApiResponse(success=False, message="账号不存在或无权操作")
     try:
         manager = get_im_session_manager()
         client = manager.clients.get(account_id)
@@ -359,7 +371,7 @@ async def get_messages(
             err_msg = body.get("developerMessage", body.get("reason", ""))
             logger.warning(f"【{account_id}】IM消息列表返回错误: {err_msg}，等待下次轮询重试")
             return ApiResponse(
-                success=True,
+                success=False, message="平台历史查询未成功，保留已有消息",
                 data={"messages": [], "hasMore": False, "nextCursor": None},
             )
 
@@ -371,6 +383,16 @@ async def get_messages(
             if msg_info:
                 messages.append(msg_info)
         messages.reverse()
+        store = ReplyState()
+        for message in messages:
+            if message['messageId']:
+                persisted, _ = await store.record_message(account_id, cid, message['messageId'],
+                    'assistant' if message['isSelf'] else 'user',
+                    message['images'][0] if message['type'] == 'image' and message['images'] else message['text'],
+                    message['senderId'], origin='platform', content_type=message['type'],
+                    occurred_at=(message['time'] / 1000 if message['time'] > 1000000000000 else message['time']) or None,
+                    sender_name=message['senderName'])
+                message.update(messageId=persisted['message_id'], version=persisted['version'], status=persisted['status'])
 
         return ApiResponse(
             success=True,
@@ -395,7 +417,8 @@ class SendMessageRequest(BaseModel):
     """发送消息请求体"""
     cid: str
     toUserId: str
-    text: str
+    text: str = Field(min_length=1, max_length=20000)
+    requestId: str = Field(default_factory=lambda: uuid.uuid4().hex, min_length=1, max_length=128)
 
 
 class RecallMessageRequest(BaseModel):
@@ -419,42 +442,26 @@ async def send_message(
     account_id: str,
     req: SendMessageRequest,
     current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db_session),
 ):
-    """
-    发送文本消息
-
-    Args:
-        account_id: 账号ID
-        req: 包含 cid（会话ID）、toUserId（对方用户ID）、text（消息内容）
-    """
+    account = await _get_owned_chat_account(account_id, current_user, db)
+    if not account:
+        return ApiResponse(success=False, message="账号不存在或无权操作")
+    if not req.text.strip():
+        return ApiResponse(success=False, message="消息内容为空")
+    client = get_im_session_manager().clients.get(account_id)
+    if not client or not client.is_connected:
+        return ApiResponse(success=False, message="账号未连接")
+    async def transport():
+        result = await client.send_text_message(cid=req.cid, to_user_id=req.toUserId, text=req.text, request_id=req.requestId)
+        return platform_send_result(result)
     try:
-        manager = get_im_session_manager()
-        client = manager.clients.get(account_id)
-        if not client or not client.is_connected:
-            return ApiResponse(success=False, message="账号未连接，请先连接")
-
-        if not req.text.strip():
-            return ApiResponse(success=False, message="消息内容不能为空")
-
-        send_result = await client.send_text_message(
-            cid=req.cid,
-            to_user_id=req.toUserId,
-            text=req.text,
-        )
-        logger.info(
-            f"【{account_id}】发送消息到 {req.toUserId}: {req.text[:50]}"
-        )
-        return ApiResponse(
-            success=True,
-            message="发送成功",
-            data={"messageId": send_result.get("messageId", "")},
-        )
-
-    except Exception as e:
-        # send_text_message 在被 IM 安全拦截等业务错误时会抛出明文原因，
-        # 直接透传给前端展示（如"内容存在不当信息..."），便于用户调整后重发。
-        logger.warning(f"【{account_id}】发送消息失败: {e}")
-        return ApiResponse(success=False, message=f"发送失败：{str(e)}")
+        result = await ReplyState().send(account_id, req.cid, req.requestId, req.text, transport,
+            pause_minutes=account.pause_duration, fingerprint=req.toUserId, sender_id=client.myid)
+    except ValueError as exc:
+        return ApiResponse(success=False, message=str(exc))
+    labels = {'submitted': '已提交', 'confirmed': '平台已确认', 'failed': '明确失败', 'unknown': '结果待核实，请先核对聊天记录'}
+    return ApiResponse(success=result['status'] != 'failed', message=labels[result['status']], data=result)
 
 
 @router.post("/recall-message/{account_id}")
@@ -494,6 +501,7 @@ async def _get_owned_chat_account(account_id: str, current_user: User, db: Async
 async def query_official_blacklist(
     account_id: str,
     cid: str,
+    buyer_id: str = '',
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
 ):
@@ -501,8 +509,11 @@ async def query_official_blacklist(
     if not account or not account.cookie:
         return ApiResponse(success=False, message="账号不存在或Cookie为空")
     try:
-        data = await official_blacklist_request(account.cookie, cid, "query")
-        return ApiResponse(success=True, data={"blocked": bool(data.get("isInBlack"))})
+        data = await official_blacklist_request(account.cookie, cid, "query", account=account)
+        blocked = parse_blacklist_status(data)
+        if buyer_id:
+            await BlacklistService(db).sync_platform_member(account.owner_id, buyer_id, blocked)
+        return ApiResponse(success=True, data={"blocked": blocked, "synced": bool(buyer_id)})
     except Exception as e:
         return ApiResponse(success=False, message=f"查询黑名单状态失败: {e}")
 
@@ -512,6 +523,7 @@ async def change_official_blacklist(
     account_id: str,
     cid: str,
     action: str,
+    buyer_id: str = '',
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
 ):
@@ -521,8 +533,10 @@ async def change_official_blacklist(
     if not account or not account.cookie:
         return ApiResponse(success=False, message="账号不存在或Cookie为空")
     try:
-        await official_blacklist_request(account.cookie, cid, action)
+        await official_blacklist_request(account.cookie, cid, action, account=account)
         blocked = action == "add"
+        if buyer_id:
+            await BlacklistService(db).sync_platform_member(account.owner_id, buyer_id, blocked)
         return ApiResponse(
             success=True,
             message="已加入闲鱼官方黑名单" if blocked else "已解除闲鱼官方黑名单",
@@ -548,6 +562,8 @@ async def query_avatars(
         account_id: 账号ID
         req: 包含 session_ids 列表
     """
+    if not await _get_owned_chat_account(account_id, current_user, db):
+        return ApiResponse(success=False, message="账号不存在或无权操作")
     try:
         # 校验账号归属并获取cookie（管理员可操作任意账号）
         query = select(XYAccount).where(XYAccount.account_id == account_id)
@@ -590,6 +606,8 @@ async def get_account_profile(
     db: AsyncSession = Depends(get_db_session),
 ):
     """查询并持久化卖家在闲鱼的真实昵称"""
+    if not await _get_owned_chat_account(account_id, current_user, db):
+        return ApiResponse(success=False, message="账号不存在或无权操作")
     query = select(XYAccount).where(XYAccount.account_id == account_id)
     if not is_admin_user(current_user):
         query = query.where(XYAccount.owner_id == current_user.id)
@@ -841,3 +859,7 @@ def _extract_message_summary(message: dict) -> str:
     except Exception:
         pass
     return ""
+
+# 回复领域路由沿用在线聊天注册入口，不修改全局导出。
+from app.api.routes.reply_management import router as reply_controls_router
+router.include_router(reply_controls_router)

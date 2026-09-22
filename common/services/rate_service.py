@@ -49,309 +49,63 @@ class RateService:
                 cookies[key.strip()] = value.strip()
         return cookies
     
-    async def rate_buyer(self, trade_id: str, feedback: str = "不错的买家", is_retry: bool = False) -> Dict[str, Any]:
-        """评价买家
-        
-        支持令牌过期自动刷新Cookie并重试一次
-        
-        Args:
-            trade_id: 订单ID
-            feedback: 评价内容，默认"不错的买家"
-            is_retry: 是否为令牌过期后的重试请求
-            
-        Returns:
-            评价结果字典，包含success和message
-        """
-        try:
-            from common.utils.cookie_refresh import (
-                is_token_expired_error, handle_token_expired_response,
-                update_account_cookies_in_db,
-                is_session_expired_error, trigger_password_login_async,
-                mark_account_session_expired
-            )
-            
-            m_h5_tk = self.cookies_dict.get('_m_h5_tk', '')
-            token = m_h5_tk.split('_')[0] if m_h5_tk else ''
-            timestamp = str(int(time.time() * 1000))
-            
-            # 构建请求数据
-            data_obj = {
-                "tradeId": trade_id,
-                "rate": 1,  # 好评
-                "feedback": feedback,
-                "createOrAppend": 0
-            }
-            data_val = json.dumps(data_obj, separators=(',', ':'), ensure_ascii=False)
-            sign = generate_sign(timestamp, token, data_val)
-            
-            params = {
-                "jsv": "2.7.2",
-                "appKey": "34839810",
-                "t": timestamp,
-                "sign": sign,
-                "v": "4.0",
-                "type": "originaljson",
-                "accountSite": "xianyu",
-                "dataType": "json",
-                "timeout": "20000",
-                "api": "mtop.taobao.idle.rate.create",
-                "sessionOption": "AutoLoginOnly"
-            }
-            
-            headers = {
-                "accept": "application/json",
-                "content-type": "application/x-www-form-urlencoded",
-                "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "referer": "https://www.goofish.com/",
-                "origin": "https://www.goofish.com",
-                "cookie": self.cookie_string
-            }
-            
-            url = "https://h5api.m.goofish.com/h5/mtop.taobao.idle.rate.create/4.0/"
-            
-            timeout = aiohttp.ClientTimeout(total=20)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(url, params=params, headers=headers, data={"data": data_val}) as response:
-                    result = await response.json()
-                    
-                    ret = result.get('ret', [])
-                    ret_str = ret[0] if ret else str(result)
-                    retry_tag = '[令牌过期重试] ' if is_retry else ''
-                    
-                    if 'SUCCESS' in ret_str:
-                        logger.info(
-                            f"账号 {self.account_id or '未知账号'} {retry_tag}评价成功: "
-                            f"trade_id={trade_id}, feedback={feedback}, 接口返回: ret={ret}"
-                        )
-                        return {"success": True, "message": "评价成功"}
-                    
-                    # 检测令牌过期，尝试刷新Cookie并重试
-                    if not is_retry and is_token_expired_error(ret):
-                        logger.warning(
-                            f"账号 {self.account_id or '未知账号'} 评价订单 {trade_id} 令牌过期，"
-                            f"接口返回: ret={ret}，准备刷新Cookie后重试"
-                        )
-                        has_new, new_cookies_str = handle_token_expired_response(
-                            response, self.cookie_string
-                        )
-                        if has_new:
-                            if self.account_id:
-                                await update_account_cookies_in_db(self.account_id, new_cookies_str)
-                            # 更新本地Cookie并重试
-                            self.cookie_string = new_cookies_str
-                            self.cookies_dict = self._parse_cookies(new_cookies_str)
-                            return await self.rate_buyer(trade_id, feedback, is_retry=True)
-                        else:
-                            logger.warning(f"账号 {self.account_id or '未知账号'} 评价订单 {trade_id} 令牌过期，但响应中没有Set-Cookie，无法重试")
-                    
-                    # 检测Session过期，标记账号冷却并触发后台异步密码登录（不阻塞、不重试）
-                    if is_session_expired_error(ret):
-                        logger.warning(
-                            f"账号 {self.account_id or '未知账号'} 评价订单 {trade_id} Session过期，"
-                            f"接口返回: ret={ret}，触发后台异步密码登录"
-                        )
-                        if self.account_id:
-                            mark_account_session_expired(self.account_id)
-                            trigger_password_login_async(self.account_id)
-                    
-                    logger.warning(
-                        f"账号 {self.account_id or '未知账号'} {retry_tag}评价失败: "
-                        f"trade_id={trade_id}, 接口返回: ret={ret}, response={result}"
-                    )
-                    return {"success": False, "message": ret_str}
-                        
-        except Exception as e:
-            logger.error(f"账号 {self.account_id or '未知账号'} 评价异常: trade_id={trade_id}, error={e}")
-            return {"success": False, "message": str(e)}
+    async def rate_buyer(self, trade_id: str, feedback: str = "不错的买家", is_retry: bool = False):
+        from common.services.product_feedback_service import guarded_rate
+        return await guarded_rate(self, trade_id, feedback)
+
+    async def _rate_buyer_impl(self, trade_id: str, feedback: str = "不错的买家", is_retry: bool = False) -> Dict[str, Any]:
+        """Submit through the existing account executor; recovery never runs here."""
+        from common.services.account_business_client import dispatch_business
+        from common.db.session import async_session_maker
+        from common.models.xy_account import XYAccount
+        from sqlalchemy import select
+        async with async_session_maker() as session:
+            account = await session.scalar(select(XYAccount).where(XYAccount.account_id == self.account_id))
+            if account is None:
+                return {'success':False,'definitive_failure':True,'message':'account_not_found'}
+        return await dispatch_business(account,'rate_buyer',{'order_no':trade_id,'feedback':feedback})
 
 
 async def fetch_merchant_rate_list(cookie_string: str, account_id: str = None, page: int = 1, page_size: int = 20, max_retries: int = 3) -> Dict[str, Any]:
-    """获取商家待评价订单列表
-    
-    调用 mtop.taobao.idle.merchant.rate.list 接口获取待评价订单
-    
-    Args:
-        cookie_string: 账号Cookie字符串
-        account_id: 账号ID（用于日志和令牌刷新）
-        page: 页码，默认1
-        page_size: 每页数量，默认20
-        max_retries: 最大重试次数，默认3
-        
-    Returns:
-        {
-            'success': bool,
-            'items': list,  # 待评价订单列表
-            'total_count': int,
-            'message': str,
-            'cookies_str': str  # 可能刷新后的cookie
-        }
-    """
-    from common.utils.cookie_refresh import (
-        is_token_expired_error, handle_token_expired_response,
-        update_account_cookies_in_db,
-        is_session_expired_error, trigger_password_login_async,
-        mark_account_session_expired
-    )
-    
-    current_cookie = cookie_string
-    
-    for attempt in range(max_retries):
-        try:
-            cookies_dict = {}
-            for cookie in current_cookie.split("; "):
-                if "=" in cookie:
-                    key, value = cookie.split("=", 1)
-                    cookies_dict[key.strip()] = value.strip()
-            
-            m_h5_tk = cookies_dict.get('_m_h5_tk', '')
-            token = m_h5_tk.split('_')[0] if m_h5_tk else ''
-            timestamp = str(int(time.time() * 1000))
-            
-            # 构建请求数据
-            data_obj = {
-                "pageNumber": page,
-                "rowsPerPage": page_size,
-                "queryType": "ORDER",
-                "rateSearchParam": {
-                    "sellerRateStatus": "5"  # 待评价
-                }
-            }
-            data_val = json.dumps(data_obj, separators=(',', ':'), ensure_ascii=False)
-            
-            # 生成签名
-            app_key = "34839810"
-            sign = generate_sign(timestamp, token, data_val)
-            
-            params = {
-                "jsv": "2.7.2",
-                "appKey": app_key,
-                "t": timestamp,
-                "sign": sign,
-                "v": "1.0",
-                "type": "json",
-                "accountSite": "xianyu",
-                "dataType": "json",
-                "timeout": "20000",
-                "api": "mtop.taobao.idle.merchant.rate.list",
-                "valueType": "string",
-                "sessionOption": "AutoLoginOnly",
-            }
-            
-            headers = {
-                "accept": "application/json",
-                "content-type": "application/x-www-form-urlencoded",
-                "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "referer": "https://seller.goofish.com/?site=COMMONPRO",
-                "origin": "https://seller.goofish.com",
-                "cookie": current_cookie,
-            }
-            
-            url = "https://h5api.m.goofish.com/h5/mtop.taobao.idle.merchant.rate.list/1.0/"
-            
-            timeout_cfg = aiohttp.ClientTimeout(total=20)
-            async with aiohttp.ClientSession(timeout=timeout_cfg) as session:
-                async with session.post(url, params=params, headers=headers, data={"data": data_val}) as response:
-                    result = await response.json()
-                    
-                    ret = result.get('ret', [])
-                    ret_str = ret[0] if ret else str(result)
-                    
-                    if 'SUCCESS' in ret_str:
-                        module = result.get('data', {}).get('module', {})
-                        items = module.get('items', [])
-                        total_count = int(module.get('totalCount', '0'))
-                        logger.info(
-                            f"账号 {account_id or '未知'} 获取待评价列表成功: "
-                            f"共 {total_count} 条，本页 {len(items)} 条"
-                        )
-                        return {
-                            'success': True,
-                            'items': items,
-                            'total_count': total_count,
-                            'message': '获取成功',
-                            'cookies_str': current_cookie,
-                        }
-                    
-                    # 检测令牌过期
-                    if is_token_expired_error(ret):
-                        logger.warning(
-                            f"账号 {account_id or '未知'} 获取待评价列表令牌过期 (尝试 {attempt+1}/{max_retries})"
-                        )
-                        has_new, new_cookies_str = handle_token_expired_response(
-                            response, current_cookie
-                        )
-                        if has_new:
-                            current_cookie = new_cookies_str
-                            if account_id:
-                                await update_account_cookies_in_db(account_id, new_cookies_str)
-                            continue  # 重试
-                        else:
-                            if attempt < max_retries - 1:
-                                continue
-                            return {
-                                'success': False,
-                                'items': [],
-                                'total_count': 0,
-                                'message': f'令牌过期且无法刷新: {ret_str}',
-                                'cookies_str': current_cookie,
-                            }
-                    
-                    # 检测Session过期
-                    if is_session_expired_error(ret):
-                        logger.warning(
-                            f"账号 {account_id or '未知'} 获取待评价列表Session过期"
-                        )
-                        if account_id:
-                            mark_account_session_expired(account_id)
-                            trigger_password_login_async(account_id)
-                        return {
-                            'success': False,
-                            'items': [],
-                            'total_count': 0,
-                            'message': f'Session过期: {ret_str}',
-                            'cookies_str': current_cookie,
-                        }
-                    
-                    # 其他错误，重试
-                    logger.warning(
-                        f"账号 {account_id or '未知'} 获取待评价列表失败 "
-                        f"(尝试 {attempt+1}/{max_retries}): {ret_str}"
-                    )
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(1)
-                        continue
-                    
-                    return {
-                        'success': False,
-                        'items': [],
-                        'total_count': 0,
-                        'message': ret_str,
-                        'cookies_str': current_cookie,
-                    }
-                    
-        except Exception as e:
-            logger.error(
-                f"账号 {account_id or '未知'} 获取待评价列表异常 "
-                f"(尝试 {attempt+1}/{max_retries}): {e}"
-            )
-            if attempt < max_retries - 1:
-                await asyncio.sleep(1)
-                continue
-            return {
-                'success': False,
-                'items': [],
-                'total_count': 0,
-                'message': str(e),
-                'cookies_str': current_cookie,
-            }
-    
-    return {
-        'success': False,
-        'items': [],
-        'total_count': 0,
-        'message': '重试次数已用尽',
-        'cookies_str': current_cookie,
-    }
+    """Read one page via the sole executor; max_retries is a compatibility argument only."""
+    from common.db.session import async_session_maker
+    from common.models.xy_account import XYAccount
+    from common.services.xianyu_mtop import mtop_call
+    from sqlalchemy import select
+
+    def failed(code, response=None):
+        response = response or {}
+        return {'success':False, 'items':[], 'total_count':0, 'message':code,
+                'cookies_str':cookie_string, 'retry_after':response.get('retry_after'),
+                'account_invalid':bool(response.get('account_invalid')),
+                '_request_status_unknown':bool(response.get('_request_status_unknown'))}
+
+    if (not account_id or type(page) is not int or type(page_size) is not int
+            or page < 1 or not 1 <= page_size <= 100):
+        return failed('invalid_rate_page')
+    async with async_session_maker() as session:
+        account = await session.scalar(select(XYAccount).where(XYAccount.account_id == account_id))
+        if account is None:
+            return failed('account_not_found')
+        owner_id = account.owner_id
+    response = await mtop_call(account_id, cookie_string, 'mtop.taobao.idle.merchant.rate.list', '1.0',
+        {'pageNumber':page, 'rowsPerPage':page_size, 'queryType':'ORDER', 'rateSearchParam':{'sellerRateStatus':'5'}},
+        owner_id=owner_id, origin='https://seller.goofish.com', referer='https://seller.goofish.com/?site=COMMONPRO')
+    if not response.get('success'):
+        return failed(response.get('error') or 'rate_list_unverified', response)
+    raw = response.get('res') or {}
+    data = raw.get('data') or {}
+    module = data.get('module') if isinstance(data, dict) else None
+    if not isinstance(module, dict) or not isinstance(module.get('items'), list):
+        return failed('rate_list_schema_error')
+    try:
+        total = int(module['totalCount'])
+        if total < 0 or isinstance(module['totalCount'], bool):
+            raise ValueError('invalid_count')
+    except (KeyError, TypeError, ValueError):
+        return failed('rate_list_schema_error')
+    return {'success':True, 'items':module['items'], 'total_count':total,
+            'message':'获取成功', 'cookies_str':cookie_string}
 
 
 async def get_rate_feedback_content(account_id: str) -> Optional[str]:

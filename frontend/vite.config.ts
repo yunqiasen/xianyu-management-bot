@@ -66,8 +66,9 @@ export default defineConfig({
     },
   },
   server: {
-    port: 9000,
-    host: '0.0.0.0', // 允许外部访问
+    port: Number(process.env.XYMB_FRONTEND_PORT || 19000),
+    strictPort: true,
+    host: process.env.XYMB_FRONTEND_HOST || '127.0.0.1',
     allowedHosts: [
       'localhost',
       '127.0.0.1',
@@ -77,13 +78,13 @@ export default defineConfig({
     proxy: {
       // 所有 API 请求统一代理到后端（含WebSocket升级）
       '/api': {
-        target: 'http://localhost:8089',
+        target: process.env.XYMB_BACKEND_URL || 'http://127.0.0.1:19089',
         changeOrigin: true,
         ws: true,
       },
       // 静态文件代理到后端（包含上传的图片）
       '/static': {
-        target: 'http://localhost:8089',
+        target: process.env.XYMB_BACKEND_URL || 'http://127.0.0.1:19089',
         changeOrigin: true,
       },
     },

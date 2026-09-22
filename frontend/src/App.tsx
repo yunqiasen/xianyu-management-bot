@@ -23,6 +23,7 @@ import { GetSourceCode } from '@/pages/auth/GetSourceCode'
 // 页面组件懒加载，按需加载提升首屏速度
 const Dashboard = React.lazy(() => import('@/pages/dashboard/Dashboard').then(m => ({ default: m.Dashboard })))
 const DataOverview = React.lazy(() => import('@/pages/data_analysis/DataOverview').then(m => ({ default: m.DataOverview })))
+const AISettings = React.lazy(() => import('@/pages/ai-settings/AISettings'))
 const Accounts = React.lazy(() => import('@/pages/accounts/Accounts').then(m => ({ default: m.Accounts })))
 const Items = React.lazy(() => import('@/pages/items/Items').then(m => ({ default: m.Items })))
 const Orders = React.lazy(() => import('@/pages/orders/Orders').then(m => ({ default: m.Orders })))
@@ -341,6 +342,7 @@ function App() {
             <Route path="dashboard" element={<Dashboard />} />
             <Route path="data-analysis/overview" element={<DataOverview />} />
             <Route path="accounts" element={<Accounts />} />
+            <Route path="ai-settings" element={<AISettings />} />
             <Route path="accounts/shared-scan" element={<SharedScanManager />} />
             <Route path="items" element={<Items />} />
             <Route path="orders" element={<Orders />} />

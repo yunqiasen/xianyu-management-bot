@@ -13,6 +13,12 @@ export interface ServiceStatusItem {
   label: string
   port: number
   online: boolean
+  status: string
+  database: string
+  redis: string
+  workers_enabled: boolean
+  version: string
+  commit: string
 }
 
 // 服务状态查询响应数据

@@ -15,6 +15,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.services.account_limit_service import AccountLimitService
+from common.services import account_policy
 from common.models.xy_account import XYAccount
 from common.models.user import User
 from common.utils.cookie_refresh import clear_cookie_refresh_snapshot
@@ -29,6 +30,71 @@ class AccountService:
     def __init__(self, session: AsyncSession):
         self.session = session
 
+    async def _lock_account(self, account: XYAccount) -> XYAccount:
+        result = await self.session.execute(
+            select(XYAccount).where(XYAccount.id == account.id)
+            .with_for_update().execution_options(populate_existing=True)
+        )
+        locked = result.scalars().first()
+        if locked is None:
+            raise ValueError("账号不存在")
+        return locked
+
+    async def _check_identity_owner(self, owner_id: int, unb: str | None) -> None:
+        if not unb:
+            raise ValueError("Cookie 缺少账号身份 unb")
+        result = await self.session.execute(select(XYAccount).where(XYAccount.unb == unb))
+        if any(row.owner_id != owner_id for row in result.scalars().all()):
+            raise ValueError("闲鱼身份已绑定其他后台用户")
+
+    async def start_credential_job(self, account, kind, owner_id):
+        account = await self._lock_account(account)
+        previous = account_policy.snapshot(account)['jobs']
+        job = account_policy.start_job(account, kind=kind, owner_id=owner_id)
+        await self.session.commit()
+        return {**job, 'created': job['id'] not in previous}
+
+    async def get_credential_job(self, account, job_id, owner_id):
+        account = await self._lock_account(account)
+        job = account_policy.get_job(account, job_id, owner_id=owner_id)
+        await self.session.commit()
+        return job
+
+    async def cancel_credential_job(self, account, job_id, owner_id):
+        account = await self._lock_account(account)
+        job = account_policy.cancel_job(account, job_id, owner_id=owner_id)
+        await self.session.commit()
+        return job
+
+    async def finish_credential_job(self, account, job_id, cookie):
+        account = await self._lock_account(account)
+        accepted = account_policy.complete_job(account, job_id, cookie)
+        await self.session.commit()
+        return accepted
+
+    async def ack_configuration(self, account, consumer, version):
+        account = await self._lock_account(account)
+        accepted = account_policy.ack_config(account, consumer, version)
+        await self.session.commit()
+        return accepted
+
+    async def save_request_policy(self, account, payload):
+        from common.services.account_configuration import request_policy_view
+        account = await self._lock_account(account)
+        previous = account_policy.snapshot(account)
+        if previous['config_version'] != payload.expected_config_version:
+            raise account_policy.StaleAccountOperation('configuration_changed')
+        from common.services.typed_settings import clear_inheritance
+        clear_inheritance(account, ['risk'])
+        values = {**previous.get('config_values', {}), 'risk': payload.risk_values()}
+        account_policy.bump_config(account, values)
+        if previous['business_state'] in {'paused', 'verification_required', 'cooldown', 'proxy_error', 'recovering'}:
+            current = account_policy.snapshot(account)
+            current.update(business_state=previous['business_state'], reason=previous['reason'])
+            account_policy.store(account, current)
+        await self.session.commit()
+        return request_policy_view(account)
+
     async def list_account_options(self, owner_id: int | None = None) -> list[dict]:
         stmt = select(
             XYAccount.id,
@@ -36,7 +102,7 @@ class AccountService:
             XYAccount.remark,
             XYAccount.status,
             XYAccount.show_browser,
-        ).order_by(XYAccount.account_id)
+        ).where(XYAccount.status != "deleted").order_by(XYAccount.account_id)
         if owner_id is not None:
             stmt = stmt.where(XYAccount.owner_id == owner_id)
         result = await self.session.execute(stmt)
@@ -53,7 +119,7 @@ class AccountService:
 
     async def list_account_ids(self, owner_id: int | None = None) -> list[str]:
         """获取账号ID列表，owner_id为None时返回所有账号（管理员）"""
-        stmt = select(XYAccount.account_id).order_by(XYAccount.account_id)
+        stmt = select(XYAccount.account_id).where(XYAccount.status != "deleted").order_by(XYAccount.account_id)
         if owner_id is not None:
             stmt = stmt.where(XYAccount.owner_id == owner_id)
         result = await self.session.execute(stmt)
@@ -61,7 +127,7 @@ class AccountService:
 
     async def list_accounts(self, owner_id: int | None = None) -> list[XYAccount]:
         """获取账号列表，owner_id为None时返回所有账号（管理员）"""
-        stmt = select(XYAccount).order_by(XYAccount.account_id)
+        stmt = select(XYAccount).where(XYAccount.status != "deleted").order_by(XYAccount.account_id)
         if owner_id is not None:
             stmt = stmt.where(XYAccount.owner_id == owner_id)
         result = await self.session.execute(stmt)
@@ -109,7 +175,7 @@ class AccountService:
         from sqlalchemy import func, and_, or_
         
         base_stmt = select(XYAccount)
-        conditions = []
+        conditions = [XYAccount.status != "deleted"]
         
         # 用户ID筛选
         if owner_id is not None:
@@ -325,40 +391,94 @@ class AccountService:
         result = await self.session.execute(stmt)
         return (result.scalar() or 0) > 0
 
-    async def create_account(
-        self,
-        owner_id: int,
-        account_id: str,
-        cookie_value: str,
-        *,
-        unb: str | None = None,
-        login_method: str = "manual",
-    ) -> XYAccount:
-        # 全局唯一校验：account_id 不允许与任何用户的账号重复
-        if await self.account_id_exists(account_id):
-            raise ValueError("账号ID已存在")
+    async def stage_cookie_import(self, owner_id, account_id, cookie_value, *,
+                                  create_only=False, enabled=None, profile=None, login_method='manual', commit=True):
+        """Save a profile and a fenced verification job atomically; keep candidate secrets out of responses."""
+        import re
+        from common.utils.xianyu_utils import trans_cookies
+        account_id = str(account_id or '').strip()
+        if not re.fullmatch(r'[\w.@-]{1,80}', account_id):
+            raise ValueError('账号ID格式错误')
+        # Serializes quota and profile additions for one owner.
+        owner = await self.session.scalar(select(User).where(User.id == owner_id).with_for_update())
+        if owner is None:
+            raise ValueError('用户不存在')
+        account = await self.session.scalar(select(XYAccount).where(
+            XYAccount.account_id == account_id).with_for_update().execution_options(populate_existing=True))
+        if account is not None and (create_only or account.owner_id != owner_id or account.status == 'deleted'):
+            raise ValueError('账号ID已存在，请使用原账号维护入口')
+        created = account is None
+        candidate = account_policy._secret(cookie_value)
+        if candidate is None:
+            candidate = account.cookie if account is not None else ''
+        identity = trans_cookies(candidate).get('unb')
+        if not identity or len(identity) > 64:
+            raise ValueError('Cookie 缺少有效账号身份 unb')
+        if account is not None and account.unb and str(account.unb) != identity:
+            raise ValueError('凭据账号身份不一致')
+        aliases = (await self.session.execute(select(XYAccount).where(XYAccount.unb == identity))).scalars().all()
+        if any(account is None or other.id != account.id for other in aliases):
+            raise ValueError('闲鱼身份已有账号，请使用原账号刷新')
+        if created:
+            await AccountLimitService(self.session).ensure_can_add_account(owner_id)
+            account = XYAccount(owner_id=owner_id, account_id=account_id, unb=identity, cookie='',
+                login_method=login_method, status='active' if enabled is not False else 'inactive',
+                auto_confirm=False, pause_duration=10, show_browser=False, proxy_type='none')
+            self.session.add(account)
+        else:
+            account.unb = identity
+            if enabled is True:
+                account.status, account.disable_reason = 'active', None
+            elif enabled is False and account.status == 'active':
+                account.status, account.disable_reason = 'inactive', 'import_disabled'
+        fields = profile or {}
+        plain_fields = {'remark','pause_duration','message_expire_time','show_browser',
+                        'proxy_type','proxy_host','proxy_port'}
+        from common.services.typed_settings import DEFINITIONS, validate_value
+        for key in plain_fields & fields.keys():
+            value = validate_value(key, fields[key]) if key in DEFINITIONS else fields[key]
+            setattr(account, key, value)
+        account_policy.update_login_fields(account, username=fields.get('username'),
+                                            login_password=fields.get('login_password'))
+        for key in ('proxy_user', 'proxy_pass'):
+            value = account_policy._secret(fields.get(key))
+            if value is not None:
+                setattr(account, key, value)
+        account_policy.proxy_url({key:getattr(account,key) for key in
+            ('proxy_type','proxy_host','proxy_port','proxy_user','proxy_pass')})
+        if not created:
+            from common.services.typed_settings import clear_inheritance
+            clear_inheritance(account, fields)
+            state = account_policy.snapshot(account)
+            for task in state['jobs'].values():
+                if task['status'] not in account_policy.TERMINAL:
+                    task['status'] = 'superseded'
+            account_policy.store(account, state)
+            # Every spreadsheet import is one configuration batch. Later sheets are
+            # saved before the queued credential checker starts, while business is paused.
+            account_policy.bump_config(account)
+        job = account_policy.start_job(account, owner_id=owner_id, kind='cookie_import')
+        from sqlalchemy.exc import IntegrityError
+        try:
+            await self.session.flush()
+        except IntegrityError as exc:
+            raise ValueError('账号身份已存在，请刷新原账号') from exc
+        if commit:
+            await self.session.commit()
+            await self.session.refresh(account)
+        return account, job, candidate, created
 
-        await AccountLimitService(self.session).ensure_can_add_account(owner_id)
-
-        account = XYAccount(
-            owner_id=owner_id,
-            account_id=account_id,
-            cookie=cookie_value,
-            login_method=login_method,
-            status="active",
-            auto_confirm=False,
-            pause_duration=10,
-            show_browser=False,
-            unb=unb,
-            last_login_at=datetime.now(tz=UTC),
-        )
-        self.session.add(account)
-        await self.session.commit()
-        await self.session.refresh(account)
+    async def create_account(self, owner_id: int, account_id: str, cookie_value: str, *,
+                             unb: str | None = None, login_method: str = 'manual') -> XYAccount:
+        account, _, _, _ = await self.stage_cookie_import(owner_id, account_id, cookie_value,
+            create_only=True, enabled=True, login_method=login_method)
         return account
 
-    async def update_cookie(self, account: XYAccount, value: str) -> None:
-        account.cookie = value
+    async def update_cookie(self, account: XYAccount, value: str, *, expected_version: int | None = None) -> None:
+        if expected_version is None:
+            expected_version = account_policy.snapshot(account)['credential_version']
+        account = await self._lock_account(account)
+        account_policy.replace_credentials(account, value, expected_version=expected_version)
         account.metadata_json = clear_cookie_refresh_snapshot(account.metadata_json)
         self.session.add(account)
         await self.session.commit()
@@ -371,10 +491,27 @@ class AccountService:
             enabled: 是否启用
             disable_reason: 禁用原因（仅在禁用时有效，启用时会清空）
         """
+        account = await self._lock_account(account)
         account.status = "active" if enabled else "disabled"
+        account_policy.bump_config(account)
+        state = account_policy.snapshot(account)
+        state.update(business_state="unchecked" if enabled else "disabled", reason=None if enabled else "manual_disabled")
+        account_policy.store(account, state)
         # 启用时清空禁用原因，禁用时设置禁用原因
         account.disable_reason = None if enabled else disable_reason
         self.session.add(account)
+        await self.session.commit()
+
+    async def _save_config_fields(self, account: XYAccount, **values) -> None:
+        from common.services.typed_settings import clear_inheritance, DEFINITIONS, validate_value
+        for key, value in values.items():
+            if key in DEFINITIONS:
+                validate_value(key, value)
+        account = await self._lock_account(account)
+        clear_inheritance(account, values)
+        for key, value in values.items():
+            setattr(account, key, value)
+        account_policy.bump_config_preserving_pause(account)
         await self.session.commit()
 
     async def update_remark(self, account: XYAccount, remark: str) -> None:
@@ -383,32 +520,19 @@ class AccountService:
         await self.session.commit()
 
     async def update_auto_confirm(self, account: XYAccount, auto_confirm: bool) -> None:
-        values = {"auto_confirm": auto_confirm}
+        values = {'auto_confirm': auto_confirm}
         if auto_confirm:
-            values["only_send_card"] = False
-        stmt = update(XYAccount).where(XYAccount.id == account.id).values(**values)
-        await self.session.execute(stmt)
-        await self.session.commit()
-        account.auto_confirm = auto_confirm
-        if auto_confirm:
-            account.only_send_card = False
+            values['only_send_card'] = False
+        await self._save_config_fields(account, **values)
 
     async def update_pause_duration(self, account: XYAccount, duration: int) -> None:
-        account.pause_duration = duration
-        self.session.add(account)
-        await self.session.commit()
+        await self._save_config_fields(account, pause_duration=duration)
 
     async def update_message_expire_time(self, account: XYAccount, expire_time: int) -> None:
-        """更新相同消息等待时间"""
-        account.message_expire_time = expire_time
-        self.session.add(account)
-        await self.session.commit()
+        await self._save_config_fields(account, message_expire_time=expire_time)
 
     async def update_reply_delay(self, account: XYAccount, delay_seconds: int) -> None:
-        """更新自动回复延迟时间(秒)"""
-        account.reply_delay_seconds = delay_seconds
-        self.session.add(account)
-        await self.session.commit()
+        await self._save_config_fields(account, reply_delay_seconds=delay_seconds)
 
     async def update_login_info(
         self,
@@ -416,31 +540,65 @@ class AccountService:
         username: str | None = None,
         login_password: str | None = None,
         show_browser: bool | None = None,
+        clear_fields: list[str] | None = None,
     ) -> None:
-        """更新账号登录信息（用户名、密码、是否显示浏览器）"""
-        if username is not None:
-            account.username = username
-        if login_password is not None:
-            account.login_password = login_password
+        """空白/脱敏字段保持原值；只有 clear_fields 显式清除。"""
+        account = await self._lock_account(account)
+        before = (account.username, account.login_password, account.show_browser)
+        was_inherited = 'show_browser' in account_policy.snapshot(account).get('inherited_fields', [])
+        account_policy.update_login_fields(account, username=username, login_password=login_password, clear_fields=clear_fields or ())
         if show_browser is not None:
             account.show_browser = show_browser
+            from common.services.typed_settings import clear_inheritance
+            clear_inheritance(account, ['show_browser'])
+        if before != (account.username, account.login_password, account.show_browser) or (show_browser is not None and was_inherited):
+            account_policy.bump_config_preserving_pause(account)
         self.session.add(account)
         await self.session.commit()
 
     async def update_scheduled_redelivery(self, account: XYAccount, scheduled_redelivery: bool) -> None:
-        """更新定时补发货开关"""
-        account.scheduled_redelivery = scheduled_redelivery
-        self.session.add(account)
-        await self.session.commit()
+        await self._save_config_fields(account, scheduled_redelivery=scheduled_redelivery)
 
     async def update_scheduled_rate(self, account: XYAccount, scheduled_rate: bool) -> None:
-        """更新定时补评价开关"""
-        account.scheduled_rate = scheduled_rate
-        self.session.add(account)
-        await self.session.commit()
+        await self._save_config_fields(account, scheduled_rate=scheduled_rate)
+
+    async def delete_preview(self, account):
+        from sqlalchemy import or_
+        from common.models.xy_order import XYOrder
+        from common.models.delivery_intent import DeliveryIntent
+        from common.models.account_operation import AccountOperation
+        from common.models.reply_state import reply_outbox
+
+        async def count_rows(table, *conditions):
+            return await self.session.scalar(select(func.count()).select_from(table).where(*conditions)) or 0
+
+        counts = {
+            'unfinished_orders': await count_rows(XYOrder, XYOrder.account_id == account.account_id,
+                XYOrder.owner_id == account.owner_id,
+                XYOrder.status.not_in(('completed', 'closed', 'cancelled', 'refunded'))),
+            'unfinished_deliveries': await count_rows(DeliveryIntent, DeliveryIntent.account_id == account.account_id,
+                DeliveryIntent.owner_id == account.owner_id, or_(
+                    DeliveryIntent.content_state.not_in(('confirmed', 'not_sent')),
+                    DeliveryIntent.confirm_state.not_in(('confirmed', 'not_required')))),
+            'pending_replies': await count_rows(reply_outbox, reply_outbox.c.account_id == account.account_id,
+                reply_outbox.c.status.in_(('submitted', 'unknown'))),
+            'pending_operations': await count_rows(AccountOperation, AccountOperation.account_id == account.account_id,
+                AccountOperation.owner_id == account.owner_id, AccountOperation.status.in_(('submitted', 'unknown'))),
+        }
+        state = account_policy.snapshot(account)
+        counts['active_jobs'] = sum(j['status'] not in account_policy.TERMINAL for j in state['jobs'].values())
+        return {'account_id': account.account_id, **counts, 'can_delete': not any(counts.values()),
+                'retains_business_history': True}
 
     async def delete_account(self, account: XYAccount) -> None:
-        await self.session.delete(account)
+        account = await self._lock_account(account)
+        preview = await self.delete_preview(account)
+        if not preview['can_delete']:
+            raise ValueError('账号仍有未完成订单、履约、消息或凭据任务，请先核实')
+        # 软删除保留业务事实、归属和审计；不级联清理订单。
+        account.status = 'deleted'
+        account.disable_reason = '用户删除'
+        account_policy.bump_config(account)
         await self.session.commit()
 
     async def get_account_by_unb(self, owner_id: int, unb: str) -> XYAccount | None:
@@ -471,17 +629,23 @@ class AccountService:
         unb: str | None,
         *,
         login_method: str = "qr_scan",
+        target_account_id: str | None = None,
+        expected_version: int | None = None,
     ) -> tuple[XYAccount, bool]:
+        await self._check_identity_owner(owner_id, unb)
         account: XYAccount | None = None
-        if unb:
+        if target_account_id:
+            account = await self.get_account_for_user(owner_id, target_account_id)
+            if account is None:
+                raise ValueError("刷新目标账号不存在")
+        elif unb:
             account = await self.get_account_by_unb(owner_id, unb)
 
         created = False
         if account:
-            account.cookie = cookies
+            account = await self._lock_account(account)
+            account_policy.replace_credentials(account, cookies, expected_version=expected_version)
             account.metadata_json = clear_cookie_refresh_snapshot(account.metadata_json)
-            account.status = "active"
-            account.disable_reason = None  # 清空禁用原因
             account.login_method = login_method
             account.unb = unb
             account.last_login_at = datetime.now(tz=UTC)
@@ -542,6 +706,7 @@ class AccountService:
         Raises:
             ValueError: account_id 已被其他用户占用
         """
+        await self._check_identity_owner(owner_id, unb)
         existing = await self.get_account_by_identifier(account_id)
         # account_id 已被其他用户占用时禁止覆盖，直接报错（与 websocket 版一致）
         if existing and existing.owner_id != owner_id:
@@ -550,14 +715,12 @@ class AccountService:
         now = datetime.now(tz=UTC)
         created = False
         if existing:
-            existing.cookie = cookies
+            existing = await self._lock_account(existing)
+            account_policy.replace_credentials(existing, cookies)
             existing.metadata_json = clear_cookie_refresh_snapshot(existing.metadata_json)
-            existing.username = account
-            existing.login_password = password
+            account_policy.update_login_fields(existing, username=account, login_password=password)
             existing.show_browser = show_browser
             existing.login_method = "password"
-            existing.status = "active"
-            existing.disable_reason = None
             existing.last_login_at = now
             if unb:
                 existing.unb = unb
@@ -591,89 +754,31 @@ class AccountService:
         return account_obj, created
 
     async def update_auto_polish(self, account: XYAccount, auto_polish: bool) -> None:
-        """更新商品自动擦亮开关"""
-        account.auto_polish = auto_polish
-        self.session.add(account)
-        await self.session.commit()
+        await self._save_config_fields(account, auto_polish=auto_polish)
 
     async def update_confirm_before_send(self, account: XYAccount, confirm_before_send: bool) -> None:
-        """更新发货成功再发卡券开关（与send_before_confirm互斥）"""
-        values = {"confirm_before_send": confirm_before_send}
+        values = {'confirm_before_send': confirm_before_send}
         if confirm_before_send:
             values.update(send_before_confirm=False, only_send_card=False)
-        stmt = update(XYAccount).where(XYAccount.id == account.id).values(**values)
-        await self.session.execute(stmt)
-        await self.session.commit()
-        account.confirm_before_send = confirm_before_send
-        if confirm_before_send:
-            account.send_before_confirm = False
-            account.only_send_card = False
+        await self._save_config_fields(account, **values)
 
     async def update_send_before_confirm(self, account: XYAccount, send_before_confirm: bool) -> None:
-        """更新卡券发送成功再确认发货开关（与confirm_before_send互斥）"""
-        values = {"send_before_confirm": send_before_confirm}
+        values = {'send_before_confirm': send_before_confirm}
         if send_before_confirm:
             values.update(confirm_before_send=False, only_send_card=False)
-        stmt = update(XYAccount).where(XYAccount.id == account.id).values(**values)
-        await self.session.execute(stmt)
-        await self.session.commit()
-        account.send_before_confirm = send_before_confirm
-        if send_before_confirm:
-            account.confirm_before_send = False
-            account.only_send_card = False
+        await self._save_config_fields(account, **values)
 
     async def update_only_send_card(self, account: XYAccount, only_send_card: bool) -> None:
-        """更新只发卡券开关。开启后关闭自动确认及其它确认顺序设置。"""
-        values = {"only_send_card": only_send_card}
+        values = {'only_send_card': only_send_card}
         if only_send_card:
-            values.update(
-                auto_confirm=False,
-                confirm_before_send=False,
-                send_before_confirm=False,
-            )
-        stmt = update(XYAccount).where(XYAccount.id == account.id).values(**values)
-        await self.session.execute(stmt)
-        await self.session.commit()
-        account.only_send_card = only_send_card
-        if only_send_card:
-            account.auto_confirm = False
-            account.confirm_before_send = False
-            account.send_before_confirm = False
+            values.update(auto_confirm=False, confirm_before_send=False, send_before_confirm=False)
+        await self._save_config_fields(account, **values)
 
     async def update_auto_red_flower(self, account: XYAccount, auto_red_flower: bool) -> None:
-        """更新自动求小红花开关
-        
-        使用显式 UPDATE SQL 写入，避开 ORM 脏状态追踪可能的陷阱，
-        确保操作一定会发送 UPDATE 语句到数据库。
-        """
-        stmt = (
-            update(XYAccount)
-            .where(XYAccount.id == account.id)
-            .values(auto_red_flower=auto_red_flower)
-        )
-        await self.session.execute(stmt)
-        await self.session.commit()
-        # 同步内存对象属性（expire_on_commit=False 下对象属性不会自动刷新）
-        account.auto_red_flower = auto_red_flower
+        await self._save_config_fields(account, auto_red_flower=auto_red_flower)
 
     async def update_ai_reply_block_ordered_users(self, account: XYAccount, ai_reply_block_ordered_users: bool) -> None:
-        """更新已下单用户禁止AI回复开关
-        
-        使用显式 UPDATE SQL 写入，确保操作一定会发送 UPDATE 语句到数据库。
-        
-        Args:
-            account: 账号对象
-            ai_reply_block_ordered_users: 是否禁止对已下单用户进行AI回复
-        """
-        stmt = (
-            update(XYAccount)
-            .where(XYAccount.id == account.id)
-            .values(ai_reply_block_ordered_users=ai_reply_block_ordered_users)
-        )
-        await self.session.execute(stmt)
-        await self.session.commit()
-        # 同步内存对象属性（expire_on_commit=False 下对象属性不会自动刷新）
-        account.ai_reply_block_ordered_users = ai_reply_block_ordered_users
+        await self._save_config_fields(account, ai_reply_block_ordered_users=ai_reply_block_ordered_users)
 
     async def update_delivery_disabled(
         self,
@@ -684,110 +789,19 @@ class AccountService:
         delivery_only_card_after_close: bool = False,
         excluded_item_ids: list[str] | None = None,
     ) -> None:
-        """更新禁止发货设置（开关 + 原因 + 主动关闭订单 + 关闭后只发卡券 + 排除商品列表）
-
-        使用显式 UPDATE SQL 写入，避免 ORM 脏状态追踪可能导致字段未落库。
-
-        联动规则（与前端 UI 一致）：
-          - 禁止发货关闭：reason / auto_close_order / delivery_only_card_after_close
-            全部强制 False；排除商品列表强制清空
-          - auto_close_order 关闭：delivery_only_card_after_close 强制 False
-            （"关闭订单后继续发货"以"先关闭订单"为前置）
-
-        Args:
-            account: 账号实例
-            delivery_disabled: 禁止发货开关
-            delivery_disabled_reason: 禁止发货原因（开关关闭时会被清空）
-            auto_close_order: 主动关闭订单开关
-            delivery_only_card_after_close: 关闭订单后继续发货（仅发卡券）
-            excluded_item_ids: 排除商品 item_id 列表（开关关闭时会被清空；列表内自动
-                去重、去除空白、保留输入顺序）
-        """
-        normalized_reason: str | None
-        # 排除列表归一化：去空白 + 去重 + 保持顺序；上限 500 个，避免 JSON 过大
-        normalized_excluded: list[str] = []
-        if excluded_item_ids:
-            seen: set[str] = set()
-            for raw in excluded_item_ids:
-                if raw is None:
-                    continue
-                item_id = str(raw).strip()
-                if not item_id or item_id in seen:
-                    continue
-                seen.add(item_id)
-                normalized_excluded.append(item_id)
-                if len(normalized_excluded) >= 500:
-                    break
-
-        if not delivery_disabled:
-            normalized_reason = None
-            normalized_auto_close = False
-            normalized_only_card = False
-            # 禁止发货关闭时，排除商品列表也强制清空，避免遗留无效配置
-            normalized_excluded = []
-        else:
-            reason = (delivery_disabled_reason or "").strip()
-            normalized_reason = reason or None
-            normalized_auto_close = bool(auto_close_order)
-            # 主动关闭订单关闭时，"关闭后只发卡券"必须强制关闭
-            normalized_only_card = bool(delivery_only_card_after_close) if normalized_auto_close else False
-
-        # JSON 字段写入：MySQL 接受 None 表示 NULL；空列表用 None 存以节省空间
-        normalized_excluded_for_db: list[str] | None = normalized_excluded if normalized_excluded else None
-
-        stmt = (
-            update(XYAccount)
-            .where(XYAccount.id == account.id)
-            .values(
-                delivery_disabled=delivery_disabled,
-                delivery_disabled_reason=normalized_reason,
-                auto_close_order=normalized_auto_close,
-                delivery_only_card_after_close=normalized_only_card,
-                delivery_disabled_excluded_items=normalized_excluded_for_db,
-            )
-        )
-        await self.session.execute(stmt)
-
-        # 同步写入新规则表（buyer_credit_zero 规则）
-        from common.models.xy_delivery_block_rule import XYDeliveryBlockRule
-        from sqlalchemy import and_
-
-        rule_stmt = select(XYDeliveryBlockRule).where(
-            and_(
-                XYDeliveryBlockRule.account_id == account.account_id,
-                XYDeliveryBlockRule.rule_code == "buyer_credit_zero",
-            )
-        )
-        result = await self.session.execute(rule_stmt)
-        existing_rule = result.scalars().first()
-
-        if existing_rule:
-            existing_rule.enabled = delivery_disabled
-            existing_rule.block_reason = normalized_reason
-            existing_rule.auto_close_order = normalized_auto_close
-            existing_rule.only_card_after_close = normalized_only_card
-            existing_rule.excluded_item_ids = normalized_excluded_for_db
-        else:
-            new_rule = XYDeliveryBlockRule(
-                account_id=account.account_id,
-                rule_code="buyer_credit_zero",
-                enabled=delivery_disabled,
-                priority=10,
-                block_reason=normalized_reason,
-                auto_close_order=normalized_auto_close,
-                only_card_after_close=normalized_only_card,
-                excluded_item_ids=normalized_excluded_for_db,
-                config={"threshold": 0},
-            )
-            self.session.add(new_rule)
-
-        await self.session.commit()
-        # 同步内存对象属性
+        """Save account fields and the active rule together, using one configuration version."""
+        account = await self._lock_account(account)
+        from common.services.typed_settings import clear_inheritance
+        from common.services.delivery_rule_configuration import sync_legacy_credit_rule
         account.delivery_disabled = delivery_disabled
-        account.delivery_disabled_reason = normalized_reason
-        account.auto_close_order = normalized_auto_close
-        account.delivery_only_card_after_close = normalized_only_card
-        account.delivery_disabled_excluded_items = normalized_excluded_for_db
+        account.delivery_disabled_reason = delivery_disabled_reason
+        account.auto_close_order = auto_close_order
+        account.delivery_only_card_after_close = delivery_only_card_after_close
+        account.delivery_disabled_excluded_items = excluded_item_ids
+        await sync_legacy_credit_rule(self.session, account)
+        clear_inheritance(account, ['delivery_disabled_reason'])
+        account_policy.bump_config_preserving_pause(account)
+        await self.session.commit()
 
     async def get_delivery_block_rules(self, account_id: str) -> list[dict]:
         """获取账号的禁止发货规则列表
@@ -895,11 +909,20 @@ class AccountService:
         from common.models.xy_delivery_block_rule import XYDeliveryBlockRule
         from sqlalchemy import and_
 
+        account = await self.session.scalar(select(XYAccount).where(
+            XYAccount.account_id == account_id).with_for_update().execution_options(populate_existing=True))
+        if account is None:
+            raise ValueError("account_not_found")
+
         for rule_item in rules:
             rule_code = rule_item.rule_code
             enabled = rule_item.enabled
             priority = rule_item.priority
             block_reason = (rule_item.block_reason or "").strip() or None
+            if rule_code == 'buyer_credit_zero':
+                from common.services.typed_settings import clear_inheritance
+                clear_inheritance(account, ['delivery_disabled_reason'])
+                account.delivery_disabled_reason = block_reason
             auto_close = rule_item.auto_close_order
             only_card = rule_item.only_card_after_close if auto_close else False
 
@@ -966,4 +989,5 @@ class AccountService:
         )
         await self.session.execute(sync_stmt)
 
+        account_policy.bump_config_preserving_pause(account)
         await self.session.commit()

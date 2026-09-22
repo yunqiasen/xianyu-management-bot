@@ -1,5 +1,7 @@
 import { get, post, put, del } from '@/utils/request'
-import type { ApiResponse, NotificationChannel, MessageNotification } from '@/types'
+import type { ApiResponse, NotificationChannel as BaseNotificationChannel, MessageNotification } from '@/types'
+
+export type NotificationChannel = Omit<BaseNotificationChannel, 'type'> & { type: BaseNotificationChannel['type'] | 'qq' }
 
 const CHANNEL_PREFIX = '/api/v1/notification-channels'
 const MESSAGE_PREFIX = '/api/v1/message-notifications'

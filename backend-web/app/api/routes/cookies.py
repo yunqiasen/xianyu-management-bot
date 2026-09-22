@@ -10,7 +10,7 @@
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, Response, UploadFile, File, Form, status
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Query, Response, UploadFile, File, Form, status
 from sqlalchemy import func, select, text
 
 from app.api import deps
@@ -338,7 +338,7 @@ async def list_cookie_details_paginated(
         details.append({
             "pk": account.id,  # 数据库主键
             "id": account.account_id,
-            "value": account.cookie or "",
+            "value": "********" if account.cookie else "",
             "enabled": _status_to_enabled(account.status),
             "online": account.account_id in online_ids,
             "auto_confirm": bool(account.auto_confirm),
@@ -363,7 +363,7 @@ async def list_cookie_details_paginated(
             "message_expire_time": account.message_expire_time if account.message_expire_time is not None else 3600,
             "reply_delay_seconds": account.reply_delay_seconds if account.reply_delay_seconds is not None else 0,
             "username": account.username or "",
-            "login_password": account.login_password or "",
+            "login_password": "********" if account.login_password else "",
             "show_browser": bool(account.show_browser),
             "disable_reason": account.disable_reason or "",
             "filter_count": filter_counts.get(account.account_id, 0),
@@ -444,7 +444,7 @@ async def _update_account_status_and_task(
         task_message = task_result.get("message")
 
     if not task_success:
-        await account_service.update_status(account, current_enabled, original_disable_reason)
+        # 消费者离线不回滚用户停用意图；其他执行入口仍读取持久状态。
         return False, task_message or ("账号任务启动失败" if enabled else "账号任务停止失败")
 
     return True, None
@@ -463,40 +463,36 @@ async def get_available_delivery_block_rules(
 @router.post("", response_model=ApiResponse)
 async def create_account(
     payload: AccountCreate,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(deps.get_current_active_user),
     account_service: AccountService = Depends(deps.get_account_service),
 ) -> ApiResponse:
+    from app.services.account_jobs import run_cookie_import
     try:
-        account = await account_service.create_account(current_user.id, payload.id, payload.value)
-        
-        # 启动WebSocket任务（通过HTTP调用WebSocket服务）
-        from app.services.websocket_client import websocket_client
-        task_result = await websocket_client.start_account(account.account_id, account.cookie or "", account.owner_id)
-        if isinstance(task_result, dict) and not task_result.get("success", True):
-            return ApiResponse(success=False, message=task_result.get("message") or "账号已添加，但启动任务失败")
-        
+        account, job, candidate, _ = await account_service.stage_cookie_import(
+            current_user.id, payload.id, payload.value, create_only=True, enabled=True)
     except ValueError as exc:
-        return ApiResponse(success=False, message=str(exc))
-    except Exception as exc:
-        return ApiResponse(success=False, message=f"添加账号失败: {str(exc)}")
-    return ApiResponse(success=True, message="账号已添加")
+        await account_service.session.rollback()
+        raise HTTPException(409, str(exc)) from exc
+    background_tasks.add_task(run_cookie_import, account.account_id, current_user.id, job['id'], candidate)
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=202, content=ApiResponse(success=True,
+        message="账号已创建，凭据检查已提交", data={'account_id':account.account_id, 'job':job}).model_dump())
 
 
 @router.put("/{account_id}", response_model=ApiResponse)
 async def update_account_cookie(
     account_id: str,
     payload: AccountCookieUpdate,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(deps.get_current_active_user),
     account_service: AccountService = Depends(deps.get_account_service),
 ) -> ApiResponse:
-    account = await _get_account_or_404(current_user, account_id, account_service)
-    await account_service.update_cookie(account, payload.value)
-    
-    # 更新Cookie并重启WebSocket任务（通过HTTP调用WebSocket服务）
-    from app.services.websocket_client import websocket_client
-    await websocket_client.restart_account(account_id)
-    
-    return ApiResponse(success=True, message="Cookie 已更新")
+    from common.services import account_policy as policy
+    await _get_account_or_404(current_user, account_id, account_service)
+    if policy._secret(payload.value) is None:
+        return ApiResponse(success=True, message='已有凭据保持不变')
+    return await import_account_credentials(account_id, payload, background_tasks, current_user, account_service)
 
 
 @router.put("/{account_id}/status", response_model=ApiResponse)
@@ -693,7 +689,7 @@ async def update_account_auto_confirm(
 ) -> ApiResponse:
     account = await _get_account_or_404(current_user, account_id, account_service)
     await account_service.update_auto_confirm(account, payload.auto_confirm)
-    return ApiResponse(success=True, message="自动确认设置已更新")
+    return ApiResponse(success=True, message="自动确认设置已保存，待应用配置")
 
 
 @router.put("/{account_id}/pause-duration", response_model=ApiResponse)
@@ -705,7 +701,7 @@ async def update_account_pause_duration(
 ) -> ApiResponse:
     account = await _get_account_or_404(current_user, account_id, account_service)
     await account_service.update_pause_duration(account, payload.pause_duration)
-    return ApiResponse(success=True, message="暂停时长已更新")
+    return ApiResponse(success=True, message="暂停时长已保存，待应用配置")
 
 
 @router.put("/{account_id}/message-expire-time", response_model=ApiResponse)
@@ -718,7 +714,7 @@ async def update_account_message_expire_time(
     """更新相同消息等待时间"""
     account = await _get_account_or_404(current_user, account_id, account_service)
     await account_service.update_message_expire_time(account, payload.message_expire_time)
-    return ApiResponse(success=True, message="相同消息等待时间已更新")
+    return ApiResponse(success=True, message="相同消息等待时间已保存，待应用配置")
 
 
 @router.put("/{account_id}/reply-delay", response_model=ApiResponse)
@@ -731,7 +727,7 @@ async def update_account_reply_delay(
     """更新自动回复延迟时间"""
     account = await _get_account_or_404(current_user, account_id, account_service)
     await account_service.update_reply_delay(account, payload.reply_delay_seconds)
-    return ApiResponse(success=True, message="自动回复延迟时间已更新")
+    return ApiResponse(success=True, message="自动回复延迟时间已保存，待应用配置")
 
 
 @router.put("/{account_id}/login-info", response_model=ApiResponse)
@@ -748,8 +744,9 @@ async def update_account_login_info(
         username=payload.username,
         login_password=payload.login_password,
         show_browser=payload.show_browser,
+        clear_fields=payload.clear_fields,
     )
-    return ApiResponse(success=True, message="登录信息已更新")
+    return ApiResponse(success=True, message="登录信息已保存，待应用配置")
 
 
 @router.put("/{account_id}/scheduled-redelivery", response_model=ApiResponse)
@@ -762,7 +759,7 @@ async def update_account_scheduled_redelivery(
     """更新定时补发货开关"""
     account = await _get_account_or_404(current_user, account_id, account_service)
     await account_service.update_scheduled_redelivery(account, payload.scheduled_redelivery)
-    return ApiResponse(success=True, message="定时补发货设置已更新")
+    return ApiResponse(success=True, message="定时补发货设置已保存，待应用配置")
 
 
 @router.put("/{account_id}/scheduled-rate", response_model=ApiResponse)
@@ -775,7 +772,7 @@ async def update_account_scheduled_rate(
     """更新定时补评价开关"""
     account = await _get_account_or_404(current_user, account_id, account_service)
     await account_service.update_scheduled_rate(account, payload.scheduled_rate)
-    return ApiResponse(success=True, message="定时补评价设置已更新")
+    return ApiResponse(success=True, message="定时补评价设置已保存，待应用配置")
 
 
 @router.put("/{account_id}/auto-polish", response_model=ApiResponse)
@@ -788,7 +785,7 @@ async def update_account_auto_polish(
     """更新商品自动擦亮开关"""
     account = await _get_account_or_404(current_user, account_id, account_service)
     await account_service.update_auto_polish(account, payload.auto_polish)
-    return ApiResponse(success=True, message="商品自动擦亮设置已更新")
+    return ApiResponse(success=True, message="商品自动擦亮设置已保存，待应用配置")
 
 
 @router.put("/{account_id}/confirm-before-send", response_model=ApiResponse)
@@ -801,7 +798,7 @@ async def update_account_confirm_before_send(
     """更新发货成功再发卡券开关"""
     account = await _get_account_or_404(current_user, account_id, account_service)
     await account_service.update_confirm_before_send(account, payload.confirm_before_send)
-    return ApiResponse(success=True, message="发货成功再发卡券设置已更新")
+    return ApiResponse(success=True, message="发货成功再发卡券设置已保存，待应用配置")
 
 
 @router.put("/{account_id}/send-before-confirm", response_model=ApiResponse)
@@ -814,7 +811,7 @@ async def update_account_send_before_confirm(
     """更新卡券发送成功再确认发货开关"""
     account = await _get_account_or_404(current_user, account_id, account_service)
     await account_service.update_send_before_confirm(account, payload.send_before_confirm)
-    return ApiResponse(success=True, message="卡券发送成功再确认发货设置已更新")
+    return ApiResponse(success=True, message="卡券发送成功再确认发货设置已保存，待应用配置")
 
 
 @router.put("/{account_id}/only-send-card", response_model=ApiResponse)
@@ -827,7 +824,7 @@ async def update_account_only_send_card(
     """更新只发卡券、不确认发货开关"""
     account = await _get_account_or_404(current_user, account_id, account_service)
     await account_service.update_only_send_card(account, payload.only_send_card)
-    return ApiResponse(success=True, message="只发卡券不确认发货设置已更新")
+    return ApiResponse(success=True, message="只发卡券不确认发货设置已保存，待应用配置")
 
 
 @router.put("/{account_id}/auto-red-flower", response_model=ApiResponse)
@@ -840,7 +837,7 @@ async def update_account_auto_red_flower(
     """更新自动求小红花开关"""
     account = await _get_account_or_404(current_user, account_id, account_service)
     await account_service.update_auto_red_flower(account, payload.auto_red_flower)
-    return ApiResponse(success=True, message="自动求小红花设置已更新")
+    return ApiResponse(success=True, message="自动求小红花设置已保存，待应用配置")
 
 
 @router.put("/{account_id}/ai-reply-block-ordered-users", response_model=ApiResponse)
@@ -853,7 +850,7 @@ async def update_account_ai_reply_block_ordered_users(
     """更新已下单用户禁止AI回复开关"""
     account = await _get_account_or_404(current_user, account_id, account_service)
     await account_service.update_ai_reply_block_ordered_users(account, payload.ai_reply_block_ordered_users)
-    return ApiResponse(success=True, message="已下单用户禁止AI回复设置已更新")
+    return ApiResponse(success=True, message="已下单用户禁止AI回复设置已保存，待应用配置")
 
 
 @router.put("/{account_id}/delivery-disabled", response_model=ApiResponse)
@@ -876,7 +873,7 @@ async def update_account_delivery_disabled(
         delivery_only_card_after_close=payload.delivery_only_card_after_close,
         excluded_item_ids=payload.excluded_item_ids or [],
     )
-    return ApiResponse(success=True, message="禁止发货设置已更新")
+    return ApiResponse(success=True, message="禁止发货设置已保存，待应用配置")
 
 
 @router.get("/{account_id}/delivery-block-rules", response_model=ApiResponse)
@@ -901,7 +898,7 @@ async def update_delivery_block_rules(
     """批量更新账号的禁止发货规则配置"""
     account = await _get_account_or_404(current_user, account_id, account_service)
     await account_service.update_delivery_block_rules(account.account_id, payload.rules)
-    return ApiResponse(success=True, message="禁止发货规则已更新")
+    return ApiResponse(success=True, message="禁止发货规则已保存，待应用配置")
 
 
 @router.delete("/{account_id}", response_model=ApiResponse)
@@ -912,12 +909,14 @@ async def delete_account(
 ) -> ApiResponse:
     account = await _get_account_or_404(current_user, account_id, account_service)
     
-    # 先停止WebSocket任务（通过HTTP调用WebSocket服务）
+    # 先在账号行锁内核对未完成事实并停用；拒绝删除时保留原有执行任务。
+    try:
+        await account_service.delete_account(account)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
     from app.services.websocket_client import websocket_client
     await websocket_client.stop_account(account_id)
-    
-    await account_service.delete_account(account)
-    return ApiResponse(success=True, message="账号已删除")
+    return ApiResponse(success=True, message="账号已删除，业务历史保留")
 
 
 @router.get("/stats", response_model=ApiResponse)
@@ -1024,6 +1023,7 @@ async def export_accounts(
 
 @router.post("/import")
 async def import_accounts(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(..., description="Excel文件"),
     enable_all: bool = Form(default=False, description="是否全部启用"),
     current_user: User = Depends(deps.get_current_active_user),
@@ -1035,123 +1035,233 @@ async def import_accounts(
     - enable_all=false：按Excel中的状态导入（启用的启用，禁用的仅入库）
     - enable_all=true：所有账号强制启用并启动WebSocket任务
     """
-    from app.services.account_import_service import AccountImportService
+    from app.services.account_import_service import AccountImportService, MAX_IMPORT_BYTES
 
     if not file.filename or not file.filename.endswith(".xlsx"):
         return ApiResponse(success=False, message="请上传 .xlsx 格式的Excel文件")
 
     try:
-        content = await file.read()
+        content = await file.read(MAX_IMPORT_BYTES + 1)
     except Exception as exc:
-        return ApiResponse(success=False, message=f"读取文件失败: {str(exc)}")
+        return ApiResponse(success=False, message="读取文件失败")
 
     import_service = AccountImportService(session, current_user.id)
     result = await import_service.import_accounts(content, enable_all=enable_all)
+    from app.services.account_jobs import run_cookie_import
+    for account_id, job_id, candidate in import_service.pending_credential_jobs:
+        background_tasks.add_task(run_cookie_import, account_id, current_user.id, job_id, candidate)
     return result
 
 
-@router.post("/renew-login")
+@router.post('/renew-login')
 async def renew_account_login(
     account_ids: list[str],
     current_user: User = Depends(deps.get_current_active_user),
+    account_service: AccountService = Depends(deps.get_account_service),
 ) -> ApiResponse:
-    """批量账号续期（调用 silentHasLogin.do + setLoginSettings.do 续期Cookie）
-
-    通过共通服务同时调用两个续期接口，将返回的 Set-Cookie 增量合并到账号现有 cookie 中。
-
-    Args:
-        account_ids: 账号ID列表（account_id 字符串，支持批量）
-    """
-    from common.db.session import async_session_maker
-    from common.services.cookie_renew_api_service import cookie_renew_api_service
-    from sqlalchemy import select
-
-    owner_id, is_admin = resolve_owner_scope(current_user)
-
+    """Submit renewal to the sole executor; never enable or overwrite locally."""
+    from common.services.account_renewal import AccountRenewalClient
+    from app.core.config import get_settings
+    settings = get_settings()
+    client = AccountRenewalClient(settings.websocket_service_url, settings.internal_api_token, timeout=120)
     results = []
-    success_count = 0
-    failed_count = 0
+    for account_id in dict.fromkeys(account_ids):
+        try:
+            account = await _get_account_or_404(current_user,account_id,account_service)
+            if account.status != 'active':
+                result = {'status':'skipped','reason':'account_disabled'}
+            else:
+                result = await client.renew(account)
+            results.append({'account_id':account_id,'success':result['status']=='verified',**result})
+        except HTTPException:
+            results.append({'account_id':account_id,'success':False,'status':'failed','reason':'account_not_found'})
+    counts = {status:sum(r['status']==status for r in results) for status in ('verified','failed','skipped','unknown')}
+    return ApiResponse(success=True,message='续期检查结束，详见逐账号结果',data={
+        'results':results,'success_count':counts['verified'],'failed_count':counts['failed'],
+        'skipped_count':counts['skipped'],'unknown_count':counts['unknown']})
 
-    async with async_session_maker() as session:
-        for account_id in account_ids:
-            try:
-                # 获取账号信息（通过 account_id 字符串）
-                stmt = select(XYAccount).where(XYAccount.account_id == account_id)
-                if owner_id is not None:
-                    stmt = stmt.where(XYAccount.owner_id == owner_id)
-                result = await session.execute(stmt)
-                account = result.scalars().first()
 
-                if not account:
-                    results.append({"account_id": account_id, "success": False, "message": "账号不存在"})
-                    failed_count += 1
-                    continue
+@router.get('/{account_id}/runtime', response_model=ApiResponse)
+async def account_runtime_status(
+    account_id: str,
+    current_user: User = Depends(deps.get_current_active_user),
+    account_service: AccountService = Depends(deps.get_account_service),
+):
+    from common.services import account_policy as policy
+    account = await _get_account_or_404(current_user, account_id, account_service)
+    account = await account_service._lock_account(account)
+    for job_id in list(policy.snapshot(account)['jobs']):
+        policy.get_job(account, job_id, owner_id=account.owner_id)
+    await account_service.session.commit()
+    state = policy.snapshot(account)
+    # 返回有限状态字段；metadata 里的业务配置及任务内部数据不整体暴露。
+    fields = ('business_state','reason','connection_state','last_success_at','next_retry_at',
+              'credential_version','config_version','generation','recovery_attempts','consumers')
+    return ApiResponse(success=True, data={
+        **{key: state.get(key) for key in fields},
+        'enabled': account.status == 'active',
+        'pending_consumers': policy.pending_consumers(account),
+        'has_password': bool(account.login_password),
+        'has_cookie': bool(account.cookie),
+        'jobs': [{k: job.get(k) for k in ('id','kind','status','expires_at','reason')}
+                 for job in state['jobs'].values()],
+    })
 
-                cookies_str = account.cookie or ""
-                if not cookies_str.strip():
-                    results.append({"account_id": account_id, "success": False, "message": "账号Cookie为空"})
-                    failed_count += 1
-                    continue
 
-                # 调用共通服务执行接口续期
-                renew_result = await cookie_renew_api_service.renew(cookies_str, account_id)
+@router.post('/{account_id}/credential-jobs', response_model=ApiResponse, status_code=202)
+async def import_account_credentials(
+    account_id: str, payload: AccountCookieUpdate,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(deps.get_current_active_user),
+    account_service: AccountService = Depends(deps.get_account_service),
+):
+    from common.services import account_policy as policy
+    from app.services.account_jobs import run_cookie_import
+    account = await _get_account_or_404(current_user, account_id, account_service)
+    account = await account_service._lock_account(account)
+    if payload.expected_version is not None and payload.expected_version != policy.snapshot(account)['credential_version']:
+        raise HTTPException(409, '凭据已更新，请刷新页面')
+    if policy._secret(payload.value) is None:
+        raise HTTPException(422, '请输入新的 Cookie')
+    job = await account_service.start_credential_job(account, 'cookie_import', account.owner_id)
+    if job['created']:
+        background_tasks.add_task(run_cookie_import, account.account_id, account.owner_id, job['id'], payload.value)
+    return ApiResponse(success=True, message='凭据检查已排队，提交不代表验证成功', data=job)
 
-                # 不管续期是否成功，只要有Cookie字段更新就先写入数据库
-                if renew_result.updated_cookie_names and renew_result.new_cookies_str != cookies_str:
-                    account.cookie = renew_result.new_cookies_str
-                    await session.commit()
 
-                if not renew_result.success:
-                    results.append({
-                        "account_id": account_id,
-                        "account_name": account.account_id,
-                        "success": False,
-                        "message": renew_result.api_message or "续期接口未返回有效Cookie",
-                    })
-                    failed_count += 1
-                    continue
+@router.get('/{account_id}/credential-jobs/{job_id}', response_model=ApiResponse)
+async def get_account_credential_job(
+    account_id: str, job_id: str,
+    current_user: User = Depends(deps.get_current_active_user),
+    account_service: AccountService = Depends(deps.get_account_service),
+):
+    account = await _get_account_or_404(current_user, account_id, account_service)
+    try:
+        job = await account_service.get_credential_job(account, job_id, account.owner_id)
+    except PermissionError:
+        raise HTTPException(404, '账号任务不存在')
+    return ApiResponse(success=True, data=job)
 
-                # 续期成功，自动启用账号
-                if account.status != "active":
-                    account.status = "active"
-                    account.disable_reason = None
-                    await session.commit()
 
-                # 通知 WebSocket 服务启动/重启账号任务
-                try:
-                    from app.services.websocket_client import websocket_client
-                    await websocket_client.start_account(account.account_id, renew_result.new_cookies_str or cookies_str, account.owner_id)
-                except Exception as ws_e:
-                    from loguru import logger
-                    logger.warning(f"账号 {account.account_id} 续期成功但启动WebSocket任务失败: {ws_e}")
+@router.delete('/{account_id}/credential-jobs/{job_id}', response_model=ApiResponse)
+async def cancel_account_credential_job(
+    account_id: str, job_id: str,
+    current_user: User = Depends(deps.get_current_active_user),
+    account_service: AccountService = Depends(deps.get_account_service),
+):
+    account = await _get_account_or_404(current_user, account_id, account_service)
+    try:
+        job = await account_service.cancel_credential_job(account, job_id, account.owner_id)
+    except PermissionError:
+        raise HTTPException(404, '账号任务不存在')
+    return ApiResponse(success=True, message='任务已结束；迟到结果将被丢弃', data=job)
 
-                if renew_result.updated_cookie_names:
-                    results.append({
-                        "account_id": account_id,
-                        "account_name": account.account_id,
-                        "success": True,
-                        "message": f"续期成功，更新了 {len(renew_result.updated_cookie_names)} 个字段：{', '.join(renew_result.updated_cookie_names)}",
-                    })
-                else:
-                    results.append({
-                        "account_id": account_id,
-                        "account_name": account.account_id,
-                        "success": True,
-                        "message": "续期成功，Cookie无变化",
-                    })
-                success_count += 1
 
-            except Exception as e:
-                await session.rollback()
-                results.append({
-                    "account_id": account_id,
-                    "success": False,
-                    "message": f"续期异常: {str(e)}",
-                })
-                failed_count += 1
+@router.get('/{account_id}/delete-preview', response_model=ApiResponse)
+async def preview_account_deletion(
+    account_id: str,
+    current_user: User = Depends(deps.get_current_active_user),
+    account_service: AccountService = Depends(deps.get_account_service),
+):
+    account = await _get_account_or_404(current_user, account_id, account_service)
+    return ApiResponse(success=True, data=await account_service.delete_preview(account))
 
-    return ApiResponse(
-        success=True,
-        message=f"批量续期完成：成功 {success_count} 个，失败 {failed_count} 个",
-        data={"results": results, "success_count": success_count, "failed_count": failed_count},
-    )
+
+from common.services.account_configuration import RequestPolicyUpdate, request_policy_view
+
+
+@router.get('/{account_id}/request-policy', response_model=ApiResponse)
+async def get_account_request_policy(
+    account_id: str,
+    current_user: User = Depends(deps.get_current_active_user),
+    account_service: AccountService = Depends(deps.get_account_service),
+):
+    account = await _get_account_or_404(current_user, account_id, account_service)
+    return ApiResponse(success=True, data=request_policy_view(account))
+
+
+@router.put('/{account_id}/request-policy', response_model=ApiResponse)
+async def save_account_request_policy(
+    account_id: str, payload: RequestPolicyUpdate,
+    current_user: User = Depends(deps.get_current_active_user),
+    account_service: AccountService = Depends(deps.get_account_service),
+):
+    from common.services.account_policy import StaleAccountOperation
+    account = await _get_account_or_404(current_user, account_id, account_service)
+    try:
+        result = await account_service.save_request_policy(account, payload)
+    except StaleAccountOperation:
+        raise HTTPException(409, '配置已更新，请刷新后保存')
+    return ApiResponse(success=True, message='频率已保存；待各服务应用', data=result)
+
+
+from common.services.account_configuration import (
+    ConfigurationApplyRequest, ConfigurationVersion, ConfigurationStore, ConfigurationClient, ConfigurationError,
+)
+
+
+@router.post('/{account_id}/configuration/reload', response_model=ApiResponse)
+async def reload_account_configuration(
+    account_id: str, payload: ConfigurationVersion,
+    current_user: User = Depends(deps.get_current_active_user),
+    account_service: AccountService = Depends(deps.get_account_service),
+):
+    from common.services import account_policy
+    from app.core.config import get_settings
+    account = await _get_account_or_404(current_user, account_id, account_service)
+    account = await account_service._lock_account(account)
+    state = account_policy.snapshot(account)
+    if state['config_version'] != payload.config_version:
+        raise HTTPException(409, '配置已更新，请刷新后应用')
+    account_policy.ack_config(account, 'web', payload.config_version)
+    pending = account_policy.pending_consumers(account)
+    await account_service.session.commit()
+    settings = get_settings()
+    client = ConfigurationClient({'websocket': settings.websocket_service_url,
+                                   'scheduler': settings.scheduler_service_url}, settings.internal_api_token)
+    results = await client.apply(ConfigurationApplyRequest(owner_id=account.owner_id,
+        account_id=account_id, config_version=payload.config_version), pending)
+    account = await account_service._lock_account(account)
+    if account_policy.snapshot(account)['config_version'] != payload.config_version:
+        await account_service.session.rollback()
+        raise HTTPException(409, '应用期间配置已更新，请重新加载')
+    pending = account_policy.pending_consumers(account)
+    await account_service.session.commit()
+    return ApiResponse(success=True, message='配置已应用' if not pending else '配置部分应用，稍后补齐',
+        data={'complete':not pending, 'config_version':payload.config_version, 'pending_consumers':pending, 'results':results})
+
+
+from common.services.typed_settings import SettingUpdate, TypedSettings
+
+
+@router.get('/{account_id}/configuration/effective', response_model=ApiResponse)
+async def read_typed_configuration(
+    account_id: str,
+    current_user: User = Depends(deps.get_current_active_user),
+    account_service: AccountService = Depends(deps.get_account_service),
+):
+    account = await _get_account_or_404(current_user, account_id, account_service)
+    try:
+        return ApiResponse(success=True, data=await TypedSettings(account_service.session).read(
+            account, current_user.role == 'ADMIN'))
+    except ConfigurationError as exc:
+        raise HTTPException(exc.status, exc.code) from exc
+
+
+@router.put('/{account_id}/configuration/settings', response_model=ApiResponse)
+async def save_typed_configuration(
+    account_id: str, payload: SettingUpdate,
+    current_user: User = Depends(deps.get_current_active_user),
+    account_service: AccountService = Depends(deps.get_account_service),
+):
+    account = await _get_account_or_404(current_user, account_id, account_service)
+    try:
+        data = await TypedSettings(account_service.session).save(account, current_user.id,
+            current_user.role == 'ADMIN', payload)
+    except ConfigurationError as exc:
+        await account_service.session.rollback()
+        raise HTTPException(exc.status, exc.code) from exc
+    except ValueError as exc:
+        await account_service.session.rollback()
+        raise HTTPException(400, '配置类型或范围有误') from exc
+    return ApiResponse(success=True, message='配置已保存；生效来源与待应用服务见下方', data=data)

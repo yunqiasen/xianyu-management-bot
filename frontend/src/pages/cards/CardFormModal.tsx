@@ -49,6 +49,8 @@ interface CardFormData {
   apiHeaders: string
   apiParams: string
   apiResponseField: string
+  apiIdempotencyHeader: string
+  apiQueryUrl: string
   textContent: string
   dataContent: string
   imageUrls: string[]
@@ -93,6 +95,8 @@ export function cardToFormData(card: CardData): CardFormData {
     apiHeaders: card.api_config?.headers || '',
     apiParams: card.api_config?.params || '',
     apiResponseField: card.api_config?.response_field || '',
+    apiIdempotencyHeader: card.api_config?.idempotency_header || '',
+    apiQueryUrl: card.api_config?.query_url || '',
     textContent: card.text_content || '',
     dataContent: card.data_content || '',
     imageUrls: imageUrlsList,
@@ -127,6 +131,8 @@ export const emptyCardFormData: CardFormData = {
   apiHeaders: '',
   apiParams: '',
   apiResponseField: '',
+  apiIdempotencyHeader: '',
+  apiQueryUrl: '',
   textContent: '',
   dataContent: '',
   imageUrls: [],
@@ -301,6 +307,8 @@ export function CardFormModal({ cardId, initialData, onClose, onSaved }: CardFor
           headers: formData.apiHeaders.trim() || undefined,
           params: formData.apiParams.trim() || undefined,
           response_field: formData.apiResponseField.trim() || undefined,
+          idempotency_header: formData.apiIdempotencyHeader.trim() || undefined,
+          query_url: formData.apiQueryUrl.trim() || undefined,
         }
       } else if (formData.type === 'text') {
         cardData.text_content = formData.textContent.trim()
@@ -436,6 +444,11 @@ export function CardFormModal({ cardId, initialData, onClose, onSaved }: CardFor
                   )}
                 </div>
                 <div>
+                  <label className="input-label">采购结果查询地址（GET，选填）</label>
+                  <input className="input-ios mb-2" value={formData.apiQueryUrl} onChange={e => updateField('apiQueryUrl', e.target.value)} placeholder="https://供应商/订单查询" />
+                  <label className="input-label">供应商幂等请求头（支持时填写）</label>
+                  <input className="input-ios mb-2" value={formData.apiIdempotencyHeader} onChange={e => updateField('apiIdempotencyHeader', e.target.value)} placeholder="Idempotency-Key" />
+                  <p className="text-xs text-slate-500 mb-3">同一履约使用固定请求身份；采购超时保留待核实，不自动重复购买。</p>
                   <label className="input-label">响应取值字段（选填）</label>
                   <input
                     type="text"

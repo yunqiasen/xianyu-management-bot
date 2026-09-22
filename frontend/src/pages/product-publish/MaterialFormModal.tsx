@@ -30,18 +30,18 @@ interface Props {
 
 const createInternalSpecifications = (specifications: PublishSpecification[] = []): ProductSpecification[] => specifications.map((spec, specIndex) => ({
   id: `spec-${specIndex}-${Date.now()}`,
-  name: spec.name,
+  name: spec.name, source_id: spec.source_id,
   supportImage: Boolean(spec.support_image),
   values: (spec.values || []).map((value, valueIndex) => ({
     id: `value-${specIndex}-${valueIndex}-${Date.now()}`,
-    name: value.name,
+    name: value.name, source_id: value.source_id,
     image: value.image || null,
   })),
 }))
 
 const createInternalSkuRows = (rows: PublishSkuRow[] = [], specifications: ProductSpecification[] = []): SkuRow[] => rows.map((row) => ({
   key: buildSkuKey(specifications, row.specs || {}),
-  specs: row.specs || {},
+  specs: row.specs || {}, source_id: row.source_id,
   price: String(row.price ?? ''),
   stock: row.stock == null ? '' : String(row.stock),
 }))
@@ -114,11 +114,11 @@ function toMaterialPayload(form: MaterialFormState): MaterialCreateParams {
     images: form.images,
     videos: form.videos,
     specifications: form.specifications.map((spec) => ({
-      name: spec.name,
+      name: spec.name, source_id: spec.source_id,
       support_image: spec.supportImage,
-      values: spec.values.map((value) => ({ name: value.name, image: value.image || undefined })),
+      values: spec.values.map((value) => ({ name: value.name, source_id: value.source_id, image: value.image || undefined })),
     })),
-    sku_rows: form.sku_rows.map((row) => ({ specs: row.specs, price: Number(row.price), stock: Number(row.stock) || 0 })),
+    sku_rows: form.sku_rows.map((row) => ({ specs: row.specs, source_id: row.source_id, price: Number(row.price), stock: Number(row.stock) || 0 })),
     quantity: form.quantity,
     delivery_method: form.delivery_method,
     shipping_method: form.shipping_method,

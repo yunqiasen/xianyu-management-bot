@@ -57,6 +57,7 @@ class QRLoginSession:
 
     def __init__(self, session_id: str):
         self.session_id = session_id
+        self.proxy: Optional[str] = None
         self.status = "waiting"  # waiting, scanned, success, expired, cancelled, verification_required
         self.qr_code_url: Optional[str] = None
         self.qr_content: Optional[str] = None
@@ -114,7 +115,7 @@ class QRLoginManager:
         app_key = "34839810"
 
         async with httpx.AsyncClient(
-            timeout=self.timeout, follow_redirects=True, proxy=self.proxy
+            timeout=self.timeout, follow_redirects=True, proxy=session.proxy, trust_env=False
         ) as client:
             try:
                 resp = await client.get(self.api_h5_tk, headers=self.headers)
@@ -174,7 +175,7 @@ class QRLoginManager:
         }
 
         async with httpx.AsyncClient(
-            follow_redirects=True, timeout=self.timeout, proxy=self.proxy
+            follow_redirects=True, timeout=self.timeout, proxy=session.proxy, trust_env=False
         ) as client:
             try:
                 resp = await client.get(
@@ -208,11 +209,12 @@ class QRLoginManager:
                 logger.error("获取登录参数时连接错误")
                 raise
 
-    async def generate_qr_code(self) -> Dict[str, Any]:
+    async def generate_qr_code(self, proxy: Optional[str] = None) -> Dict[str, Any]:
         """生成二维码"""
         try:
             session_id = str(uuid.uuid4())
             session = QRLoginSession(session_id)
+            session.proxy = proxy
 
             await self._get_mh5tk(session)
             logger.info(f"获取m_h5_tk成功: {session_id}")
@@ -221,7 +223,7 @@ class QRLoginManager:
             logger.info(f"获取登录参数成功: {session_id}")
 
             async with httpx.AsyncClient(
-                follow_redirects=True, timeout=self.timeout, proxy=self.proxy
+                follow_redirects=True, timeout=self.timeout, proxy=session.proxy, trust_env=False
             ) as client:
                 resp = await client.get(
                     self.api_generate_qr, params=session.params, headers=self.headers
@@ -290,7 +292,7 @@ class QRLoginManager:
     async def _poll_qrcode_status(self, session: QRLoginSession) -> httpx.Response:
         """获取二维码扫描状态"""
         async with httpx.AsyncClient(
-            follow_redirects=True, timeout=self.timeout, proxy=self.proxy
+            follow_redirects=True, timeout=self.timeout, proxy=session.proxy, trust_env=False
         ) as client:
             resp = await client.post(
                 self.api_scan_status,

@@ -342,14 +342,14 @@ async def upload_card_image(
     try:
         _, filename, _ = await save_uploaded_image(
             image,
-            CARD_UPLOAD_DIR,
+            CARD_UPLOAD_DIR / str(current_user.id),
             filename_prefix=str(current_user.id),
         )
     except ImageUploadError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.message)
 
     # 返回相对URL路径
-    image_url = f"/static/uploads/cards/{filename}"
+    image_url = f"/static/uploads/cards/{current_user.id}/{filename}"
     return {"success": True, "image_url": image_url}
 
 

@@ -371,7 +371,13 @@ class DashboardStatsService:
     async def get_admin_today_stats(self) -> dict[str, int | float]:
         """获取管理员今日统计。"""
         bundle = await self._get_admin_dashboard_bundle()
-        today_stats = bundle["today_stats"]
+        today_stats = dict(bundle["today_stats"])
+        start=self._build_today_start()
+        report=await self.operating_summary(None,start.isoformat(),(start+timedelta(days=1)).isoformat())
+        today_stats['today_orders']=report['summary']['count']
+        today_stats['today_amount']=float(report['summary']['net'])
+        today_stats['today_shipped']=sum(r['status'] in self.SHIPPED_ORDER_STATUSES for r in report['details'])
+        today_stats['today_pending']=sum(r['status'] not in (*self.SHIPPED_ORDER_STATUSES,*self.CLOSED_ORDER_STATUSES) for r in report['details'])
 
         return {
             "today_users": int(today_stats["today_users"]),
@@ -383,44 +389,18 @@ class DashboardStatsService:
             "today_agent_orders": int(today_stats["today_agent_orders"]),
         }
 
-    async def get_order_amount_trend(self, *, owner_id: int | None, days: int = 30) -> list[dict[str, int | float | str]]:
-        """获取近N天订单金额趋势。"""
-        start_date = self._build_today_start() - timedelta(days=days - 1)
+    async def get_order_amount_trend(self, *, owner_id: int | None, days: int = 30):
+        days=max(1,min(days,366))
+        start=self._build_today_start()-timedelta(days=days-1)
+        end=self._build_today_start()+timedelta(days=1)
+        report=await self.operating_summary(owner_id,start.isoformat(),end.isoformat())
+        amounts={r['date']:r for r in report['trend']}
+        result=[]
+        for n in range(days):
+            day=start+timedelta(days=n); row=amounts.get(day.date().isoformat(),{})
+            result.append({'date':day.strftime('%m-%d'),'amount':float(row.get('net',0)),'count':row.get('count',0),'paid':float(row.get('paid',0)),'refund':float(row.get('refund',0))})
+        return result
 
-        # 只按真实下单时间(placed_at)统计趋势，不对 created_at 做回退，
-        # 避免同步历史订单时 created_at=今天被误算到今日曲线
-        placed_stmt = (
-            select(
-                func.date(XYOrder.placed_at).label("order_date"),
-                func.coalesce(func.sum(XYOrder.amount), 0).label("daily_amount"),
-                func.count().label("daily_count"),
-            )
-            .select_from(XYOrder)
-            .where(
-                XYOrder.placed_at >= start_date,
-                XYOrder.status.notin_(self.CLOSED_ORDER_STATUSES),
-            )
-            .group_by(func.date(XYOrder.placed_at))
-            .order_by(func.date(XYOrder.placed_at))
-        )
-        if owner_id is not None:
-            placed_stmt = placed_stmt.where(XYOrder.owner_id == owner_id)
-
-        placed_rows = (await self.session.execute(placed_stmt)).all()
-
-        amount_map: dict[str, float] = {}
-        count_map: dict[str, int] = {}
-        self._merge_trend_rows(placed_rows, amount_map, count_map)
-
-        trend_data: list[dict[str, int | float | str]] = []
-        for index in range(days):
-            current_day = start_date + timedelta(days=index)
-            date_key = current_day.strftime("%m-%d")
-            trend_data.append(
-                {
-                    "date": date_key,
-                    "amount": round(amount_map.get(date_key, 0), 2),
-                    "count": count_map.get(date_key, 0),
-                }
-            )
-        return trend_data
+    async def operating_summary(self, owner_id: int, start: str, end: str, timezone: str = 'Asia/Shanghai'):
+        from app.services.operating_summary_service import operating_summary
+        return await operating_summary(self.session, owner_id, start, end, timezone)

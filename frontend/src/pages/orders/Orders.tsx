@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { motion } from 'framer-motion'
 import { ShoppingCart, RefreshCw, Search, Trash2, Eye, X, Send, Loader2, Settings, Filter, Ban } from 'lucide-react'
-import { fetchXianyuOrders, getOrders, deleteOrder, batchDeleteOrders, getOrderDetail, manualDelivery, type OrderDetail, type OrderFilterParams } from '@/api/orders'
+import { getOrders, deleteOrder, batchDeleteOrders, getOrderDetail, manualDelivery, type OrderDetail, type OrderFilterParams } from '@/api/orders'
 import { getAccountDetails } from '@/api/accounts'
 import { useUIStore } from '@/store/uiStore'
 import { useAuthStore } from '@/store/authStore'
@@ -9,6 +9,8 @@ import { PageLoading } from '@/components/common/Loading'
 import { Select } from '@/components/common/Select'
 import { ConfirmModal } from '@/components/common/ConfirmModal'
 import { BlacklistLevelModal } from './BlacklistLevelModal'
+import { CommercePanel } from './CommercePanel'
+import { createHistoryJob, historyAction } from '@/api/orderCommerce'
 import type { Order, Account } from '@/types'
 
 // 列配置类型
@@ -80,6 +82,7 @@ export function Orders() {
   const [totalPages, setTotalPages] = useState(0)
   const [ordersLoading, setOrdersLoading] = useState(false)
   const [fetchingXianyuOrders, setFetchingXianyuOrders] = useState(false)
+  const [commerceRevision, setCommerceRevision] = useState(0)
   
   // 筛选状态
   const [filters, setFilters] = useState<OrderFilterParams>({
@@ -98,7 +101,7 @@ export function Orders() {
   // 确认弹窗状态
   const [deleteConfirm, setDeleteConfirm] = useState<{ open: boolean; id: string | null }>({ open: false, id: null })
   const [batchDeleteConfirm, setBatchDeleteConfirm] = useState(false)
-  const [deliveryConfirm, setDeliveryConfirm] = useState<{ open: boolean; orderNo: string | null }>({ open: false, orderNo: null })
+  const [deliveryConfirm, setDeliveryConfirm] = useState<{ open: boolean; orderNo: string | null; accountId?: string }>({ open: false, orderNo: null })
   const [deleting, setDeleting] = useState(false)
 
   // 筛选面板展开状态
@@ -242,11 +245,11 @@ export function Orders() {
     }
   }
 
-  const handleShowDetail = async (orderNo: string) => {
+  const handleShowDetail = async (orderNo: string, accountId?: string) => {
     setLoadingDetail(true)
     setDetailModalOpen(true)
     try {
-      const result = await getOrderDetail(orderNo)
+      const result = await getOrderDetail(orderNo, false, accountId)
       if (result.success) {
         setOrderDetail(result.data)
       } else {
@@ -261,13 +264,13 @@ export function Orders() {
     }
   }
 
-  const handleManualDelivery = async (orderNo: string) => {
+  const handleManualDelivery = async (orderNo: string, accountId?: string) => {
     setDeliveringOrderId(orderNo)
     setDeliveryConfirm({ open: false, orderNo: null })
     try {
-      const result = await manualDelivery(orderNo)
+      const result = await manualDelivery(orderNo, accountId)
       if (result.success) {
-        addToast({ type: 'success', message: `发货成功: ${result.data?.card_name || ''}` })
+        addToast({ type: 'success', message: result.message || '履约阶段已保存，请查看阶段面板' })
       } else {
         addToast({ type: 'error', message: result.message || '发货失败' })
       }
@@ -289,20 +292,11 @@ export function Orders() {
     }
     setFetchingXianyuOrders(true)
     try {
-      const result = await fetchXianyuOrders(selectedAccount || undefined)
-      if (result.success) {
-        const syncData = result.data
-        addToast({
-          type: 'success',
-          message: result.message || `同步完成：获取${syncData?.total_fetched || 0}条，新增${syncData?.new_inserted || 0}条，更新${syncData?.updated || 0}条`,
-        })
-        if (syncData?.errors?.length) {
-          addToast({ type: 'error', message: `部分账号同步失败：${syncData.errors.slice(0, 2).join('；')}` })
-        }
-        loadOrders(1, pageSize, filters)
-      } else {
-        addToast({ type: 'error', message: result.message || '获取闲鱼订单失败' })
-      }
+      const created = await createHistoryJob(selectedAccount)
+      await historyAction(created.data.id, 'step')
+      setCommerceRevision(value => value + 1)
+      addToast({ type: 'success', message: '历史检查点已保存；可在续跑面板继续或取消' })
+      loadOrders(1, pageSize, filters)
     } catch (error: unknown) {
       const axiosError = error as { response?: { data?: { detail?: string } } }
       const errorMessage = axiosError.response?.data?.detail || '获取闲鱼订单失败'
@@ -385,6 +379,8 @@ export function Orders() {
           </button>
         </div>
       </div>
+
+      <CommercePanel account={selectedAccount} revision={commerceRevision} />
 
       {/* Orders List：筛选 + 表格 + 分页合卡，参照账号管理布局 */}
       <motion.div
@@ -841,14 +837,14 @@ export function Orders() {
                       <td className="whitespace-nowrap sticky right-0 bg-white dark:bg-slate-900 z-10">
                         <div className="flex items-center gap-1">
                           <button
-                            onClick={() => handleShowDetail(order.order_id)}
+                            onClick={() => handleShowDetail(order.order_id, order.cookie_id)}
                             className="p-2 rounded-lg hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-colors"
                             title="查看详情"
                           >
                             <Eye className="w-4 h-4 text-blue-500" />
                           </button>
                           <button
-                            onClick={() => setDeliveryConfirm({ open: true, orderNo: order.order_id })}
+                            onClick={() => setDeliveryConfirm({ open: true, orderNo: order.order_id, accountId: order.cookie_id })}
                             disabled={deliveringOrderId === order.order_id || order.status === 'shipped' || order.status === 'completed' || order.card_only_delivered}
                             className={`p-2 rounded-lg transition-colors ${
                               order.status === 'shipped' || order.status === 'completed' || order.card_only_delivered
@@ -1195,7 +1191,7 @@ export function Orders() {
         confirmText="确定发货"
         cancelText="取消"
         type="warning"
-        onConfirm={() => deliveryConfirm.orderNo && handleManualDelivery(deliveryConfirm.orderNo)}
+        onConfirm={() => deliveryConfirm.orderNo && handleManualDelivery(deliveryConfirm.orderNo, deliveryConfirm.accountId)}
         onCancel={() => setDeliveryConfirm({ open: false, orderNo: null })}
       />
 

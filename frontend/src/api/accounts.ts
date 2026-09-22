@@ -408,6 +408,7 @@ export const checkQRLoginStatus = async (sessionId: string): Promise<{
 
 // 检查密码登录状态
 export const checkPasswordLoginStatus = async (sessionId: string): Promise<{
+  verification_session?: boolean
   success: boolean
   status: 'pending' | 'processing' | 'success' | 'failed' | 'verification_required' | 'not_found'
   message?: string
@@ -421,6 +422,7 @@ export const checkPasswordLoginStatus = async (sessionId: string): Promise<{
   error?: string
 }> => {
   const result = await get<{
+    verification_session?: boolean
     status: string
     message?: string
     account_id?: string
@@ -432,6 +434,7 @@ export const checkPasswordLoginStatus = async (sessionId: string): Promise<{
     error?: string
   }>(`${PASSWORD_LOGIN_PREFIX}/check/${sessionId}`)
   return {
+    verification_session: result.verification_session,
     success: result.status === 'success',
     status: result.status as 'pending' | 'processing' | 'success' | 'failed' | 'verification_required' | 'not_found',
     message: result.message,

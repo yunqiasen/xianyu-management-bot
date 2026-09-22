@@ -321,7 +321,7 @@ async def list_platform_blacklist(
     service: BlacklistService = Depends(get_blacklist_service),
 ):
     """获取闲鱼黑名单列表"""
-    items, total = await service.list_platform(page=page, page_size=page_size)
+    items, total = await service.list_platform(owner_id=current_user.id, page=page, page_size=page_size)
 
     return {
         "success": True,

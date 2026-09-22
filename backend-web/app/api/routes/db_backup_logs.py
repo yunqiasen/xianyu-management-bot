@@ -8,7 +8,10 @@
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request, HTTPException
+from pydantic import BaseModel, ConfigDict
+from sqlalchemy import select, or_
+from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi.responses import StreamingResponse
 from urllib.parse import quote
 
@@ -84,3 +87,54 @@ async def download_db_backup_file(
         media_type="application/gzip",
         headers={"Content-Disposition": disposition},
     )
+
+class BackupProtectionUpdate(BaseModel):
+    model_config = ConfigDict(strict=True, extra='forbid')
+    protected: bool
+
+
+@router.post('/db-backup-logs/{log_id}/verify')
+async def verify_backup(
+    log_id: int, request: Request, restore: bool = False,
+    user: User = Depends(deps.get_current_admin_user),
+    session: AsyncSession = Depends(deps.get_db_session),
+):
+    from app.services.backup_verification_service import BackupVerificationService
+    engine = getattr(request.app.state, 'admin_restore_engine', None) if restore else None
+    if restore and engine is None:
+        raise HTTPException(409, '隔离MySQL尚未配置；校验不等于恢复成功')
+    try:
+        return {'success': True, 'data': await BackupVerificationService(session).verify(log_id, user.id, engine)}
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
+
+
+@router.get('/db-backup-logs/{log_id}/verifications')
+async def list_backup_verifications(
+    log_id: int, _: User = Depends(deps.get_current_admin_user),
+    session: AsyncSession = Depends(deps.get_db_session),
+):
+    from common.models.admin_control import BackupVerification
+    from app.services.backup_verification_service import verification_view
+    recent = list(await session.scalars(select(BackupVerification.id).where(
+        BackupVerification.backup_log_id == log_id).order_by(BackupVerification.created_at.desc()).limit(20)))
+    rows = await session.scalars(select(BackupVerification).where(
+        BackupVerification.backup_log_id == log_id,
+        or_(BackupVerification.id.in_(recent), BackupVerification.protected.is_(True)))
+        .order_by(BackupVerification.created_at.desc()))
+    return {'success': True, 'data': [verification_view(row) for row in rows]}
+
+
+@router.put('/db-backup-logs/{log_id}/verifications/{verification_id}/protection')
+async def set_backup_protection(
+    log_id: int, verification_id: str, payload: BackupProtectionUpdate,
+    user: User = Depends(deps.get_current_admin_user),
+    session: AsyncSession = Depends(deps.get_db_session),
+):
+    from app.services.backup_verification_service import BackupVerificationService, BackupProtectionError
+    try:
+        data = await BackupVerificationService(session).set_protection(
+            log_id, verification_id, user.id, payload.protected)
+        return {'success': True, 'data': data}
+    except BackupProtectionError as exc:
+        raise HTTPException(exc.status, str(exc)) from None

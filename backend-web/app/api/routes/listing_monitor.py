@@ -40,7 +40,7 @@ class ListingMonitorCreateRequest(BaseModel):
     price_min: Optional[float] = Field(None, ge=0, description="商品价格区间最低值")
     price_max: Optional[float] = Field(None, ge=0, description="商品价格区间最高值")
     publish_days: Optional[int] = Field(None, ge=1, le=365, description="上新天数筛选（publishDays，单位天，留空=不限）")
-    interval_minutes: int = Field(..., ge=1, description="任务执行间隔（分钟）")
+    interval_minutes: int = Field(5, ge=1, description="任务执行间隔（分钟）")
     collect_pages: int = Field(1, ge=1, description="每次采集页数")
     proxy_url: Optional[str] = Field(None, max_length=255, description="代理API地址（GET返回IP:PORT列表，空=不使用代理）")
     account_ids: List[str] = Field(default_factory=list, description="采集账号ID列表（多选，非必填；不可用时回退兜底）")
@@ -49,7 +49,7 @@ class ListingMonitorCreateRequest(BaseModel):
     dm_batch_size: int = Field(5, ge=1, le=100, description="每次定时私信任务最多处理条数")
     order_batch_size: int = Field(5, ge=1, le=100, description="每次定时下单任务最多处理条数")
     direct_order: bool = Field(False, description="采集后是否直接下单（开启则新采集商品立即用下单账号下单后再入库）")
-    is_enabled: bool = Field(True, description="是否启用")
+    is_enabled: bool = Field(False, description="是否启用")
     remark: Optional[str] = Field(None, max_length=500, description="备注")
 
 
@@ -253,7 +253,10 @@ async def update_listing_monitor_task_status(
     """启用/停用上新监控任务"""
     owner_id, _ = resolve_owner_scope(current_user)
     svc = ListingMonitorService(session)
-    updated = await svc.update_status(owner_id, task_id, req.is_enabled)
+    try:
+        updated = await svc.update_status(owner_id, task_id, req.is_enabled)
+    except ValueError as exc:
+        return ApiResponse(success=False, message=str(exc))
     if not updated:
         return ApiResponse(success=False, message="监控任务不存在")
     return ApiResponse(success=True, message="监控任务状态更新成功", data={"task": _task_to_dict(updated)})
@@ -518,3 +521,40 @@ async def get_listing_monitor_item(
     if not data:
         return ApiResponse(success=False, message="采集商品不存在")
     return ApiResponse(success=True, message="查询成功", data={"item": data})
+
+
+class ListingMonitorReliabilityRequest(BaseModel):
+    region: str = Field("", max_length=120, description="地区包含匹配；更改后重新建立完整基线")
+
+
+@router.get("/{task_id}/reliability", response_model=ApiResponse)
+async def get_listing_monitor_reliability(
+    task_id: int,
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    from app.services.listing_monitor_reliability import reliability_status
+    owner_id, _ = resolve_owner_scope(current_user)
+    task = (await ListingMonitorService(session).get(owner_id, task_id))
+    if not task:
+        return ApiResponse(success=False, message="监控任务不存在")
+    return ApiResponse(success=True, data=await reliability_status(session, task_id))
+
+
+@router.put("/{task_id}/reliability", response_model=ApiResponse)
+async def configure_listing_monitor_reliability(
+    task_id: int, req: ListingMonitorReliabilityRequest,
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    from common.services import listing_monitor_reliability as monitor
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    owner_id, _ = resolve_owner_scope(current_user)
+    task = await ListingMonitorService(session).get(owner_id, task_id)
+    if not task:
+        return ApiResponse(success=False, message="监控任务不存在")
+    if not monitor.monitor_v2_enabled():
+        return ApiResponse(success=False, message="P5候选开关关闭；DEV43覆盖验收门保留")
+    service = monitor.MonitorReliabilityService(async_sessionmaker(session.bind, expire_on_commit=False))
+    await service.configure(task_id, region=req.region)
+    return ApiResponse(success=True, message="地区已保存，下轮重新建立完整基线")

@@ -481,52 +481,19 @@ class CookieTokenManager:
         self._refetch_new_cookies = {}
 
     async def update_config_cookies(self) -> bool:
-        """更新数据库中的 Cookie（不覆盖账号密码等其他字段）。
-
-        Returns:
-            写回成功返回 True，账号缺失、数据库失败或异常返回 False。
-        """
+        from common.services.account_cookie_service import write_account_credentials
+        runtime = getattr(self.parent, '_account_runtime', None)
+        if runtime is None:
+            return False
         try:
-            # 更新数据库中的Cookie
-            if hasattr(self.parent, 'cookie_id') and self.cookie_id:
-                try:
-                    # 获取当前Cookie的用户ID，避免在刷新时改变所有者
-                    current_user_id = None
-                    if hasattr(self.parent, 'user_id') and self.parent.user_id:
-                        current_user_id = self.parent.user_id
-
-                    # 打印要保存的x5sec值
-                    cookies_dict = trans_cookies(self.cookies_str)
-                    logger.warning(f"【{self.cookie_id}】update_config_cookies保存的x5sec: {cookies_dict.get('x5sec', '无')[:80]}...")
-                    
-                    # 使用 update_cookie_account_info 避免覆盖其他字段
-                    success = await update_account_cookies_in_db(
-                        self.cookie_id, 
-                        self.cookies_str,
-                        owner_id=current_user_id,
-                    )
-                    if not success:
-                        logger.warning(f"更新Cookie到数据库失败: {self.cookie_id}")
-                        await self.send_token_refresh_notification(
-                            f"数据库Cookie更新失败: {self.cookie_id}",
-                            "db_update_failed",
-                        )
-                        return False
-                    else:
-                        logger.warning(f"已更新Cookie到数据库: {self.cookie_id}")
-                        return True
-                except Exception as e:
-                    logger.error(f"更新数据库Cookie失败: {self._safe_str(e)}")
-                    await self.send_token_refresh_notification(f"数据库Cookie更新失败: {str(e)}", "db_update_failed")
-                    return False
-            else:
-                logger.warning("Cookie ID不存在，无法更新数据库")
-                await self.send_token_refresh_notification("Cookie ID不存在，无法更新数据库", "cookie_id_missing")
-                return False
-
-        except Exception as e:
-            logger.error(f"更新Cookie失败: {self._safe_str(e)}")
-            await self.send_token_refresh_notification(f"Cookie更新失败: {str(e)}", "cookie_update_failed")
+            await runtime.lease.check()
+            accepted = await write_account_credentials(self.cookie_id, self.parent.user_id,
+                self.cookies_str, expected=(*runtime.version, runtime.generation))
+            if accepted:
+                # 同一执行者自己的续签升级凭据版本；其他版本变化依旧拒绝。
+                runtime.version = (runtime.version[0] + 1, runtime.version[1])
+            return accepted
+        except Exception:
             return False
 
     # ==================== 滑块验证检测 ====================
@@ -1069,711 +1036,89 @@ class CookieTokenManager:
     # ==================== Token刷新核心逻辑 ====================
 
     async def refresh_token(self, captcha_retry_count: int = 0, token_expiry_retry_count: int = 0):
-        """刷新token
-        
-        Args:
-            captcha_retry_count: 滑块验证重试次数，用于防止无限递归
-            token_expiry_retry_count: 令牌过期重试次数（FAIL_SYS_TOKEN_EXOIRED/EXPIRED），用于防止无限重试
-        """
-        notification_sent = False
-        
-        try:
-            # 检查账号是否已禁用
-            from app.services.captcha.concurrency import should_skip_account
-            if should_skip_account(self.cookie_id):
-                logger.warning(f"【{self.cookie_id}】账号已禁用，跳过token刷新")
-                return None
-            
-            logger.info(f"【{self.cookie_id}】开始刷新token... (滑块验证重试次数: {captcha_retry_count})")
-            self.last_token_refresh_status = "started"
-
-            is_initial_cache_attempt = bool(
-                captcha_retry_count == 0
-                and token_expiry_retry_count == 0
-                and getattr(self, "_startup_expired_cache_available", True)
-            )
-            
-            # 开关每次均实时查库，确保运行中的 WebSocket 无需重启即可生效。
-            local_slider_setting = await self._is_local_slider_disabled()
-            local_slider_disabled = local_slider_setting is True
-            if local_slider_setting is not False:
-                cached = await self._get_cached_token(allow_expired=True)
-                if cached:
-                    return await self._use_cached_token(cached)
-
-                if not getattr(self, "_last_cache_lookup_succeeded", True):
-                    self.last_token_refresh_status = "skipped_startup_cache_lookup_failed"
-                    logger.warning(
-                        f"【{self.cookie_id}】Token缓存读取失败，无法确认缓存是否存在，"
-                        "本次不调用Token接口，等待下次轮询"
-                    )
-                    return self.current_token
-
-                if local_slider_setting is None:
-                    self.current_token = None
-                    self.last_token_refresh_status = (
-                        "skipped_local_slider_config_unavailable"
-                    )
-                    logger.warning(
-                        f"【{self.cookie_id}】本机滑块处理开关读取失败且Token缓存不存在，"
-                        "按安全策略不发起Token接口请求，等待下次轮询"
-                    )
-                    return None
-
-                logger.warning(
-                    f"【{self.cookie_id}】本机滑块不处理已开启且Token缓存不存在，"
-                    "继续请求Token接口；若网页接口最终仍需滑块，"
-                    "将跳过本机滑块并等待下次轮询"
-                )
-
-            # 常规模式仅在首次调用时读取有效缓存，重试时保持原有接口处理逻辑。
-            if (
-                not local_slider_disabled
-                and captcha_retry_count == 0
-                and token_expiry_retry_count == 0
-            ):
-                cached = await self._get_cached_token(
-                    allow_expired=is_initial_cache_attempt,
-                    expired_cache_reason="websocket_startup",
-                )
-                if is_initial_cache_attempt and not getattr(
-                    self,
-                    "_last_cache_lookup_succeeded",
-                    True,
-                ):
-                    self.last_token_refresh_status = "skipped_startup_cache_lookup_failed"
-                    logger.warning(
-                        f"【{self.cookie_id}】启动阶段读取Token缓存失败，"
-                        "本次不调用Token接口，保留启动缓存兜底机会等待下一轮"
-                    )
-                    return self.current_token
-                if is_initial_cache_attempt:
-                    self._startup_expired_cache_available = False
-                if cached:
-                    return await self._use_cached_token(cached)
-
-            should_skip_refresh, existing_token = (
-                await self._get_processing_risk_control_skip_result("Token刷新")
-            )
-            if should_skip_refresh:
-                return existing_token
-            self.restarted_in_browser_refresh = False
-
-            # 检查滑块验证重试次数
-            if captcha_retry_count >= self.max_captcha_verification_count:
-                logger.error(f"【{self.cookie_id}】滑块验证重试次数已达上限 ({self.max_captcha_verification_count})，停止重试")
-                await self.send_token_refresh_notification(
-                    f"滑块验证重试次数已达上限，请手动处理",
-                    "captcha_max_retries_exceeded"
-                )
-                notification_sent = True
-                self.last_token_refresh_status = "failed_captcha_max_retries"
-                return None
-
-            # 检查消息接收冷却时间
-            current_time = time.time()
-            time_since_last_message = current_time - self.last_message_received_time
-            if self.last_message_received_time > 0 and time_since_last_message < self.message_cookie_refresh_cooldown:
-                remaining_time = self.message_cookie_refresh_cooldown - time_since_last_message
-                remaining_minutes = int(remaining_time // 60)
-                remaining_seconds = int(remaining_time % 60)
-                logger.info(f"【{self.cookie_id}】收到消息后冷却中，放弃本次token刷新，还需等待 {remaining_minutes}分{remaining_seconds}秒")
-                self.last_token_refresh_status = "skipped_cooldown"
-                return None
-
-            # 从数据库重新加载最新的cookie（滑块验证重试时跳过，使用内存中已更新的Cookie）
-            logger.info(f"【{self.cookie_id}】开始执行Cookie刷新任务...")
-            if captcha_retry_count > 0:
-                logger.warning(f"【{self.cookie_id}】滑块验证重试中，跳过从数据库重新加载Cookie，使用内存中已更新的Cookie")
-            else:
-                try:
-                    account_info = await self._load_account_info()
-                    if account_info and account_info.get('cookie_value'):
-                        new_cookies_str = account_info.get('cookie_value')
-                        if new_cookies_str != self.cookies_str:
-                            logger.info(f"【{self.cookie_id}】检测到数据库中的cookie已更新，重新加载cookie")
-                            self.cookies_str = new_cookies_str
-                            self.cookies = trans_cookies(self.cookies_str)
-                            logger.warning(f"【{self.cookie_id}】Cookie已从数据库重新加载")
-                except Exception as reload_e:
-                    logger.warning(f"【{self.cookie_id}】从数据库重新加载cookie失败，继续使用当前cookie: {self._safe_str(reload_e)}")
-
-            # Token获取方式每次实时查库，确保系统设置修改后无需重启即可生效
-            token_api_mode = await load_token_api_mode(self.cookie_id)
-            logger.info(
-                f"【{self.cookie_id}】发起Token刷新API请求，"
-                f"使用{get_token_api_mode_label(token_api_mode)}"
-            )
-            api_result = await request_im_token_with_fallback(
-                self.cookies_str,
-                self.device_id,
-                api_mode=token_api_mode,
-                log_tag=self.cookie_id,
-            )
-            if api_result.device_id and api_result.device_id != self.device_id:
-                self.device_id = api_result.device_id
-                logger.info(f"【{self.cookie_id}】已更新远程接口返回的Device ID")
-            logger.info(
-                f"【{self.cookie_id}】Token刷新API响应: "
-                f"状态码={api_result.status_code}, 耗时={api_result.duration_seconds:.2f}秒"
-            )
-            res_json = api_result.response_json
-            logger.info(f"【{self.cookie_id}】Token刷新响应: {json.dumps(res_json, ensure_ascii=False)[:500]}")
-
-            # 检查并更新Cookie
-            new_cookies = api_result.response_cookies
-            if new_cookies:
-                self.cookies.update(new_cookies)
-                self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
-                if await self.update_config_cookies():
-                    logger.warning("已更新Cookie到数据库")
-                else:
-                    logger.error(
-                        f"【{self.cookie_id}】Token接口下发的Cookie写回数据库失败"
-                    )
-
-            new_token = extract_im_access_token(res_json)
-            if new_token:
-                self.current_token = new_token
-                self.parent._using_expired_startup_token = False
-                self.last_token_refresh_time = time.time()
-                self.parent.last_message_received_time = 0
-                logger.warning(f"【{self.cookie_id}】Token刷新成功，已重置消息接收时间标识")
-                logger.info(f"【{self.cookie_id}】Token刷新成功，新Token: {new_token}")
-                self.last_token_refresh_status = "success"
-                # 必须在 _set_cached_token 覆盖 _cached_token_in_use 前捕获，否则永远为 False
-                token_changed = new_token != self._cached_token_in_use
-                await self._set_cached_token(new_token, self.device_id)
-                # Token 变化后旧连接的 Token 已失效，不重连会进入"心跳正常但收不到消息"的僵尸状态
-                if token_changed:
-                    await self._reconnect_websocket_for_renewed_token(
-                        reason="Token刷新后已变化"
-                    )
-                return new_token
-
-            # Session过期先于滑块判断：Cookie 已失效时滑块验证结果同样无效，
-            # 过滑块纯属白跑（占用并发槽位、失败后还会清缓存发通知），
-            # 必须直接走密码登录续期。（仅Session过期触发密码登录，令牌过期不触发）
-            if is_session_expired_token_result(api_result):
-                refresh_result = await self.try_password_login_refresh("Session过期")
-
-                if refresh_result == "no_credentials":
-                    # 未配置密码，禁用账号
-                    logger.warning(f"【{self.cookie_id}】Session过期且未配置密码，立即禁用账号")
-
-                    # 自动禁用账号
-                    try:
-                        from common.db.compat import db_manager
-                        db_manager.disable_account(self.cookie_id, reason="账号已掉线且未配置账号密码，自动禁用")
-                        logger.warning(f"【{self.cookie_id}】账号已自动禁用")
-                    except Exception as disable_e:
-                        logger.error(f"【{self.cookie_id}】自动禁用账号失败: {self._safe_str(disable_e)}")
-
-                    notification_sent = True
-                    return None
-                if refresh_result is True:
-                    # 刷新成功，清除旧缓存并重新获取token
-                    await self._delete_cached_token()
-                    return await self.refresh_token(captcha_retry_count + 1)
-                if refresh_result == "skipped_cooldown":
-                    # 密码登录冷却期内跳过：包括「上次登录冷却 300 秒内」与「账密错误
-                    # 冷却 5 小时内」两种确定性可恢复状态。账号本身一切正常，只是
-                    # 当下不能立即用密码登录刷新 cookie，应等待冷却结束 / 用户修正
-                    # 账密。标记为 skipped_cooldown（main 循环 non_counted_statuses
-                    # 已包含此状态，不计入 _token_fetch_failures，避免被自动禁用）。
-                    self.last_token_refresh_status = "skipped_cooldown"
-                    self.current_token = None
-                    await self._delete_cached_token()
-                    return None
-
-                # 刷新失败（密码登录真实失败：账号信息缺失等）
-                notification_sent = True
-                self.last_token_refresh_status = "failed_session_expired"
-                self.current_token = None
-                await self._delete_cached_token()
-                return None
-
-            # 检查是否需要滑块验证
-            if self.need_captcha_verification(res_json):
-                if local_slider_disabled:
-                    self.current_token = None
-                    self.last_token_refresh_status = "skipped_local_slider_disabled"
-                    logger.warning(
-                        f"【{self.cookie_id}】{get_token_api_mode_label(api_result.api_mode)}请求后仍需滑块验证，"
-                        "本机滑块不处理已开启，本次不启动本机滑块，等待下次轮询"
-                    )
-                    return None
-
-                logger.warning(f"【{self.cookie_id}】检测到需要滑块验证，开始处理...")
-
-                try:
-                    captcha_start_time = time.time()
-                    new_cookies_str = await self.handle_captcha_verification(res_json)
-                    captcha_duration = time.time() - captcha_start_time
-
-                    if self.last_token_refresh_status in (
-                        "skipped_risk_control_processing",
-                        "skipped_risk_control_check_failed",
-                    ):
-                        return self.current_token
-                    if self.last_token_refresh_status == "failed_risk_log_create":
-                        notification_sent = True
-                        return None
-
-                    refetch_token_ok = bool(
-                        getattr(self, "_refetch_token_ok", False)
-                    )
-                    refetched_token = getattr(self, "_refetch_new_token", None)
-                    if isinstance(refetched_token, str):
-                        refetched_token = refetched_token.strip()
-                    else:
-                        refetched_token = None
-
-                    # Consume a token returned by the remote captcha endpoint here.
-                    # A non-empty cookie string alone must not trigger another token
-                    # API request when a usable token is already available.
-                    if (
-                        new_cookies_str is not None
-                        and refetch_token_ok
-                        and refetched_token
-                    ):
-                        token_changed = refetched_token != self._cached_token_in_use
-                        self.current_token = refetched_token
-                        self.parent._using_expired_startup_token = False
-                        self.last_token_refresh_time = time.time()
-                        self.parent.last_message_received_time = 0
-                        self.last_token_refresh_status = "success"
-                        await self._set_cached_token(refetched_token, self.device_id)
-                        self._clear_refetch_state()
-                        logger.info(
-                            f"[{self.cookie_id}] remote captcha endpoint returned a token; "
-                            "skip the duplicate token refresh request"
-                        )
-                        if token_changed:
-                            await self._reconnect_websocket_for_renewed_token(
-                                reason="remote captcha endpoint returned a new token"
-                            )
-                        return refetched_token
-
-                    if new_cookies_str:
-                        logger.info(f"【{self.cookie_id}】滑块验证成功，准备重新刷新token...")
-                        # 滑块验证成功后，清除旧缓存并重新获取token
-                        self._clear_refetch_state()
-                        await self._delete_cached_token()
-                        return await self.refresh_token(captcha_retry_count=captcha_retry_count + 1)
-                    logger.error(f"【{self.cookie_id}】滑块验证失败")
-                    self._clear_refetch_state()
-                    notification_sent = True
-                    self.last_token_refresh_status = "failed_captcha"
-                    self.current_token = None
-                    await self._delete_cached_token()
-                    return None
-                except Exception as captcha_e:
-                    logger.error(f"【{self.cookie_id}】滑块验证处理异常: {self._safe_str(captcha_e)}")
-                    self._clear_refetch_state()
-                    notification_sent = True
-                    self.last_token_refresh_status = "failed_captcha_exception"
-                    self.current_token = None
-                    await self._delete_cached_token()
-                    return None
-
-            # FAIL_SYS_TOKEN_EXOIRED/EXPIRED：允许自动重试一次
-            try:
-                if token_expiry_retry_count < 1 and is_token_expired_response(res_json):
-                    ret_value = res_json.get('ret', []) or []
-                    logger.warning(f"【{self.cookie_id}】检测到令牌过期，准备重试一次: {ret_value}")
-                    await asyncio.sleep(0.5)
-                    return await self.refresh_token(
-                        captcha_retry_count=captcha_retry_count,
-                        token_expiry_retry_count=token_expiry_retry_count + 1,
-                    )
-            except Exception as retry_e:
-                logger.warning(f"【{self.cookie_id}】令牌过期重试判断异常: {self._safe_str(retry_e)}")
-
-            logger.error(f"【{self.cookie_id}】Token刷新失败: {res_json}")
-            self.current_token = None
-            self.last_token_refresh_status = "failed_api"
-            await self._delete_cached_token()
-
-            if not notification_sent:
-                await self.send_token_refresh_notification(f"Token刷新失败: {res_json}", "token_refresh_failed")
+        """续签、首次检查及必要密码登录走同一持久预算，停止旧递归恢复。"""
+        from common.services.account_recovery import AccountRecovery
+        from common.services.account_credentials import CredentialRejected, credential_failure
+        runtime = getattr(self.parent, '_account_runtime', None)
+        expected = None
+        if runtime:
+            await runtime.lease.check()
+            expected = (*runtime.version, runtime.generation)
+        recovery = AccountRecovery(self.cookie_id, self.parent.user_id)
+        # 成功缓存不属于恢复尝试；过期缓存不再冒充可用 Token。
+        cached = await self._get_cached_token(allow_expired=False)
+        if cached:
+            return await self._use_cached_token(cached)
+        job = await recovery.start('renewal', expected=expected)
+        if not job:
+            self.last_token_refresh_status = 'skipped_cooldown'
             return None
-
-        except asyncio.TimeoutError:
-            logger.error(f"【{self.cookie_id}】Token刷新API请求超时（30秒）")
+        token_result = None
+        async def renew():
+            nonlocal token_result
+            async with recovery.sessions() as db:
+                a = await recovery.account(db)
+                recovery.validate(a,job['id'])
+                cookie, identity = a.cookie, a.unb
+                proxy = {k:getattr(a,k) for k in ('proxy_type','proxy_host','proxy_port','proxy_user','proxy_pass')}
+            if runtime: await runtime.lease.check()
+            result = await request_im_token_with_fallback(cookie, self.device_id,
+                proxy_config=proxy, timeout_seconds=30)
+            token_result = extract_im_access_token(result.response_json)
+            if not token_result: raise CredentialRejected(credential_failure(result))
+            parts = trans_cookies(cookie); parts.update(result.response_cookies)
+            if parts.get('unb') != str(identity): raise CredentialRejected('identity_mismatch')
+            return '; '.join(f'{k}={v}' for k,v in parts.items())
+        accepted = await recovery.run(job['id'], renew=renew, login=recovery.password_once)
+        if not accepted:
             self.current_token = None
-            self.last_token_refresh_status = "failed_timeout"
-            # 超时属于网络问题，不代表 token 失效，保留数据库缓存 token 供下次重试，避免误删后被迫走滑块
+            self.last_token_refresh_status = 'skipped_cooldown'
             return None
-        except aiohttp.ClientError as e:
-            logger.error(f"【{self.cookie_id}】Token刷新网络错误: {type(e).__name__}: {e}")
-            self.current_token = None
-            self.last_token_refresh_status = "failed_network"
-            # 网络错误同样不删数据库缓存 token，保留供下次重试
+        a = await self._load_account_record()
+        self.cookies_str = a.cookie; self.cookies = trans_cookies(a.cookie)
+        if runtime:
+            from common.services import account_policy
+            state = account_policy.snapshot(a)
+            if state['generation'] != runtime.generation:
+                return None
+            runtime.version = (state['credential_version'],state['config_version'])
+            await runtime.lease.check()
+        if not token_result:
+            self.last_token_refresh_status = 'credentials_verified'
+            await self.restart_instance(reason='密码恢复已验证凭据')
             return None
-        except Exception as e:
-            logger.error(f"【{self.cookie_id}】Token刷新异常: {type(e).__name__}: {self._safe_str(e)}")
-            self.current_token = None
-            self.last_token_refresh_status = "failed_exception"
-            await self._delete_cached_token()
+        self.current_token = token_result
+        self.last_token_refresh_time = time.time()
+        self.last_token_refresh_status = 'success'
+        await self._set_cached_token(token_result,self.device_id)
+        return token_result
 
-            if not notification_sent:
-                await self.send_token_refresh_notification(f"Token刷新异常: {str(e)}", "token_refresh_exception")
-            return None
-
-    # ==================== 密码登录刷新 ====================
-
-    async def try_password_login_refresh(self, trigger_reason: str = "令牌/Session过期"):
-        """尝试通过密码登录刷新Cookie并重启实例
-
-        每次调用都会写入一条账号登录日志（xy_account_login_logs），便于在
-        「日志管理 / 账号登录日志」中复盘登录尝试结果与失败原因。
-        """
-        logger.warning(f"【{self.cookie_id}】检测到{trigger_reason}，准备刷新Cookie并重启实例...")
-
-        # 记录账号登录日志的辅助变量与函数：在每个出口前调用一次，统一计算耗时
-        start_ts = time.time()
-        # username 在 account_info 加载后才会被赋值；闭包内只读取，赋值由外层完成
-        login_username: str | None = None
-        # 接口续期失败原因（在接口续期失败后赋值，供后续日志拼接）
-        _api_renew_fail_msg: str = ""
-
-        def _record_login_log(
-            login_status: str,
-            failure_reason: str | None = None,
-            error_message: str | None = None,
-            updated_cookie_names: str | None = None,
-        ) -> None:
-            """记录一条账号登录日志（写日志失败不影响主流程）。"""
-            try:
-                from common.db.compat import db_manager
-                duration_ms = int((time.time() - start_ts) * 1000)
-                # 如果接口续期失败了，在 error_message 前拼接续期失败信息
-                final_error_message = error_message
-                if _api_renew_fail_msg and error_message:
-                    final_error_message = f"{_api_renew_fail_msg}，{error_message}"
-                db_manager.add_account_login_log(
-                    cookie_id=self.cookie_id,
-                    login_status=login_status,
-                    username=login_username,
-                    trigger_reason=trigger_reason,
-                    failure_reason=failure_reason,
-                    error_message=final_error_message,
-                    updated_cookie_names=updated_cookie_names,
-                    duration_ms=duration_ms,
-                )
-            except Exception as log_e:
-                logger.warning(f"【{self.cookie_id}】写入账号登录日志失败: {self._safe_str(log_e)}")
-
-        try:
-            from common.db.compat import db_manager
-            
-            # 检查密码登录冷却期
-            current_time = time.time()
-            last_password_login = self.parent._last_password_login_time.get(self.cookie_id, 0) if hasattr(self.parent, '_last_password_login_time') else 0
-            password_login_cooldown = getattr(self.parent, '_password_login_cooldown', 300)
-            time_since_last_login = current_time - last_password_login
-            
-            if last_password_login > 0 and time_since_last_login < password_login_cooldown:
-                remaining_time = password_login_cooldown - time_since_last_login
-                cooldown_msg = (
-                    f"距离上次密码登录仅 {time_since_last_login:.1f} 秒，"
-                    f"仍在冷却期内（还需等待 {remaining_time:.1f} 秒），跳过密码登录"
-                )
-                logger.warning(f"【{self.cookie_id}】{cooldown_msg}")
-                _record_login_log("skipped_cooldown", "login_cooldown", cooldown_msg)
-                # 返回 "skipped_cooldown" 而非 False，以便上层 refresh_token 把 status 标记为
-                # 不计入禁用计数的 "skipped_cooldown"（避免 main 循环每 5 秒一次地累加
-                # _token_fetch_failures，1 分钟内达到 10 次后误把账号自动禁用）。
-                return "skipped_cooldown"
-            
-            # 检查账密错误冷却期（5小时）
-            password_error_time = self.parent._password_error_cooldown_time.get(self.cookie_id, 0) if hasattr(self.parent, '_password_error_cooldown_time') else 0
-            password_error_cooldown = getattr(self.parent, '_password_error_cooldown', 5 * 60 * 60)
-            time_since_error = current_time - password_error_time
-            
-            if password_error_time > 0 and time_since_error < password_error_cooldown:
-                remaining_hours = (password_error_cooldown - time_since_error) / 3600
-                cooldown_msg = f"账密错误冷却期内（还需等待 {remaining_hours:.1f} 小时），跳过密码登录"
-                logger.warning(f"【{self.cookie_id}】{cooldown_msg}")
-                _record_login_log("skipped_cooldown", "password_error_cooldown", cooldown_msg)
-                # 同上：账密错误已经在第一次发生时立即禁用了账号。当用户手动启用账号后，
-                # cookie 仍然 Session 过期；冷却期内跳过密码登录是确定性的可恢复状态
-                # （等待用户修正账密 / 等冷却结束），不应该被算作「真实故障」累加禁用计数。
-                return "skipped_cooldown"
-
-            logger.info(f"【{self.cookie_id}】{trigger_reason}触发Cookie刷新和实例重启")
-
-            # ====== 优先尝试接口续期（轻量级，无需浏览器） ======
-            try:
-                from common.services.cookie_renew_api_service import cookie_renew_api_service
-                logger.info(f"【{self.cookie_id}】先尝试接口续期（silentHasLogin + setLoginSettings）...")
-                # 记录续期前的全量cookies
-                logger.info(f"【{self.cookie_id}】[续期前全量Cookies] {self.cookies_str}")
-                renew_result = await cookie_renew_api_service.renew(self.cookies_str, self.cookie_id)
-
-                # 不管续期是否成功，只要有Cookie字段更新就先写入数据库
-                if renew_result.updated_cookie_names:
-                    self.cookies_str = renew_result.new_cookies_str
-                    self.cookies = trans_cookies(self.cookies_str)
-                    if not await self.update_config_cookies():
-                        raise RuntimeError("接口续期Cookie写回数据库失败")
-                    logger.info(
-                        f"【{self.cookie_id}】接口返回Cookie已更新 "
-                        f"{len(renew_result.updated_cookie_names)} 个字段："
-                        f"{', '.join(renew_result.updated_cookie_names)}"
-                    )
-
-                # 记录续期后的全量cookies（不管成功失败都打印）
-                logger.info(f"【{self.cookie_id}】[续期后全量Cookies] {self.cookies_str}")
-
-                if renew_result.success:
-                    # 续期成功（可能是接口续期或浏览器续期），跳过密码登录
-                    renew_method_desc = "接口续期" if renew_result.renew_method == "api" else "浏览器续期"
-                    logger.info(
-                        f"【{self.cookie_id}】{renew_method_desc}成功，跳过密码登录"
-                    )
-                    log_reason = f"api_renew_success" if renew_result.renew_method == "api" else "browser_renew_success"
-                    _record_login_log(
-                        "success",
-                        log_reason,
-                        f"{renew_method_desc}成功，更新了 {len(renew_result.updated_cookie_names)} 个字段："
-                        f"{', '.join(renew_result.updated_cookie_names)}，无需密码登录"
-                        if renew_result.updated_cookie_names
-                        else f"{renew_method_desc}成功，Cookie无变化，无需密码登录",
-                        updated_cookie_names=",".join(renew_result.updated_cookie_names) if renew_result.updated_cookie_names else None,
-                    )
-                    return True
-                else:
-                    logger.info(
-                        f"【{self.cookie_id}】续期未成功"
-                        f"（{renew_result.api_message}），"
-                        f"继续尝试密码登录..."
-                    )
-            except Exception as renew_exc:
-                logger.warning(
-                    f"【{self.cookie_id}】续期异常（不影响后续密码登录）: {self._safe_str(renew_exc)}"
-                )
-
-            # ====== 续期未成功，继续原有密码登录流程 ======
-            # 标记续期失败原因（闭包变量，_record_login_log 会自动拼接）
-            _api_renew_fail_msg = "接口续期和浏览器续期均失败"
-
-            account_info = await self._load_account_info()
-            
-            if not account_info:
-                err_msg = "无法获取账号信息"
-                logger.error(f"【{self.cookie_id}】{err_msg}")
-                _record_login_log("failed", "account_info_missing", err_msg)
-                return False
-
-            # 拿到 username 后赋给闭包变量，确保后续每条日志都带上账号快照
-            login_username = (account_info.get('username') or '') or None
-            
-            # 检查数据库中的cookie是否已经更新
-            db_cookie_value = account_info.get('cookie_value', '')
-            if db_cookie_value and db_cookie_value != self.cookies_str:
-                logger.info(f"【{self.cookie_id}】检测到数据库中的cookie已更新，重新加载cookie")
-                self.cookies_str = db_cookie_value
-                self.cookies = trans_cookies(self.cookies_str)
-                logger.info(f"【{self.cookie_id}】Cookie已从数据库重新加载，跳过密码登录刷新")
-                _record_login_log(
-                    "success",
-                    "cookie_already_updated_externally",
-                    "数据库中的Cookie已被外部更新，直接复用，无需密码登录",
-                )
-                return True
-            
-            username = account_info.get('username', '')
-            password = account_info.get('password', '')
-            show_browser = account_info.get('show_browser', False)
-            
-            if not username or not password:
-                err_msg = "未配置用户名或密码，无法自动刷新Cookie"
-                logger.warning(f"【{self.cookie_id}】{err_msg}")
-                await self.send_token_refresh_notification(
-                    f"检测到{trigger_reason}，但未配置用户名或密码，无法自动刷新Cookie",
-                    "no_credentials"
-                )
-                _record_login_log("no_credentials", "no_credentials", err_msg)
-                return "no_credentials"  # 返回特殊值表示未配置密码，不触发重启
-            
-            # 使用 Playwright 登录
-            from app.services.captcha.xianyu_slider_stealth import XianyuSliderStealth
-            browser_mode = "有头" if show_browser else "无头"
-            logger.info(f"【{self.cookie_id}】开始使用{browser_mode}浏览器进行密码登录刷新Cookie...")
-            logger.info(f"【{self.cookie_id}】使用账号: {username}")
-            
-            # 在进入线程前捕获事件循环
-            main_loop = asyncio.get_running_loop()
-            
-            # 同步回调函数（在工作线程中调用）
-            def notification_callback_sync(message: str, screenshot_path: str = None, verification_url: str = None):
-                try:
-                    future = asyncio.run_coroutine_threadsafe(
-                        self.send_token_refresh_notification(
-                            error_message=message,
-                            notification_type="token_refresh",
-                            chat_id=None,
-                            attachment_path=screenshot_path,
-                            verification_url=verification_url
-                        ),
-                        main_loop
-                    )
-                    future.result(timeout=10)  # 等待最多10秒
-                except Exception as e:
-                    logger.warning(f"【{self.cookie_id}】发送通知失败: {e}")
-            
-            # 把构造函数和登录都放到线程中，避免阻塞事件循环
-            def _do_password_login():
-                slider = XianyuSliderStealth(user_id=self.cookie_id, enable_learning=False, headless=not show_browser)
-                try:
-                    return slider.login_with_password_playwright(
-                        account=username,
-                        password=password,
-                        show_browser=show_browser,
-                        notification_callback=notification_callback_sync
-                    )
-                finally:
-                    try:
-                        slider.close()
-                    except Exception:
-                        pass
-            
-            # 密码登录同样驱动浏览器，必须走浏览器任务专用线程池，避免占用默认线程池
-            result = await run_browser_task(_do_password_login)
-            
-            if result:
-                logger.info(f"【{self.cookie_id}】密码登录成功，获取到Cookie")
-                
-                # 密码登录成功，清除旧的Token缓存（新Cookie需要重新获取Token）
-                await self._delete_cached_token()
-                
-                new_cookies_str = '; '.join([f"{k}={v}" for k, v in result.items()])
-                # 记录密码登录获取到的新cookies
-                logger.info(f"【{self.cookie_id}】[密码登录获取的新Cookies] {new_cookies_str}")
-                
-                # 记录密码登录时间
-                if hasattr(self.parent, '_last_password_login_time'):
-                    self.parent._last_password_login_time[self.cookie_id] = time.time()
-                logger.warning(f"【{self.cookie_id}】已记录密码登录时间，冷却期 {password_login_cooldown} 秒")
-                
-                try:
-                    await self.send_token_refresh_notification(
-                        f"账号密码登录成功，Cookie已获取，准备更新并重启",
-                        "password_login_success"
-                    )
-                except Exception as notify_e:
-                    logger.warning(f"【{self.cookie_id}】发送通知失败: {self._safe_str(notify_e)}")
-                
-                update_success = await self.update_cookies_and_restart(new_cookies_str)
-                
-                if update_success:
-                    logger.info(f"【{self.cookie_id}】Cookie更新并重启任务成功")
-                    _record_login_log("success", None, "密码登录成功，Cookie已更新且实例已重启")
-                    return True
-                else:
-                    err_msg = "Cookie更新或实例重启失败（密码登录已成功）"
-                    logger.error(f"【{self.cookie_id}】{err_msg}")
-                    _record_login_log("failed", "cookie_update_failed", err_msg)
-                    return False
-                    
-            else:
-                err_msg = "密码登录失败，未获取到Cookie"
-                logger.warning(f"【{self.cookie_id}】{err_msg}")
-                _record_login_log("failed", "login_no_cookie_returned", err_msg)
-                return False
-
-        except Exception as refresh_e:
-            # ============== baxia-punish 风控图形滑块特殊处理 ==============
-            # 该异常表示账号本身正常，仅是闲鱼风控系统识别出可疑行为弹了图形验证（如"找两个松鼠"），
-            # 处理策略：不禁用账号、设置 5 小时冷却避免反复触发风控、发送特定通知。
-            # 必须通过 isinstance 单独识别，避免被下面的"账密错误"分支误判为禁用场景。
-            try:
-                from common.services.captcha.xianyu_slider_stealth import BaxiaPunishCaptchaException
-                _is_baxia_punish = isinstance(refresh_e, BaxiaPunishCaptchaException)
-            except Exception:
-                _is_baxia_punish = False
-            
-            if _is_baxia_punish:
-                punish_msg = self._safe_str(refresh_e)
-                logger.warning(
-                    f"【{self.cookie_id}】检测到 baxia-punish 风控图形滑块验证："
-                    f"{punish_msg}；账号本身正常，仅设置冷却期，不禁用账号"
-                )
-                # 设置 5 小时冷却（与账密错误共用同一冷却字段）
-                if hasattr(self.parent, '_password_error_cooldown_time'):
-                    self.parent._password_error_cooldown_time[self.cookie_id] = time.time()
-                    cooldown_hours = getattr(self.parent, '_password_error_cooldown', 5 * 60 * 60) / 3600
-                    logger.warning(
-                        f"【{self.cookie_id}】已设置 {cooldown_hours:.0f} 小时冷却期，期间不再尝试自动登录"
-                    )
-                # 发送通知
-                try:
-                    await self.send_token_refresh_notification(
-                        (
-                            f"账号在密码登录过程中触发了闲鱼风控图形验证（如\"找两个松鼠\"等图形识别滑块），"
-                            f"系统无法自动通过此类验证。\n"
-                            f"账号本身正常，已暂停 5 小时后再尝试自动登录。\n"
-                            f"如急需登录，请手动登录账号或稍后再试。\n\n"
-                            f"提示：{punish_msg}"
-                        ),
-                        "baxia_punish_captcha"
-                    )
-                except Exception as notify_e:
-                    logger.warning(
-                        f"【{self.cookie_id}】发送风控验证通知失败: {self._safe_str(notify_e)}"
-                    )
-                _record_login_log("failed", "baxia_punish_captcha", punish_msg)
-                return False
-            # ============== baxia-punish 处理结束 ==============
-            
-            error_msg = self._safe_str(refresh_e)
-            logger.error(f"【{self.cookie_id}】Cookie刷新或实例重启失败: {error_msg}")
-
-            # 检测账密错误，禁用账号并设置冷却期
-            # 关键字命中只决定是否设置 5 小时冷却（避免被风控），其他类型错误（如冻结）不需要冷却
-            is_bad_credentials = (
-                '账密错误' in error_msg
-                or '账号密码错误' in error_msg
-                or '用户名或密码错误' in error_msg
-            )
-            if is_bad_credentials:
-                # 直接使用原始错误文案作为禁用原因（不加前缀），与内层 _disable_account_on_timeout 保持一致
-                disable_reason = error_msg if error_msg else "账号密码错误"
-                try:
-                    from common.db.compat import db_manager
-                    db_manager.disable_account(self.cookie_id, reason=disable_reason)
-                    logger.warning(f"【{self.cookie_id}】检测到账密错误，账号已自动禁用，原因: {disable_reason}")
-                except Exception as disable_e:
-                    logger.error(f"【{self.cookie_id}】禁用账号失败: {self._safe_str(disable_e)}")
-                
-                # 设置冷却期
-                if hasattr(self.parent, '_password_error_cooldown_time'):
-                    self.parent._password_error_cooldown_time[self.cookie_id] = time.time()
-                    cooldown_hours = getattr(self.parent, '_password_error_cooldown', 5 * 60 * 60) / 3600
-                    logger.warning(f"【{self.cookie_id}】已设置 {cooldown_hours:.0f} 小时冷却期，期间不再尝试自动登录")
-                
-                try:
-                    await self.send_token_refresh_notification(
-                        (
-                            f"账号密码登录失败，账号已自动禁用，请检查账号密码是否正确后重新启用。\n"
-                            f"失败原因: {error_msg or '未知错误'}"
-                        ),
-                        "password_error"
-                    )
-                except Exception as notify_e:
-                    logger.warning(f"【{self.cookie_id}】发送账密错误通知失败: {self._safe_str(notify_e)}")
-            
-            # 异常分支统一记录登录日志：区分账密错误 / 其他异常
-            _record_login_log(
-                "failed",
-                "bad_credentials" if is_bad_credentials else "exception",
-                error_msg or repr(refresh_e),
-            )
-            return False
-
-    # ==================== Cookie有效性验证 ====================
+    async def try_password_login_refresh(self, trigger_reason: str = "Session过期"):
+        from common.services.account_recovery import AccountRecovery
+        from common.services import account_policy as policy
+        from common.services.account_execution import ExecutionLost
+        reason = 'invalid_credentials' if ('Session' in trigger_reason or '认证失败' in trigger_reason) else 'unknown'
+        runtime = getattr(self.parent, '_account_runtime', None)
+        expected = None
+        if runtime:
+            await runtime.lease.check()
+            expected = (*runtime.version, runtime.generation)
+        recovery = AccountRecovery(self.cookie_id, self.parent.user_id)
+        job = await recovery.start(reason, expected=expected)
+        if not job:
+            return 'skipped_cooldown'
+        accepted = await recovery.run(job['id'], renew=recovery.renew_once, login=recovery.password_once)
+        if accepted:
+            account = await self._load_account_record()
+            self.cookies_str = account.cookie
+            self.cookies = trans_cookies(account.cookie)
+            # 更新版本后旧执行方退场，接任重新做握手；这里不发出业务或另取租约。
+            if runtime:
+                await runtime.close()
+            await self.restart_instance(reason='持久恢复任务凭据已验证')
+            return True
+        self.last_token_refresh_status = 'skipped_cooldown'
+        return 'skipped_cooldown'
 
     async def verify_cookie_validity(self) -> dict:
         """验证Cookie的有效性，通过实际调用API测试"""
@@ -1802,7 +1147,7 @@ class CookieTokenManager:
                 logger.info(f"【{self.cookie_id}】已创建测试图片: {test_image_path}")
                 
                 from common.utils.image_uploader import ImageUploader
-                uploader = ImageUploader(cookies_str=self.cookies_str)
+                uploader = ImageUploader(cookies_str=self.cookies_str, account_id=self.cookie_id, owner_id=self.parent.user_id)
                 
                 await uploader.create_session()
                 

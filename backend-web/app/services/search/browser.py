@@ -1,4 +1,4 @@
-﻿"""
+"""
 浏览器管理器
 
 管理Playwright浏览器的初始化和关闭
@@ -72,7 +72,7 @@ class BrowserManager:
         """检查Playwright是否可用"""
         return PLAYWRIGHT_AVAILABLE
 
-    async def init_browser(self, headless: bool = True) -> bool:
+    async def init_browser(self, headless: bool = True, proxy: Optional[dict] = None) -> bool:
         """初始化浏览器（使用持久化上下文）"""
         if not PLAYWRIGHT_AVAILABLE:
             raise Exception("Playwright 未安装，无法使用真实搜索功能")
@@ -90,9 +90,7 @@ class BrowserManager:
             self.playwright = await async_playwright().start()
 
             # 设置持久化数据目录
-            self._user_data_dir = os.path.join(
-                tempfile.gettempdir(), 'xianyu_browser_cache'
-            )
+            self._user_data_dir = tempfile.mkdtemp(prefix='xymb-search-')
             os.makedirs(self._user_data_dir, exist_ok=True)
             logger.info(f"使用持久化数据目录: {self._user_data_dir}")
 
@@ -112,6 +110,8 @@ class BrowserManager:
                 viewport={'width': 1280, 'height': 720},
                 locale='zh-CN',
             )
+            if proxy:
+                launch_kwargs["proxy"] = proxy
             if chromium_path:
                 launch_kwargs["executable_path"] = chromium_path
             self.context = await self.playwright.chromium.launch_persistent_context(
@@ -153,6 +153,11 @@ class BrowserManager:
 
         except Exception as e:
             logger.warning(f"关闭浏览器时出错: {e}")
+        finally:
+            if self._user_data_dir:
+                import shutil
+                shutil.rmtree(self._user_data_dir, ignore_errors=True)
+                self._user_data_dir = None
 
     async def set_cookies(self, cookie_value: str) -> bool:
         """设置浏览器cookies"""

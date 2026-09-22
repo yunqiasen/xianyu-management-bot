@@ -1,4 +1,4 @@
-﻿"""
+"""
 WebSocket服务统一错误处理
 
 功能：
@@ -14,6 +14,11 @@ from fastapi.responses import JSONResponse
 from loguru import logger
 
 
+def _rpc_path(request: Request) -> bool:
+    path = request.url.path
+    return path == '/internal' or path.startswith('/internal/') or path == '/password-login' or path.startswith('/password-login/')
+
+
 async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     """
     全局异常处理器
@@ -27,6 +32,9 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
     Returns:
         JSON响应
     """
+    if _rpc_path(request):
+        logger.error('内部请求失败: {}', type(exc).__name__)
+        return JSONResponse(status_code=500, content={'detail':{'code':'internal_error'}})
     # 通过参数传递动态异常文本，避免异常 repr 中的 ``{}`` 被 Loguru 当作模板占位符。
     logger.opt(exception=exc).error(
         "全局异常捕获: {}: {}\n请求路径: {}\n请求方法: {}",
@@ -62,6 +70,8 @@ async def http_exception_handler(request: Request, exc: Exception) -> JSONRespon
         JSON响应
     """
     if isinstance(exc, HTTPException):
+        if _rpc_path(request):
+            return JSONResponse(status_code=exc.status_code, content={'detail':exc.detail}, headers=exc.headers)
         # 通过参数传递动态异常文本，避免异常详情中的 ``{}`` 被 Loguru 当作模板占位符。
         logger.warning(
             "HTTP异常: {} - {}\n请求路径: {}\n请求方法: {}",
@@ -104,6 +114,8 @@ async def validation_exception_handler(
         request.url.path,
         request.method,
     )
+    if _rpc_path(request):
+        return JSONResponse(status_code=422, content={'detail':error_fields})
     return JSONResponse(
         status_code=status.HTTP_200_OK,
         content={

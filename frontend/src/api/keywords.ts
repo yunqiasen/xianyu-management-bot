@@ -219,10 +219,10 @@ export const exportKeywords = async (cookieId: string): Promise<Blob> => {
 export const importKeywords = async (
   cookieId: string,
   file: File
-): Promise<ApiResponse<{ added: number; updated: number }>> => {
+): Promise<ApiResponse<{ added: number; updated: number; errors?: {row: number; message: string}[] }>> => {
   const formData = new FormData()
   formData.append('file', file)
-  return post<ApiResponse<{ added: number; updated: number }>>(`${KEYWORD_PREFIX}/${cookieId}/import`, formData, {
+  return post<ApiResponse<{ added: number; updated: number; errors?: {row: number; message: string}[] }>>(`${KEYWORD_PREFIX}/${cookieId}/import`, formData, {
     headers: { 'Content-Type': 'multipart/form-data' },
   })
 }

@@ -1,52 +1,35 @@
-"""
-数据库备份定时任务
+"""完整 SQL.gz 备份：包含业务日志、审计和防重事实，恢复验证后才淘汰旧文件。
 
-功能：
-1. 默认每小时执行一次，备份数据库中所有表的结构；普通表同时备份数据，日志表仅备份结构
-2. 使用纯 Python（异步会话）导出，不依赖容器内 mysqldump 二进制
-3. 导出内容写入 .sql.gz 压缩文件，存放到共享备份目录（由 BACKUP_DIR 环境变量管理）
-4. 每次执行写一条备份日志（成功/失败、文件名、路径、大小、表数、行数、耗时）
-
-设计要点：
-- 逐表导出：先 SHOW CREATE TABLE 写建表语句，再分批 SELECT 写 INSERT 语句
-- 日志类表（_log / _logs 结尾）数据量大且恢复价值低，仅备份结构、跳过数据
-- 分批读取（每批 1000 行），避免大表一次性载入内存
-- 单表失败不中断整体备份，记录到错误信息中
-- 备份属于只读导出，绝不修改/删除任何业务数据
+使用现有调度入口和共享备份目录；逐表导出，不修改业务数据。
+任何表失败都使整次备份失败，记录仅含错误类型。
 """
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import gzip
+import os
+from uuid import uuid4
 import time
 from datetime import datetime, timedelta
 from typing import Optional
 
 from loguru import logger
-from sqlalchemy import delete, text
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.core.config import get_settings
 from common.db.retry import with_db_retry
 from common.db.session import async_session_maker
 from common.models.db_backup_log import DbBackupLog
-from common.utils.backup_paths import ensure_backup_root, get_backup_root
-from common.utils.time_utils import get_beijing_now, get_beijing_now_naive
+from common.utils.backup_paths import ensure_backup_root
+from common.utils.time_utils import get_beijing_now
 
 # 每批读取的数据行数，避免大表一次性载入内存
 _BATCH_SIZE = 1000
 
-# 备份文件与备份日志的保留天数，超过该天数的备份文件与日志记录会被自动清理
-_RETENTION_DAYS = 10
-
-
-def _is_log_table(table: str) -> bool:
-    """判断是否为日志类表（以 _log / _logs 结尾）。
-
-    日志表数据量大且对恢复价值低，备份时只保留表结构、跳过数据。
-    """
-    name = table.lower()
-    return name.endswith("_log") or name.endswith("_logs")
+class NonTransactionalBackupTable(ValueError):
+    """A consistent InnoDB snapshot excludes nontransactional engines."""
 
 
 class DbBackupTaskService:
@@ -78,7 +61,7 @@ class DbBackupTaskService:
 
         backup_root = ensure_backup_root()
         now = get_beijing_now()
-        file_name = f"backup_{database}_{now.strftime('%Y%m%d_%H%M%S')}.sql.gz"
+        file_name = f"backup_{database}_{now.strftime('%Y%m%d_%H%M%S_%f')}_{uuid4().hex[:8]}.sql.gz"
         file_path = backup_root / file_name
 
         table_count = 0
@@ -87,28 +70,29 @@ class DbBackupTaskService:
 
         try:
             async with async_session_maker() as session:
-                tables = await self._list_tables(session, database)
-                if not tables:
-                    logger.warning(f"【{self.task_name}】未查询到任何数据表，跳过备份")
-                else:
-                    logger.info(f"【{self.task_name}】共 {len(tables)} 张表待备份")
+                async with self._snapshot(session):
+                    tables = await self._list_tables(session, database)
+                    if not tables:
+                        logger.warning(f"【{self.task_name}】未查询到任何数据表，跳过备份")
+                    else:
+                        logger.info(f"【{self.task_name}】共 {len(tables)} 张表待备份")
 
-                # 以 gzip 文本模式写入，边导出边落盘，降低内存占用
-                with gzip.open(file_path, "wt", encoding="utf-8") as fp:
-                    self._write_header(fp, database, now)
-                    for index, table in enumerate(tables, start=1):
-                        try:
-                            rows = await self._dump_table(session, fp, table)
-                            table_count += 1
-                            total_rows += rows
-                            logger.info(
-                                f"【{self.task_name}】({index}/{len(tables)}) 表 {table} 完成，{rows} 行"
-                            )
-                        except Exception as table_exc:  # 单表失败不中断整体
-                            msg = f"表 {table} 备份失败: {str(table_exc)[:200]}"
-                            logger.error(f"【{self.task_name}】{msg}")
-                            error_messages.append(msg)
-                    self._write_footer(fp)
+                    # 以 gzip 文本模式写入，边导出边落盘，降低内存占用
+                    with os.fdopen(os.open(file_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as raw, gzip.open(raw, "wt", encoding="utf-8") as fp:
+                        self._write_header(fp, database, now)
+                        for index, table in enumerate(tables, start=1):
+                            try:
+                                rows = await self._dump_table(session, fp, table)
+                                table_count += 1
+                                total_rows += rows
+                                logger.info(
+                                    f"【{self.task_name}】({index}/{len(tables)}) 表 {table} 完成，{rows} 行"
+                                )
+                            except Exception as table_exc:  # 单表失败不中断整体
+                                msg = f"表 {table} 备份失败: {type(table_exc).__name__}"
+                                logger.error(f"【{self.task_name}】{msg}")
+                                error_messages.append(msg)
+                        self._write_footer(fp)
 
             file_size = file_path.stat().st_size if file_path.exists() else 0
             duration_ms = int((time.monotonic() - start_time) * 1000)
@@ -135,7 +119,7 @@ class DbBackupTaskService:
             )
         except Exception as exc:
             duration_ms = int((time.monotonic() - start_time) * 1000)
-            error_text = str(exc)[:1000]
+            error_text = type(exc).__name__
             logger.error(f"【{self.task_name}】执行失败: {error_text}")
 
             # 失败时清理可能残留的不完整文件
@@ -156,21 +140,37 @@ class DbBackupTaskService:
                 error_message=error_text,
             )
         finally:
-            # 无论本次备份成败，都清理过期备份（保留最近 N 天），清理失败不影响主流程
+            # 只有最新备份已有恢复验证且校验和匹配，保留策略才执行淘汰。
             await self._cleanup_expired_backups()
+
+    @staticmethod
+    @asynccontextmanager
+    async def _snapshot(session):
+        original_zone = (await session.execute(text('SELECT @@SESSION.time_zone'))).scalar_one()
+        try:
+            # TIMESTAMP values must have one transport timezone on both servers.
+            await session.execute(text("SET SESSION time_zone='+00:00'"))
+            await session.execute(text('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ'))
+            await session.execute(text('START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY'))
+            yield
+        finally:
+            await session.execute(text('SET SESSION time_zone=:zone'), {'zone': original_zone})
 
     async def _list_tables(self, session: AsyncSession, database: str) -> list[str]:
         """查询当前数据库下的所有基础表（不含视图）。"""
         stmt = text(
             """
-            SELECT TABLE_NAME
+            SELECT TABLE_NAME, ENGINE
             FROM information_schema.TABLES
             WHERE TABLE_SCHEMA = :db AND TABLE_TYPE = 'BASE TABLE'
             ORDER BY TABLE_NAME
             """
         )
         result = await session.execute(stmt, {"db": database})
-        return [row[0] for row in result.all()]
+        rows = result.all()
+        if any(row[1] != 'InnoDB' for row in rows):
+            raise NonTransactionalBackupTable()
+        return [row[0] for row in rows]
 
     @staticmethod
     def _write_header(fp, database: str, now: datetime) -> None:
@@ -178,8 +178,10 @@ class DbBackupTaskService:
         fp.write(f"-- 数据库备份文件\n")
         fp.write(f"-- 数据库: {database}\n")
         fp.write(f"-- 备份时间(北京时间): {now.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        fp.write("-- 说明: 本文件由定时任务自动生成。普通表备份结构与数据，日志表仅备份结构\n\n")
+        fp.write("-- 说明: 本文件由定时任务自动生成。全部表备份结构与数据，包含业务日志与防重事实\n\n")
         fp.write("SET NAMES utf8mb4;\n")
+        fp.write("SET SQL_MODE='NO_AUTO_VALUE_ON_ZERO';\n")
+        fp.write("SET TIME_ZONE='+00:00';\n")
         fp.write("SET FOREIGN_KEY_CHECKS=0;\n\n")
 
     @staticmethod
@@ -200,11 +202,6 @@ class DbBackupTaskService:
         fp.write(f"DROP TABLE IF EXISTS `{table}`;\n")
         fp.write(f"{create_sql};\n\n")
 
-        # 日志类表数据量大且恢复价值低，仅备份表结构、跳过数据
-        if _is_log_table(table):
-            fp.write(f"-- 表 {table} 为日志表，仅备份结构，跳过数据\n\n")
-            return 0
-
         # 2. 表数据（分批查询，避免一次性载入大表；使用 buffered 查询保证 asyncmy 稳定性）
         fp.write(f"-- 表数据: {table}\n")
         columns = await self._get_columns(session, table)
@@ -214,7 +211,7 @@ class DbBackupTaskService:
         offset = 0
         while True:
             result = await session.execute(
-                text(f"SELECT * FROM `{table}` LIMIT :limit OFFSET :offset"),
+                text(f"SELECT {col_clause} FROM `{table}` LIMIT :limit OFFSET :offset"),
                 {"limit": _BATCH_SIZE, "offset": offset},
             )
             rows = result.fetchall()
@@ -238,6 +235,7 @@ class DbBackupTaskService:
             SELECT COLUMN_NAME
             FROM information_schema.COLUMNS
             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :table
+              AND (GENERATION_EXPRESSION IS NULL OR GENERATION_EXPRESSION = '')
             ORDER BY ORDINAL_POSITION
             """
         )
@@ -256,17 +254,17 @@ class DbBackupTaskService:
         if isinstance(value, (bytes, bytearray)):
             return f"0x{value.hex()}" if value else "''"
         if isinstance(value, datetime):
-            return "'" + value.strftime("%Y-%m-%d %H:%M:%S") + "'"
-        # 其余统一按字符串处理并转义特殊字符，防止破坏 SQL 结构
-        text_value = str(value)
-        escaped = (
-            text_value.replace("\\", "\\\\")
-            .replace("'", "\\'")
-            .replace("\n", "\\n")
-            .replace("\r", "\\r")
-            .replace("\x00", "")
-        )
-        return f"'{escaped}'"
+            value = value.strftime("%Y-%m-%d %H:%M:%S.%f")
+        elif isinstance(value, timedelta):
+            microseconds = (value.days * 86400 + value.seconds) * 1_000_000 + value.microseconds
+            sign = '-' if microseconds < 0 else ''
+            seconds, fraction = divmod(abs(microseconds), 1_000_000)
+            hours, seconds = divmod(seconds, 3600)
+            minutes, seconds = divmod(seconds, 60)
+            value = f'{sign}{hours:02}:{minutes:02}:{seconds:02}.{fraction:06}'
+        # Hex text preserves NUL, quotes and newlines independently of SQL escape mode.
+        encoded = str(value).encode('utf-8').hex()
+        return f"CONVERT(0x{encoded} USING utf8mb4)" if encoded else "''"
 
     @with_db_retry(max_retries=3, initial_delay=1.0)
     async def _log_result(
@@ -297,49 +295,25 @@ class DbBackupTaskService:
                 session.add(log)
                 await session.commit()
         except Exception as exc:
-            logger.error(f"【{self.task_name}】记录备份日志失败: {exc}")
+            logger.error("【{}】记录备份日志失败: {}", self.task_name, type(exc).__name__)
 
     async def _cleanup_expired_backups(self) -> None:
-        """清理过期的备份文件与备份日志记录（保留最近 _RETENTION_DAYS 天）。
-
-        说明：
-        - 仅删除备份文件与备份日志记录，绝不触碰任何业务数据表
-        - 文件删除依据文件修改时间，日志删除依据 created_at
-        - 任意一步失败均不影响本次备份主流程
-        """
-        cutoff = get_beijing_now() - timedelta(days=_RETENTION_DAYS)
-
-        # 1. 删除过期备份文件
+        """新备份通过隔离恢复且校验和一致后，才按日周恢复点淘汰。"""
+        from common.services.backup_retention_service import prune_verified_backups
         try:
-            backup_root = get_backup_root()
-            if backup_root.is_dir():
-                cutoff_ts = cutoff.timestamp()
-                removed = 0
-                for file in backup_root.glob("backup_*.sql.gz"):
-                    try:
-                        if file.is_file() and file.stat().st_mtime < cutoff_ts:
-                            file.unlink()
-                            removed += 1
-                    except Exception as file_exc:
-                        logger.warning(f"【{self.task_name}】删除过期备份文件失败 {file.name}: {file_exc}")
-                if removed:
-                    logger.info(f"【{self.task_name}】已清理 {removed} 个超过 {_RETENTION_DAYS} 天的备份文件")
-        except Exception as exc:
-            logger.error(f"【{self.task_name}】清理过期备份文件异常: {exc}")
-
-        # 2. 删除过期备份日志记录
-        try:
-            cutoff_naive = get_beijing_now_naive() - timedelta(days=_RETENTION_DAYS)
             async with async_session_maker() as session:
-                result = await session.execute(
-                    delete(DbBackupLog).where(DbBackupLog.created_at < cutoff_naive)
-                )
-                await session.commit()
-                deleted = int(result.rowcount or 0)
-                if deleted:
-                    logger.info(f"【{self.task_name}】已清理 {deleted} 条超过 {_RETENTION_DAYS} 天的备份日志")
+                result = await prune_verified_backups(session, apply=True)
+                logger.info("备份保留检查: {}，删除文件 {} 个", result['status'], len(result['removed']))
         except Exception as exc:
-            logger.error(f"【{self.task_name}】清理过期备份日志异常: {exc}")
+            logger.warning("备份保留检查未完成，旧备份继续保留: {}", type(exc).__name__)
+
+        from common.services.audit_retention import archive_audit_history
+        try:
+            async with async_session_maker() as session:
+                result = await archive_audit_history(session)
+                logger.info("操作审计归档: {} 条", result['archived'])
+        except Exception as exc:
+            logger.warning("操作审计归档未完成，原记录继续保留: {}", type(exc).__name__)
 
 
 # 全局实例
