@@ -16,7 +16,7 @@ import subprocess
 BASELINE = 'fdc8eb039be771456ecfbbbe43fa26f57feb3947'
 BRANCH = 'xianyu-management-bot-fork'
 INPUT_HASHES = {
-    'spec': '305e4abcb515fcefc98def5456ee897859ee8059a2b83bd2751e1d384d62eac5',
+    'spec': 'd35f88a0ed37db35d709e5e6439f6af062f58461a0273c2ece4f1c47a64b6657',
     'matrix': '22cc6973604004e5f82c0883ca511747837e0c9e8f7ac0e35c3512c0d60584b0',
     'patches': 'feb92cbdb8ffbd0e0b7975196f6c35c233171a5ee78f3f43874c4f6620d0da4b',
 }

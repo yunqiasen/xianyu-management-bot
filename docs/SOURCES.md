@@ -19,9 +19,11 @@
 
 ## 固定验收输入
 
-- [规格](specs/XYMB-SPEC-001.md)：`305e4abcb515fcefc98def5456ee897859ee8059a2b83bd2751e1d384d62eac5`
+- [规格](specs/XYMB-SPEC-001.md)：`d35f88a0ed37db35d709e5e6439f6af062f58461a0273c2ece4f1c47a64b6657`
 - [49组研究矩阵](provenance/feature-coverage-matrix.json)：`22cc6973604004e5f82c0883ca511747837e0c9e8f7ac0e35c3512c0d60584b0`
 - [19项旧差异处置](provenance/local-patch-dispositions.json)：`feb92cbdb8ffbd0e0b7975196f6c35c233171a5ee78f3f43874c4f6620d0da4b`
+
+规格v1.0.1仅修正文档引用，业务范围保持v1.0；原v1.0 SHA256为`305e4abcb515fcefc98def5456ee897859ee8059a2b83bd2751e1d384d62eac5`，可从Git历史查阅。
 
 这三份是冻结的范围和来源依据，不更新里面的历史状态冒充当前结果。当前实现与测试在 [覆盖索引](COVERAGE.md)，实际运行报告在仓库外的项目归档。19项旧差异中6项与GuDong固定版相同，不重复声称为本地新补丁。
 

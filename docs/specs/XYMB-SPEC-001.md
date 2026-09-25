@@ -1,7 +1,7 @@
 # XYMB-SPEC-001：闲鱼管理机器人全量改造规格
 
 ID: XYMB-SPEC-001
-Version: 1.0
+Version: 1.0.1
 Status: published / awaiting-ticket-handoff
 Tracker: local-markdown
 Repository: yunqiasen/xianyu-management-bot
@@ -13,6 +13,8 @@ Specification handoff: pending
 Implementation: not-started
 
 本文是本地任务台账中的正式规格，不是代码交付或生产发布。设计方向及三个测试入口已经确认；本版细化参数和完整验收要求随本次规格交接一起审阅。当前目标源码仓库尚未创建，现用业务代码、数据库及服务保持原状。
+
+> 2026-09-25 文档修订：仅修复已删除工作目录的引用，不调整业务范围、故事或验收要求。以上交接状态与正文中的“当前”保留2026-09-21的历史语境；现行实现见[功能覆盖](../COVERAGE.md)，运行状态以部署实测为准。
 
 ## Problem Statement
 
@@ -483,15 +485,15 @@ S1和S2是一套场景驱动的两侧，优先复用已有接口和事件入口�
 
 ### N03 权威输入与验证记录
 
-- [业务词表](/home/div/1_Project_dir/Project/.scratch/xianyu-management-bot/CONTEXT.md)
+- [业务词表](../../CONTEXT.md)
 - [六项ADR与确认记录](/home/div/1_Project_dir/Project/archives/xianyu-management-bot/notes/alignment-20260921/README.md)
 - [整体设计方案及分期](/home/div/1_Project_dir/Project/archives/xianyu-management-bot/notes/overall-plan-20260921.md)
-- [GuDong功能差异研究](/home/div/1_Project_dir/Project/.scratch/xianyu-management-bot/research/feature-coverage.md)
-- [49组源码覆盖台账](/home/div/1_Project_dir/Project/.scratch/xianyu-management-bot/assets/feature-coverage-matrix.json)
-- [四来源固定版本及许可](/home/div/1_Project_dir/Project/.scratch/xianyu-management-bot/research/source-baselines.md)
-- [shaxiu/LENKIN参考边界](/home/div/1_Project_dir/Project/.scratch/xianyu-management-bot/research/reference-boundaries.md)
-- [现用19个文件处置](/home/div/1_Project_dir/Project/.scratch/xianyu-management-bot/assets/local-patch-dispositions.json)
-- [原17项函数探针](/home/div/1_Project_dir/Project/.scratch/xianyu-management-bot/assets/coverage-probes-reproduced.json)
+- [GuDong功能来源与差异](../provenance/feature-coverage-matrix.json)
+- [49组源码覆盖台账](../provenance/feature-coverage-matrix.json)
+- [四来源实施固定版本及许可](../SOURCES.md)
+- 现行参考边界：[议价](../implementation/bargaining.md)、[监控](../implementation/monitor.md)；原研究工作稿已清理。
+- [原19个文件处置](../provenance/local-patch-dispositions.json)
+- 原17项函数探针工作稿已清理，不再作为可访问证据；当前测试入口见[覆盖索引](../COVERAGE.md)，两者不等同。
 - [两项代理故障探针](/home/div/1_Project_dir/Project/archives/xianyu-management-bot/notes/account-proxy-probe-20260921.json)
 - [账号规则确认](/home/div/1_Project_dir/Project/archives/xianyu-management-bot/notes/account-recovery-20260921.md)
 - [规格覆盖及一致性验证记录](/home/div/1_Project_dir/Project/archives/xianyu-management-bot/notes/specification-20260921.json)
