@@ -36,6 +36,8 @@ class MappingTests(unittest.TestCase):
         self.assertEqual(a['metadata']['ai_reply_settings']['max_bargain_rounds'], 0)
 
     def test_incompatible_password_hash_never_reused_as_live_password(self):
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE users SET password_hash='unsupported-format'")
         u = self.steps('xy_users')[0].values
         self.assertEqual(u['status'], 'INACTIVE')
         self.assertTrue(u['password_hash'].startswith('$pbkdf2-sha256$'))
