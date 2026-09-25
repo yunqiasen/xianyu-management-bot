@@ -226,12 +226,13 @@ def plan(snapshot: Snapshot, *, namespace: str, key: bytes, source_key=None, run
         if direction not in (1, 2):
             raise MigrationError('invalid_message_direction')
         content_type = r.get('content_type', 1)
-        if content_type not in (1, 2):
+        system_notice = content_type in (14, 25, 26)
+        if content_type not in (1, 2, 14, 25, 26):
             issue('chat_messages', 'unsupported_message_type')
         add('chat_messages', r, 'xy_reply_events', dict(account_id=r['cookie_id'], chat_id=normalize_chat(r['chat_id']), event_id='migration:' + token('chat', r['id']), message_id='migration:' + token('chat', r['id']),
-            role='assistant' if direction == 1 else 'user', origin='manual' if r.get('reply_source') == 'manual' else 'platform',
+            role='system' if system_notice else ('assistant' if direction == 1 else 'user'), origin='manual' if r.get('reply_source') == 'manual' else 'platform',
             sender_id=r.get('sender_id') or '', sender_name=r.get('sender_name') or '', item_id=r.get('item_id') or '',
-            content=(r.get('image_url') or r.get('content') or '') if content_type==2 else (r.get('content') or ''), content_type='image' if content_type == 2 else 'text',
+            content=(r.get('image_url') or r.get('content') or '') if content_type==2 else (r.get('content') or ''), content_type='system' if system_notice else ('image' if content_type == 2 else 'text'),
             occurred_at=timestamp(r.get('created_at')).replace(tzinfo=timezone.utc).timestamp(), status='confirmed'),
             lookup=('account_id', 'chat_id', 'event_id'))
         if r.get('image_url') or r.get('media_url') or r.get('extra_json'):
