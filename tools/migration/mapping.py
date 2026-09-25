@@ -131,7 +131,7 @@ def plan(snapshot: Snapshot, *, namespace: str, key: bytes, source_key=None, run
         except (ValueError, TypeError):
             compatible = False
         # The actual AuthService explicitly supports legacy SHA256 hex hashes.
-        compatible = compatible or bool(re.fullmatch(r'[0-9a-fA-F]{64}', source_hash))
+        compatible = compatible or (isinstance(source_hash, str) and bool(re.fullmatch(r'[0-9a-fA-F]{64}', source_hash)))
         if not compatible:
             # Deterministic, unguessable replacement; migration key is not a user password.
             source_hash = pbkdf2_sha256.using(rounds=29000, salt=bytes.fromhex(token('password-salt', r['id'])[:32])).hash(token('password', r['id']))

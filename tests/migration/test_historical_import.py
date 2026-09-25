@@ -1,6 +1,5 @@
 """Known legacy history is preserved without becoming live work or buyer input."""
 import hashlib
-import json
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -40,3 +39,12 @@ class HistoricalImportTests(unittest.TestCase):
         with sqlite3.connect(self.path) as db:
             db.execute('ALTER TABLE chat_messages ADD COLUMN content_type INTEGER DEFAULT 999')
         self.assertTrue(any(i['code'] == 'unsupported_message_type' and i['blocking'] for i in self.build().issues))
+
+    def test_missing_password_stays_in_controlled_reset_instead_of_crashing(self):
+        with sqlite3.connect(self.path) as db:
+            db.execute('UPDATE users SET password_hash=NULL WHERE id=1')
+        prepared = self.build()
+        user = next(s for s in prepared.steps if s.target == 'xy_users' and s.values['username'] == 'seller-a')
+        self.assertTrue(user.values['password_hash'].startswith('$pbkdf2-sha256$'))
+        self.assertEqual(user.values['status'], 'INACTIVE')
+        self.assertTrue(any(i['code'] == 'password_reset_required' for i in prepared.issues))
