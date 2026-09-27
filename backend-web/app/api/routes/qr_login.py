@@ -20,6 +20,7 @@ from app.api.deps import get_db_session as get_db
 from common.models.user import User
 from common.schemas.common import ApiResponse
 from common.services.account_limit_service import AccountLimitExceededError
+from common.services.account_credentials import CredentialRejected
 
 router = APIRouter(prefix="/qr-login", tags=["二维码登录"])
 
@@ -198,7 +199,10 @@ async def get_qr_status(
                             binding = {'account_id': existing.account_id, 'job_id': job['id']}
                         proxy_config = ({k: getattr(existing,k) for k in ('proxy_type','proxy_host','proxy_port','proxy_user','proxy_pass')}
                                         if existing else {'proxy_type': 'none'})
-                        verified = await validate_credentials(cookies_str, existing.unb if existing else unb, proxy_config)
+                        verified = await validate_credentials(
+                            cookies_str, existing.unb if existing else unb, proxy_config,
+                            initialize_token=True,
+                        )
                         if binding:
                             if not existing or not await account_service.finish_credential_job(existing, binding['job_id'], verified):
                                 raise ValueError('扫码任务已结束或版本已更新')
@@ -242,7 +246,7 @@ async def get_qr_status(
                         
                         # 构建请求参数
                         request_data = {
-                            "cookie_value": cookies_str,
+                            "cookie_value": verified,
                             "user_id": owner_id
                         }
                         
@@ -300,6 +304,20 @@ async def get_qr_status(
             data=status_info
         )
         
+    except CredentialRejected as exc:
+        messages = {
+            'token_initialization': '登录凭据初始化失败，请重新扫码',
+            'invalid_credentials': '扫码登录凭据已失效，请重新扫码',
+            'verification': '闲鱼要求额外验证，请在手机端完成后重新扫码',
+            'rate_limit': '闲鱼请求过于频繁，请稍后再试',
+            'network': '闲鱼接口暂时异常，请稍后再试',
+        }
+        logger.warning("扫码凭据校验未通过: session_id={}, reason={}", session_id, exc.reason)
+        return ApiResponse(
+            success=False,
+            message=messages.get(exc.reason, '闲鱼未确认登录状态，请稍后重试'),
+            data={'status': 'failed', 'reason': exc.reason},
+        )
     except Exception as e:
         logger.exception(f"查询扫码状态时发生异常: {session_id}")
         return ApiResponse(

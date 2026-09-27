@@ -11,6 +11,12 @@
 - `AccountRuntime` 使用 Redis 租约与代次、MySQL 配置/凭据版本共同约束。Web、调度调用已有消息执行方；聊天页不另建登录连接。
 - WebSocket 注册收到有效确认后才显示业务可用；发送注册包、打开页面和保存配置均不等于账号恢复。
 
+## 扫码首次 Token 检查
+
+扫码 Cookie 可能只有登录会话，还没有 `_m_h5_tk`。扫码入口显式启用一次签名 Cookie 初始化：仅在 HTTP 200、平台明确返回令牌为空/过期并下发不同的非空签名 Cookie 时，合并 Set-Cookie，用同一个 Device ID 和账号代理重新签名查询一次。取得有效 IM Token 后才保存，消息服务收到的也必须是这份已验证 Cookie。
+
+这不是放行未验证凭据或通用重试。自动恢复调用默认仍只发一次请求，继续服从原共享预算；限流、额外验证、Session 失效、身份变化、无新令牌或第二次仍失败均停止。扫码失败向前端返回可读提示及原因码，不回显原始平台内容。
+
 ## 恢复与人工验证
 
 `account_renewal` / `AccountRecovery` 是主动保活、定时刷新、Token 更新和密码恢复的共同入口。普通网络故障、代理异常、限流分别处理；只有凭据失效进入适用的账密恢复。一次恢复链内部共用两次预算，第二次等待60秒附近；连续失败和反复失效窗口保持持久状态。
@@ -34,6 +40,6 @@ HTTP、WebSocket、登录浏览器读取同一账号绑定。支持显式 none�
 
 ## 验证入口
 
-`tests/accounts/`、`tests/dispatch/test_renewal.py`、`test_proxy_transport.py`、`tests/runtime/scheduler_config_suite.py`；`tests/accounts/browser_policy.py` 操作真实配置面板和离线消费者。`test_api.py` 覆盖旧任务轮询/取消、旧绑定重开任务和到期替换；`test_recovery_chain.py` 覆盖自动与人工旧任务均不挡住新恢复。`test_infrastructure.py` 使用真实隔离 MySQL/Redis 验证身份竞争、任务合并和并行消费者确认。
+`tests/accounts/`（含 `test_qr_token_handshake.py` 的真实路由→HTTP签名握手→落库/启动接线）、`tests/dispatch/test_renewal.py`、`test_proxy_transport.py`、`tests/runtime/scheduler_config_suite.py`；`tests/accounts/browser_policy.py` 操作真实配置面板和离线消费者。`test_api.py` 覆盖旧任务轮询/取消、旧绑定重开任务和到期替换；`test_recovery_chain.py` 覆盖自动与人工旧任务均不挡住新恢复。`test_infrastructure.py` 使用真实隔离 MySQL/Redis 验证身份竞争、任务合并和并行消费者确认。
 
 这些验证使用合成账号与可控通信端点。真实账号的扫码、短信、人脸和长期续期结果属于独立发布验收。

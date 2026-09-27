@@ -87,6 +87,8 @@ def extract_im_access_token(response_json: Any) -> str | None:
     ret_value = response_json.get("ret", []) or []
     if isinstance(ret_value, str):
         ret_value = [ret_value]
+    if not isinstance(ret_value, list):
+        return None
     if not any("SUCCESS::调用成功" in str(item) for item in ret_value):
         return None
 
@@ -212,12 +214,8 @@ async def request_im_token(
         ) as response:
             # 风控响应的 content-type 可能不是 json，统一放开校验避免解析异常
             response_json = await response.json(content_type=None)
-            response_cookies: dict[str, str] = {}
-            for cookie_header in response.headers.getall("set-cookie", []):
-                if "=" not in cookie_header:
-                    continue
-                name, value = cookie_header.split(";", 1)[0].split("=", 1)
-                response_cookies[name.strip()] = value.strip()
+            # 使用 HTTP Cookie 解析结果；Set-Cookie 的空值 "" 不是有效签名令牌。
+            response_cookies = {name: morsel.value for name, morsel in response.cookies.items()}
             return ImTokenApiResult(
                 response_json=response_json,
                 response_cookies=response_cookies,
