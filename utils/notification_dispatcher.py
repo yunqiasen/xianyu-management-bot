@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import smtplib
 import threading
 import time
@@ -144,15 +145,18 @@ def get_notification_template_text(template_type: str) -> str:
     return DEFAULT_NOTIFICATION_TEMPLATES.get(template_type, '')
 
 
+# Adapted from zhinianboke 2b95816 / 565df70: one-pass placeholders.
+# Keep GuDong single braces and unknown placeholders for backwards compatibility.
+_TEMPLATE_VARIABLE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}|\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
 def format_notification_template(template: str, **kwargs: Any) -> str:
-    rendered = template or ''
-    try:
-        for key, value in kwargs.items():
-            rendered = rendered.replace(f'{{{key}}}', str(value) if value is not None else '未知')
-        return rendered
-    except Exception as exc:
-        logger.error(f"格式化模板失败: {_safe_str(exc)}")
-        return rendered
+    def replace(match):
+        key = match.group(1) or match.group(2)
+        if key not in kwargs:
+            return match.group(0)
+        value = kwargs[key]
+        return str(value) if value is not None else '未知'
+    return _TEMPLATE_VARIABLE.sub(replace, template or '')
 
 
 def render_notification_template(template_type: str, **kwargs: Any) -> str:

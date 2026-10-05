@@ -7931,9 +7931,8 @@ async def test_notification_template(data: TestNotificationIn, current_user: Dic
         }
 
         # 格式化模板
-        template = data.template
-        for key, value in test_data.get(data.template_type, {}).items():
-            template = template.replace(f'{{{key}}}', str(value))
+        from utils.notification_dispatcher import format_notification_template
+        template = format_notification_template(data.template, **test_data.get(data.template_type, {}))
 
         # 发送测试通知到所有已启用的渠道
         success_channels = []
