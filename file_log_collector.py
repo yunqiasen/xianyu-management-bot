@@ -45,7 +45,7 @@ class FileLogCollector:
         
         if not self.log_file:
             # 如果没有找到现有文件，创建一个新的
-            self.log_file = "realtime.log"
+            self.log_file = "logs/realtime.log"
             
         # 设置loguru输出到文件
         self.setup_loguru_file_output()

@@ -1,0 +1,43 @@
+services:
+  app:
+    image: xianyu-management-bot:gudong-local
+    build:
+      context: .
+      dockerfile: Dockerfile.local
+    init: true
+    restart: unless-stopped
+    working_dir: /app
+    entrypoint: ["/bin/bash", "/app/entrypoint.sh"]
+    stop_grace_period: 30s
+    ports:
+      - "${XYMB_BIND:-0.0.0.0}:${XYMB_PORT:-19010}:8090"
+    env_file:
+      - ${XYMB_ENV_FILE:?set private runtime env path}
+    environment:
+      XYMB_DEV_RELOAD: "true"
+      RELOAD: "false"
+      USE_XVFB: "true"
+      ENABLE_HEADFUL: "true"
+      ENABLE_VNC: "false"
+      DISPLAY: ":99"
+      DB_PATH: /app/data/xianyu_data.db
+      SQL_LOG_ENABLED: "false"
+      PYTHONDONTWRITEBYTECODE: "1"
+      TZ: Asia/Shanghai
+    volumes:
+      - .:/app:ro
+      - ${XYMB_RUNTIME:?set runtime path}/data:/app/data
+      - ${XYMB_RUNTIME}/logs:/app/logs
+      - ${XYMB_RUNTIME}/backups:/app/backups
+      - ${XYMB_RUNTIME}/uploads:/app/static/uploads
+      - ${XYMB_RUNTIME}/trajectory_history:/app/trajectory_history
+      - ${XYMB_RUNTIME}/browser_data:/app/browser_data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    shm_size: 1gb
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://127.0.0.1:8090/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s

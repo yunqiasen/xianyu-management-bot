@@ -197,4 +197,7 @@ echo "正在启动应用..."
 echo ""
 
 # 使用 exec 替换当前 shell，这样 Python 进程可以接收信号
+if [ "${XYMB_DEV_RELOAD:-false}" = "true" ]; then
+    exec python tools/dev_reload.py
+fi
 exec python Start.py

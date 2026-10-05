@@ -1,0 +1,4 @@
+# Pinned GuDong runtime dependencies. Application code is the local fork mount.
+FROM ghcr.io/gudong2003/xianyu-auto-reply-fix@sha256:4acc579011cbae6e20be98ceb5e86553ad13884c81090736a5545d0725269e52
+WORKDIR /app
+COPY . /app
