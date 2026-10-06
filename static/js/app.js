@@ -44,6 +44,11 @@ let itemPublishSavingMaterial = false;
 let itemPublishLoadedMaterialId = null;
 let itemPublishLoadedMaterialImages = [];
 let itemPublishMaterials = [];
+let itemPublishCategoryState = {choice: null, candidates: [], properties: [], requestId: 0};
+let itemPublishMaterialPage = 1;
+let itemPublishMaterialPageSize = 20;
+let itemPublishMaterialTotal = 0;
+let itemPublishMaterialRequestId = 0;
 let itemPublishLogs = [];
 const ITEM_PUBLISH_DEFAULT_SKU_TYPES = ['颜色', '尺码', '容量', '份数', '大小', '高度', '总量'];
 const ITEM_PUBLISH_MAX_SKU_PROPERTIES = 2;
@@ -11816,6 +11821,7 @@ function clearItemPublishImagePreviews() {
 }
 
 function clearItemPublishForm(clearResult = true) {
+    resetPublishCategory();
     clearItemPublishImagePreviews();
     itemPublishLoadedMaterialId = null;
     itemPublishLoadedMaterialImages = [];
@@ -11945,6 +11951,115 @@ function parseOptionalPublishNumber(value, label) {
     return number;
 }
 
+function resetPublishCategory(message = '未选择，发布时由平台推荐') {
+    itemPublishCategoryState.requestId++;
+    itemPublishCategoryState.choice = null;
+    itemPublishCategoryState.candidates = [];
+    itemPublishCategoryState.properties = [];
+    renderPublishCategory();
+    const status = document.getElementById('publishPlatformCategoryStatus');
+    if (status) status.textContent = message;
+    const button = document.getElementById('publishCategoryRecommendBtn');
+    if (button) button.disabled = false;
+}
+
+function renderPublishCategory() {
+    const select = document.getElementById('publishPlatformCategory');
+    const attrs = document.getElementById('publishCategoryAttributes');
+    if (!select || !attrs) return;
+    const state = itemPublishCategoryState;
+    select.innerHTML = '<option value="">自动推荐（不固定类目）</option>' + state.candidates.map((c, i) =>
+        `<option value="${i}" ${c.is_selected ? 'selected' : ''}>${escapeHtml(c.cat_name || c.channel_cat_name || '分类')} · ${escapeHtml(c.channel_cat_id || c.cat_id || c.tb_cat_id || '')}</option>`).join('');
+    attrs.innerHTML = state.properties.map((p, i) => `<div class="col-md-6"><label class="form-label" for="publishCategoryAttr${i}">${escapeHtml(p.property_name)}</label><select id="publishCategoryAttr${i}" class="form-select" data-property-index="${i}" onchange="updatePublishCategoryAttributes()"><option value="">按平台默认</option>${p.options.map((o, n) => `<option value="${n}" ${o.is_selected ? 'selected' : ''}>${escapeHtml(o.value_name || o.value_id)}</option>`).join('')}</select></div>`).join('');
+    const status = document.getElementById('publishPlatformCategoryStatus');
+    if (status) status.textContent = state.choice ? `已选择：${state.choice.cat_name || state.choice.channel_cat_name || state.choice.channel_cat_id}；发布时重新校验` : '未选择，发布时由平台推荐';
+}
+
+function updatePublishCategoryAttributes() {
+    const state = itemPublishCategoryState;
+    if (!state.choice) return;
+    const attrs = [];
+    document.getElementById('publishCategoryAttributes')?.querySelectorAll('select').forEach(el => {
+        if (el.value === '') return;
+        const p = state.properties[Number(el.dataset.propertyIndex)];
+        const v = p?.options[Number(el.value)];
+        if (v) attrs.push({property_id: p.property_id, value_id: v.value_id, value_name: v.value_name});
+    });
+    state.choice.attributes = attrs;
+}
+
+async function changePublishCategory() {
+    const index = document.getElementById('publishPlatformCategory')?.value;
+    if (index === '') { resetPublishCategory(); return; }
+    const choice = itemPublishCategoryState.candidates[Number(index)];
+    if (choice) await loadPublishCategories(choice);
+}
+
+async function loadPublishCategories(choice = null) {
+    const values = getItemPublishFormValues();
+    if (!values.accountId || !values.title) { showToast('先选择账号并填写标题', 'warning'); return; }
+    const state = itemPublishCategoryState;
+    const requestId = ++state.requestId;
+    state.choice = null; // Do not save an old category while a new request is pending.
+    state.properties = [];
+    const button = document.getElementById('publishCategoryRecommendBtn');
+    if (button) button.disabled = true;
+    const status = document.getElementById('publishPlatformCategoryStatus');
+    if (status) status.textContent = '正在读取平台类目…';
+    try {
+        const result = await requestItemPublishJson('/product-publish/categories', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({account_id: values.accountId, title: values.title, description: values.description,
+                category: values.category, platform_category: choice})
+        });
+        if (requestId !== state.requestId) return;
+        if (!result.success) throw new Error(result.message || '类目推荐失败');
+        state.choice = {...result.category};
+        state.candidates = result.candidates || [];
+        state.properties = result.properties || [];
+        renderPublishCategory();
+        updatePublishCategoryAttributes();
+    } catch (error) {
+        if (requestId !== state.requestId) return;
+        resetPublishCategory('推荐失败：' + error.message);
+        showToast(error.message, 'warning');
+    } finally {
+        if (requestId === state.requestId && button) button.disabled = false;
+    }
+}
+
+function restorePublishCategory(choice) {
+    resetPublishCategory();
+    if (!choice) return;
+    itemPublishCategoryState.choice = JSON.parse(JSON.stringify(choice));
+    itemPublishCategoryState.candidates = [{...choice, is_selected: true}];
+    // Saved choices are retained without contacting the platform; recommend again to edit options.
+    itemPublishCategoryState.properties = (choice.attributes || []).map(a => ({property_id:a.property_id,
+        property_name:a.property_id, options:[{value_id:a.value_id, value_name:a.value_name || a.value_id, is_selected:true}]}));
+    renderPublishCategory();
+}
+
+function renderItemPublishMaterialPager() {
+    const pages = Math.max(1, Math.ceil(itemPublishMaterialTotal / itemPublishMaterialPageSize));
+    const status = document.getElementById('publishMaterialPageStatus');
+    if (status) status.textContent = `${itemPublishMaterialPage} / ${pages} 页 · 共 ${itemPublishMaterialTotal} 条`;
+    const prev = document.getElementById('publishMaterialPrev');
+    const next = document.getElementById('publishMaterialNext');
+    if (prev) prev.disabled = itemPublishMaterialPage <= 1;
+    if (next) next.disabled = itemPublishMaterialPage >= pages;
+}
+
+function changeItemPublishMaterialPage(delta) {
+    itemPublishMaterialPage = Math.max(1, Math.min(Math.max(1, Math.ceil(itemPublishMaterialTotal / itemPublishMaterialPageSize)), itemPublishMaterialPage + delta));
+    return loadItemPublishMaterials();
+}
+
+function changeItemPublishMaterialPageSize(value) {
+    itemPublishMaterialPageSize = [10, 20, 50].includes(Number(value)) ? Number(value) : 20;
+    itemPublishMaterialPage = 1;
+    return loadItemPublishMaterials();
+}
+
 function getItemPublishFormValues() {
     return {
         accountId: document.getElementById('publishCookieId')?.value || '',
@@ -11957,6 +12072,7 @@ function getItemPublishFormValues() {
         postPrice: document.getElementById('publishPostPrice')?.value.trim() || '',
         canSelfPickup: document.getElementById('publishCanSelfPickup')?.checked || false,
         skuConfig: null,
+        platformCategory: itemPublishCategoryState.choice ? JSON.parse(JSON.stringify(itemPublishCategoryState.choice)) : null,
         files: Array.from(document.getElementById('publishImages')?.files || [])
     };
 }
@@ -12030,7 +12146,8 @@ function buildItemPublishJsonPayload(values, images) {
         postage: parseOptionalPublishNumber(values.postPrice, '邮费'),
         can_self_pickup: values.canSelfPickup,
         condition: '全新',
-        sku_config: values.skuConfig
+        sku_config: values.skuConfig,
+        platform_category: values.platformCategory || null
     };
 }
 
@@ -12164,17 +12281,24 @@ async function saveItemPublishMaterial() {
 
 async function loadItemPublishMaterials() {
     const container = document.getElementById('publishMaterialList');
-    if (!container) {
-        return;
-    }
+    if (!container) return;
+    const requestId = ++itemPublishMaterialRequestId;
     container.innerHTML = '<div class="text-muted small">正在加载素材...</div>';
     try {
-        const data = await requestItemPublishJson('/product-materials?page=1&page_size=20');
+        const data = await requestItemPublishJson(`/product-materials?page=${itemPublishMaterialPage}&page_size=${itemPublishMaterialPageSize}`);
+        if (requestId !== itemPublishMaterialRequestId) return;
+        itemPublishMaterialTotal = Number(data.total) || 0;
+        const pages = Math.max(1, Math.ceil(itemPublishMaterialTotal / itemPublishMaterialPageSize));
+        if (itemPublishMaterialPage > pages) {
+            itemPublishMaterialPage = pages;
+            return await loadItemPublishMaterials();
+        }
         itemPublishMaterials = data.list || [];
         renderItemPublishMaterials();
+        renderItemPublishMaterialPager();
     } catch (error) {
-        console.error('加载商品素材失败:', error);
-        container.innerHTML = '<div class="item-publish-preview-empty">加载素材失败</div>';
+        if (requestId !== itemPublishMaterialRequestId) return;
+        container.innerHTML = '<div class="item-publish-preview-empty">加载素材失败，请刷新重试</div>';
     }
 }
 
@@ -12236,6 +12360,7 @@ function loadItemPublishMaterialToForm(materialId) {
         imageInput.value = '';
     }
 
+    restorePublishCategory(material.platform_category);
     itemPublishLoadedMaterialId = material.id;
     itemPublishLoadedMaterialImages = Array.isArray(material.images) ? material.images : [];
     loadItemPublishSkuConfig(material.sku_config);
@@ -12355,6 +12480,7 @@ async function submitItemPublishForm() {
             formData.append('post_price', values.postPrice);
             formData.append('can_self_pickup', values.canSelfPickup ? 'true' : 'false');
             formData.append('sku_config', values.skuConfig ? JSON.stringify(values.skuConfig) : '');
+            formData.append('platform_category', values.platformCategory ? JSON.stringify(values.platformCategory) : '');
             values.files.forEach(file => formData.append('images', file));
 
             const response = await fetch(`${apiBase}/item-publish`, {

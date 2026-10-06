@@ -10204,6 +10204,7 @@ class ProductMaterialRequest(BaseModel):
     condition: Optional[str] = "全新"
     remark: Optional[str] = None
     sku_config: Optional[Dict[str, Any]] = None
+    platform_category: Optional[Dict[str, Any]] = None
 
 
 class ProductMaterialUpdateRequest(BaseModel):
@@ -10220,6 +10221,7 @@ class ProductMaterialUpdateRequest(BaseModel):
     condition: Optional[str] = None
     remark: Optional[str] = None
     sku_config: Optional[Dict[str, Any]] = None
+    platform_category: Optional[Dict[str, Any]] = None
 
 
 class ProductBatchPublishRequest(BaseModel):
@@ -10241,6 +10243,46 @@ class ProductSinglePublishRequest(BaseModel):
     brand: Optional[str] = None
     condition: Optional[str] = "全新"
     sku_config: Optional[Dict[str, Any]] = None
+    platform_category: Optional[Dict[str, Any]] = None
+
+
+class ProductCategoryRequest(BaseModel):
+    account_id: str
+    title: str
+    description: str = ""
+    category: Optional[str] = None
+    platform_category: Optional[Dict[str, Any]] = None
+
+
+def _normalize_platform_category(value):
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=400, detail="平台类目必须为有效 JSON") from exc
+    if not isinstance(value, dict) or len(json.dumps(value, ensure_ascii=False)) > 20000:
+        raise HTTPException(status_code=400, detail="平台类目格式错误或内容过长")
+    from utils.publish_categories import normalize_category
+    category = normalize_category(value)
+    if not any(category.get(k) for k in ('cat_id', 'channel_cat_id', 'tb_cat_id')):
+        raise HTTPException(status_code=400, detail="平台类目缺少分类 ID，请重新推荐")
+    attributes = value.get('attributes', [])
+    if not isinstance(attributes, list) or len(attributes) > 50:
+        raise HTTPException(status_code=400, detail="平台属性格式错误或数量过多")
+    seen = set()
+    for attr in attributes:
+        if not isinstance(attr, dict) or not attr.get('property_id'):
+            raise HTTPException(status_code=400, detail="平台属性缺少属性 ID")
+        pid = str(attr['property_id'])
+        if pid in seen or pid == '-10000':
+            raise HTTPException(status_code=400, detail="平台属性 ID 重复或无效")
+        if not attr.get('value_id') and not attr.get('value_name'):
+            raise HTTPException(status_code=400, detail="平台属性缺少选项")
+        seen.add(pid)
+    # Keep the user's ID/name vocabulary; the platform adapter normalizes aliases.
+    return value
 
 
 def _parse_optional_non_negative_float(value: Any, field_label: str) -> Optional[float]:
@@ -10445,6 +10487,9 @@ def _normalize_product_publish_data(data: Dict[str, Any], *, partial: bool = Fal
         except ProductSkuValidationError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    if 'platform_category' in data or not partial:
+        normalized['platform_category'] = _normalize_platform_category(data.get('platform_category'))
+
     sku_enabled = bool((normalized.get('sku_config') or {}).get('enabled'))
     if original_price is not None and current_price is None and not sku_enabled:
         raise HTTPException(status_code=400, detail="填写原价时必须同时填写现价")
@@ -10505,6 +10550,7 @@ async def _publish_product_to_account(
     can_self_pickup: bool,
     category_hint: Optional[str] = None,
     sku_config: Optional[Dict[str, Any]] = None,
+    platform_category: Optional[Dict[str, Any]] = None,
     material_id: Optional[int] = None,
     batch_id: Optional[str] = None,
     log_id: Optional[int] = None,
@@ -10576,6 +10622,7 @@ async def _publish_product_to_account(
                 can_self_pickup=bool(can_self_pickup),
                 category_hint=category_hint,
                 sku_config=normalized_sku_config,
+                platform_category=_normalize_platform_category(platform_category),
             )
             latest_cookies_str = publisher.cookies_str
             published_item_id = publisher.extract_published_item_id(publish_result)
@@ -10699,6 +10746,7 @@ async def _run_product_batch_publish(batch_id: str, jobs: List[Dict[str, Any]], 
                 can_self_pickup=bool(material.get('can_self_pickup')),
                 category_hint=material.get('category'),
                 sku_config=material.get('sku_config'),
+                platform_category=material.get('platform_category'),
                 material_id=material.get('id'),
                 batch_id=batch_id,
                 log_id=log_id,
@@ -10851,6 +10899,7 @@ async def publish_product_json(
         "brand": request.brand,
         "condition": request.condition,
         "sku_config": request.sku_config,
+        "platform_category": request.platform_category,
     }, partial=False)
     return await _publish_product_to_account(
         current_user=current_user,
@@ -10865,7 +10914,36 @@ async def publish_product_json(
         can_self_pickup=bool(data.get('can_self_pickup')),
         category_hint=data.get('category'),
         sku_config=data.get('sku_config'),
+        platform_category=data.get('platform_category'),
     )
+
+
+@app.post("/product-publish/categories")
+async def recommend_product_categories(
+    request: ProductCategoryRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Read platform recommendations without uploading images or publishing an item."""
+    from utils.item_publisher import ItemPublisher
+    account_id = _ensure_cookie_access(request.account_id, current_user)
+    cookies = str(_get_user_cookies_map(current_user).get(account_id) or '').strip()
+    if not cookies:
+        raise HTTPException(status_code=400, detail="账号 Cookie 为空，请重新登录")
+    if not request.title.strip() or len(request.title) > 60 or len(request.description) > 5000:
+        raise HTTPException(status_code=400, detail="请填写有效标题与描述")
+    choice = _normalize_platform_category(request.platform_category)
+    try:
+        async with ItemPublisher(cookies, account_id, proxy_config=db_manager.get_cookie_proxy_config(account_id)) as publisher:
+            result = await publisher.recommend_categories(
+                request.title.strip(), request.description.strip(), [],
+                category_hint=request.category, platform_category=choice,
+            )
+        return {"success": True, **{k: result[k] for k in ('category', 'candidates', 'properties')}}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.warning(f"类目推荐失败: {mask_sensitive_text(exc)}")
+        raise HTTPException(status_code=502, detail="平台类目推荐失败，请检查账号状态后重试") from exc
 
 
 @app.post("/product-publish/batch")
@@ -11095,6 +11173,7 @@ async def publish_item(
     post_price: str = Form(default=""),
     can_self_pickup: str = Form(default="false"),
     sku_config: str = Form(default=""),
+    platform_category: str = Form(default=""),
     images: List[UploadFile] = File(...),
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
@@ -11126,6 +11205,7 @@ async def publish_item(
         can_self_pickup=_parse_form_bool(can_self_pickup),
         category_hint=category,
         sku_config=sku_config,
+        platform_category=_normalize_platform_category(platform_category),
     )
 
 

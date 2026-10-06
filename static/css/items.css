@@ -331,3 +331,8 @@
     grid-template-columns: 1fr;
   }
 }
+
+/* Upstream material picker overflow fix adapted to the existing sidebar. */
+.item-publish-material-card, .item-publish-side-list, .item-publish-side-item { min-width: 0; max-width: 100%; }
+.item-publish-side-meta { overflow-wrap: anywhere; }
+#publishPlatformCategory, #publishCategoryAttributes select { min-width: 0; max-width: 100%; text-overflow: ellipsis; }

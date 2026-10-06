@@ -1263,6 +1263,8 @@ Cookie数量: {cookie_count}
         ''')
         cursor.execute("PRAGMA table_info(product_materials)")
         product_material_columns = {column[1] for column in cursor.fetchall()}
+        if 'platform_category' not in product_material_columns:
+            self._execute_sql(cursor, "ALTER TABLE product_materials ADD COLUMN platform_category TEXT")
         if 'sku_config' not in product_material_columns:
             self._execute_sql(cursor, "ALTER TABLE product_materials ADD COLUMN sku_config TEXT")
             logger.info("数据库迁移完成：product_materials 添加 sku_config 列")
@@ -10025,8 +10027,8 @@ Cookie数量: {cookie_count}
                 cursor.execute('''
                     INSERT INTO product_materials (
                         user_id, title, description, price, original_price, category, images,
-                        delivery_method, postage, can_self_pickup, brand, condition, remark, sku_config
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        delivery_method, postage, can_self_pickup, brand, condition, remark, sku_config, platform_category
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     user_id,
                     str(data.get('title') or '').strip(),
@@ -10042,6 +10044,7 @@ Cookie数量: {cookie_count}
                     data.get('condition') or '全新',
                     data.get('remark'),
                     sku_config_text,
+                    self._json_dumps_safe(data.get('platform_category')),
                 ))
                 material_id = cursor.lastrowid
                 self.conn.commit()
@@ -10070,6 +10073,7 @@ Cookie数量: {cookie_count}
             'sku_config': self._json_loads_safe(row[14], None),
             'created_at': row[15],
             'updated_at': row[16],
+            'platform_category': self._json_loads_safe(row[17], None),
         }
 
     def get_product_material(self, material_id: int, user_id: int = None) -> Optional[Dict[str, Any]]:
@@ -10081,7 +10085,7 @@ Cookie数量: {cookie_count}
                 sql = '''
                     SELECT id, user_id, title, description, price, original_price, category, images,
                            delivery_method, postage, can_self_pickup, brand, condition, remark, sku_config,
-                           created_at, updated_at
+                           created_at, updated_at, platform_category
                     FROM product_materials
                     WHERE id = ?
                 '''
@@ -10114,7 +10118,7 @@ Cookie数量: {cookie_count}
                 cursor.execute(f'''
                     SELECT id, user_id, title, description, price, original_price, category, images,
                            delivery_method, postage, can_self_pickup, brand, condition, remark, sku_config,
-                           created_at, updated_at
+                           created_at, updated_at, platform_category
                     FROM product_materials
                     {where_sql}
                     ORDER BY datetime(created_at) DESC, id DESC
@@ -10152,7 +10156,7 @@ Cookie数量: {cookie_count}
                 sql = f'''
                     SELECT id, user_id, title, description, price, original_price, category, images,
                            delivery_method, postage, can_self_pickup, brand, condition, remark, sku_config,
-                           created_at, updated_at
+                           created_at, updated_at, platform_category
                     FROM product_materials
                     WHERE id IN ({placeholders})
                 '''
@@ -10171,7 +10175,7 @@ Cookie数量: {cookie_count}
         allowed_fields = {
             'title', 'description', 'price', 'original_price', 'category', 'images',
             'delivery_method', 'postage', 'can_self_pickup', 'brand', 'condition', 'remark',
-            'sku_config'
+            'sku_config', 'platform_category'
         }
         update_fields = []
         params = []
@@ -10180,7 +10184,7 @@ Cookie数量: {cookie_count}
                 continue
             if key == 'images':
                 value = self._json_dumps_safe(value or [])
-            elif key == 'sku_config':
+            elif key in ('sku_config', 'platform_category'):
                 value = self._json_dumps_safe(value) if value else None
             elif key == 'can_self_pickup':
                 value = 1 if value else 0

@@ -10,6 +10,7 @@ from PIL import Image
 from loguru import logger
 
 from utils.xianyu_utils import generate_sign, trans_cookies
+from utils.publish_categories import normalize_category, normalize_cards, describe_categories, choose_cards, build_labels
 from utils.product_sku import build_sku_payload_fields, normalize_sku_config
 
 
@@ -199,12 +200,8 @@ class ItemPublisher:
 
     @classmethod
     def _normalize_category_result(cls, category_result: Dict[str, Any]) -> Dict[str, str]:
-        return {
-            "catId": str(cls._first_present_value(category_result, "catId", "cat_id") or "").strip(),
-            "catName": str(cls._first_present_value(category_result, "catName", "cat_name") or "").strip(),
-            "channelCatId": str(cls._first_present_value(category_result, "channelCatId", "channel_cat_id") or "").strip(),
-            "tbCatId": str(cls._first_present_value(category_result, "tbCatId", "tb_cat_id") or "").strip(),
-        }
+        result = normalize_category(category_result)
+        return {'catId': result['cat_id'], 'catName': result['cat_name'], 'channelCatId': result['channel_cat_id'], 'tbCatId': result['tb_cat_id']}
 
     @classmethod
     def _validate_category_recommendation(cls, channel_res: Dict[str, Any]) -> Dict[str, str]:
@@ -212,12 +209,8 @@ class ItemPublisher:
         category_result = cls._normalize_category_result(
             data.get("categoryPredictResult", {}) if isinstance(data, dict) else {}
         )
-        missing_fields = [field for field, value in category_result.items() if not value]
-        if missing_fields:
-            raise ValueError(
-                "自动识别类目不完整，缺少字段: "
-                f"{', '.join(missing_fields)}。请调整商品标题、首图或填写类目提示后重试。"
-            )
+        if not any(category_result[k] for k in ('catId', 'channelCatId', 'tbCatId')):
+            raise ValueError('平台未返回有效类目，请调整标题或类目提示')
         return category_result
 
     @classmethod
@@ -292,6 +285,7 @@ class ItemPublisher:
         post_price: Optional[float],
         can_self_pickup: bool,
         category_hint: Optional[str] = None,
+        platform_category: Optional[Dict[str, Any]] = None,
         sku_config: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         if delivery_choice not in self.ALLOWED_DELIVERY_CHOICES:
@@ -323,12 +317,11 @@ class ItemPublisher:
         if not publish_desc:
             raise ValueError("商品描述不能为空")
 
-        channel_res = await self.get_public_channel(publish_title, publish_desc, uploaded_images, category_hint=category_hint)
-        if not self.is_success_response(channel_res):
-            raise RuntimeError(f"获取发布类目失败: {self.extract_error_message(channel_res)}")
-
-        category_result = self._validate_category_recommendation(channel_res)
-        category_debug = self._build_category_debug(channel_res, category_hint=category_hint)
+        recommended = await self.recommend_categories(publish_title, publish_desc, uploaded_images,
+                                                      category_hint=category_hint, platform_category=platform_category)
+        category_result = self._normalize_category_result(recommended['category'])
+        channel_res = {'data': {'cardList': recommended['cards']}}
+        category_debug = {'category_hint': category_hint, 'category': recommended['category']}
 
         location = await self.get_default_location()
 
@@ -366,6 +359,17 @@ class ItemPublisher:
                 )
             }
         return publish_res
+
+    async def recommend_categories(self, title, description, images, *, category_hint=None, platform_category=None):
+        response = await self.get_public_channel(title, description, images, category_hint=category_hint)
+        if not self.is_success_response(response):
+            raise ValueError('类目推荐失败: ' + self.extract_error_message(response))
+        if platform_category:
+            selection = choose_cards(normalize_cards(response), platform_category)
+            response = await self.get_public_channel(title, description, images, category_hint=category_hint, selection=selection)
+            if not self.is_success_response(response):
+                raise ValueError('类目属性加载失败: ' + self.extract_error_message(response))
+        return describe_categories(response, platform_category)
 
     async def get_publish_capabilities(self) -> Dict[str, Any]:
         """获取当前账号的网页端发布能力，官方页面据此决定是否展示规格库存。"""
@@ -501,6 +505,7 @@ class ItemPublisher:
         description: str,
         images_info: List[Dict[str, Any]],
         category_hint: Optional[str] = None,
+        selection=None,
     ) -> Dict[str, Any]:
         recommend_title, recommend_description = self._build_recommend_text(title, description, category_hint)
         payload = {
@@ -529,6 +534,10 @@ class ItemPublisher:
             ],
             "uniqueCode": self._build_unique_code(),
         }
+
+        if selection:
+            payload.update(currentCardList=selection['current_card_list'], selectedList=selection['selected_list'],
+                           catId=selection['cat_id'], catName=selection['cat_name'], channelCatId=selection['channel_cat_id'])
 
         return await self._post_mtop(
             api_name="mtop.taobao.idle.kgraph.property.recommend",
@@ -716,64 +725,7 @@ class ItemPublisher:
 
     @classmethod
     def _build_item_label_list(cls, card_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        labels: List[Dict[str, Any]] = []
-        for card in card_list:
-            card_data = card.get("cardData") or {}
-            values_list = card_data.get("valuesList") or []
-            selected_value = None
-
-            for value in values_list:
-                if value.get("isClicked"):
-                    selected_value = value
-                    break
-
-            if selected_value is None:
-                property_name = str(card_data.get("propertyName") or "")
-                looks_like_category_card = any(keyword in property_name for keyword in ("类目", "分类", "品类"))
-                if looks_like_category_card:
-                    selected_value = next(
-                        (
-                            value for value in values_list
-                            if cls._first_present_value(value, "channelCatId", "channel_cat_id")
-                            and cls._first_present_value(value, "catName", "cat_name", "channelCatName", "channel_cat_name")
-                        ),
-                        None,
-                    )
-
-            if not selected_value:
-                continue
-
-            channel_cat_id = cls._first_present_value(selected_value, "channelCatId", "channel_cat_id")
-            cat_name = cls._first_present_value(selected_value, "catName", "cat_name", "channelCatName", "channel_cat_name")
-            tb_cat_id = cls._first_present_value(selected_value, "tbCatId", "tb_cat_id")
-            if not channel_cat_id or not cat_name:
-                continue
-
-            labels.append(
-                {
-                    "channelCateName": cat_name,
-                    "valueId": None,
-                    "channelCateId": channel_cat_id,
-                    "valueName": None,
-                    "tbCatId": tb_cat_id,
-                    "subPropertyId": None,
-                    "labelType": "common",
-                    "subValueId": None,
-                    "labelId": None,
-                    "propertyName": card_data.get("propertyName"),
-                    "isUserClick": "1",
-                    "isUserCancel": None,
-                    "from": "newPublishChoice",
-                    "propertyId": card_data.get("propertyId"),
-                    "labelFrom": "newPublish",
-                    "text": cat_name,
-                    "properties": (
-                        f"{card_data.get('propertyId')}##{card_data.get('propertyName')}:"
-                        f"{channel_cat_id}##{cat_name}"
-                    ),
-                }
-            )
-        return labels
+        return build_labels(card_list)
 
     async def _post_mtop(
         self,

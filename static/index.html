@@ -841,7 +841,7 @@
                   <div class="row g-3">
                     <div class="col-md-6">
                       <label for="publishCookieId" class="form-label">发布账号</label>
-                      <select class="form-select" id="publishCookieId" required>
+                      <select class="form-select" id="publishCookieId" onchange="resetPublishCategory()" required>
                         <option value="">请选择账号</option>
                       </select>
                     </div>
@@ -857,18 +857,30 @@
 
                     <div class="col-12">
                       <label for="publishTitle" class="form-label">商品标题</label>
-                      <input type="text" class="form-control" id="publishTitle" maxlength="60" placeholder="输入商品标题" required>
+                      <input type="text" class="form-control" id="publishTitle" oninput="resetPublishCategory()" maxlength="60" placeholder="输入商品标题" required>
                     </div>
 
                     <div class="col-12">
                       <label for="publishCategory" class="form-label">类目提示 <span class="text-muted small">（可选）</span></label>
-                      <input type="text" class="form-control" id="publishCategory" maxlength="80" placeholder="例如：手机、数码配件、图书、服饰、游戏账号">
+                      <input type="text" class="form-control" id="publishCategory" oninput="resetPublishCategory()" maxlength="80" placeholder="例如：手机、数码配件、图书、服饰、游戏账号">
                       <div class="form-text">发布失败提示“闲鱼渠道类目路径查询失败”时，可填写更明确的类目词帮助闲鱼识别。</div>
                     </div>
 
                     <div class="col-12">
+                      <div class="d-flex flex-wrap gap-2 align-items-center mb-2">
+                        <label for="publishPlatformCategory" class="form-label mb-0">平台类目与属性</label>
+                        <button type="button" class="btn btn-sm btn-outline-primary" id="publishCategoryRecommendBtn" onclick="loadPublishCategories()">推荐类目</button>
+                        <button type="button" class="btn btn-sm btn-outline-secondary" onclick="resetPublishCategory()">清除选择</button>
+                      </div>
+                      <select id="publishPlatformCategory" class="form-select" onchange="changePublishCategory()"><option value="">自动推荐（不固定类目）</option></select>
+                      <div class="form-text" id="publishPlatformCategoryStatus">未选择，发布时由平台推荐</div>
+                      <div class="row g-2 mt-1" id="publishCategoryAttributes"></div>
+                      <div class="form-text">只读取类目，不发布商品。选择会保存进素材；标题、描述、账号或类目提示变化后需重新推荐。</div>
+                    </div>
+
+                    <div class="col-12">
                       <label for="publishDescription" class="form-label">商品描述</label>
-                      <textarea class="form-control" id="publishDescription" rows="5" maxlength="5000" placeholder="输入商品描述，建议包含成色、规格、发货说明等信息" required></textarea>
+                      <textarea class="form-control" id="publishDescription" oninput="resetPublishCategory()" rows="5" maxlength="5000" placeholder="输入商品描述，建议包含成色、规格、发货说明等信息" required></textarea>
                     </div>
 
                     <div class="col-md-4" id="publishCurrentPriceWrap">
@@ -1031,6 +1043,12 @@
               <div class="card-body">
                 <div id="publishMaterialList" class="item-publish-side-list">
                   <div class="item-publish-preview-empty">暂无素材</div>
+                </div>
+                <div class="d-flex flex-wrap align-items-center gap-2 mt-3">
+                  <button type="button" class="btn btn-sm btn-outline-secondary" id="publishMaterialPrev" onclick="changeItemPublishMaterialPage(-1)" disabled>上一页</button>
+                  <button type="button" class="btn btn-sm btn-outline-secondary" id="publishMaterialNext" onclick="changeItemPublishMaterialPage(1)" disabled>下一页</button>
+                  <select class="form-select form-select-sm w-auto" id="publishMaterialPageSize" aria-label="素材每页条数" onchange="changeItemPublishMaterialPageSize(this.value)"><option value="10">10 条/页</option><option value="20" selected>20 条/页</option><option value="50">50 条/页</option></select>
+                  <span class="small text-muted" id="publishMaterialPageStatus">1 / 1 页 · 共 0 条</span>
                 </div>
               </div>
             </div>
