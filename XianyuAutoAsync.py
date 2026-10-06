@@ -7160,7 +7160,9 @@ class XianyuLive:
         if self.token_refresh_lock.locked():
             logger.info(f"【{self.cookie_id}】Token刷新已有执行中任务，等待当前流程完成后复用结果")
 
-        async with self.token_refresh_lock:
+        from utils.token_request_lock import token_request_lock
+
+        async with self.token_refresh_lock, token_request_lock(getattr(self, 'myid', None) or self.cookie_id):
             dedup_window = max(5, int(RISK_CONTROL.get('token_refresh_dedup_window_seconds', 60) or 60))
             if (
                 captcha_retry_count == 0 and
