@@ -15349,6 +15349,15 @@ class UpdateResultResponse(PydanticBaseModel):
     new_version: str = ""
 
 
+def _uses_git_update_workflow() -> bool:
+    return os.getenv("XYMB_UPDATE_MODE", "files").strip().lower() == "git"
+
+
+def _require_file_update_mode(current_user: Dict[str, Any] = Depends(get_current_user)):
+    if _uses_git_update_workflow():
+        raise HTTPException(status_code=409, detail="此部署由 Git 分支维护，请通过双上游兼容合并后发布。")
+
+
 @app.get('/api/update/check')
 async def check_for_updates(current_user: Dict[str, Any] = Depends(get_current_user)):
     """
@@ -15356,6 +15365,17 @@ async def check_for_updates(current_user: Dict[str, Any] = Depends(get_current_u
     
     返回更新信息，包括新版本号、更新内容等
     """
+    if _uses_git_update_workflow():
+        return {
+            "success": True,
+            "data": {
+                "has_update": False,
+                "update_available": False,
+                "update_mode": "git",
+                "message": "此部署由 Git 分支维护，请通过双上游兼容合并后发布；此处不检查上游版本。",
+            },
+        }
+
     try:
         updater = get_updater()
         manifest = await updater.check_for_updates()
@@ -15425,7 +15445,7 @@ async def check_for_updates(current_user: Dict[str, Any] = Depends(get_current_u
         }
 
 
-@app.post('/api/update/apply')
+@app.post('/api/update/apply', dependencies=[Depends(_require_file_update_mode)])
 async def apply_updates(current_user: Dict[str, Any] = Depends(get_current_user)):
     """
     应用更新
@@ -15463,7 +15483,7 @@ async def apply_updates(current_user: Dict[str, Any] = Depends(get_current_user)
         }
 
 
-@app.get('/api/update/progress')
+@app.get('/api/update/progress', dependencies=[Depends(_require_file_update_mode)])
 async def get_update_progress(current_user: Dict[str, Any] = Depends(get_current_user)):
     """
     获取更新进度
@@ -15496,7 +15516,7 @@ async def get_update_progress(current_user: Dict[str, Any] = Depends(get_current
         }
 
 
-@app.get('/api/update/local-hashes')
+@app.get('/api/update/local-hashes', dependencies=[Depends(_require_file_update_mode)])
 async def get_local_file_hashes(current_user: Dict[str, Any] = Depends(get_current_user)):
     """
     获取本地文件哈希值
@@ -15530,7 +15550,7 @@ async def get_local_file_hashes(current_user: Dict[str, Any] = Depends(get_curre
         }
 
 
-@app.post('/api/update/cleanup-backups')
+@app.post('/api/update/cleanup-backups', dependencies=[Depends(_require_file_update_mode)])
 async def cleanup_old_backups(days: int = 7, current_user: Dict[str, Any] = Depends(get_current_user)):
     """
     清理旧的备份文件
@@ -15563,7 +15583,7 @@ async def cleanup_old_backups(days: int = 7, current_user: Dict[str, Any] = Depe
         }
 
 
-@app.get('/api/update/file-changes')
+@app.get('/api/update/file-changes', dependencies=[Depends(_require_file_update_mode)])
 async def get_file_changes(current_user: Dict[str, Any] = Depends(get_current_user)):
     """
     比较当前文件与上次更新后的哈希清单
@@ -15593,7 +15613,7 @@ async def get_file_changes(current_user: Dict[str, Any] = Depends(get_current_us
         }
 
 
-@app.post('/api/update/save-hashes')
+@app.post('/api/update/save-hashes', dependencies=[Depends(_require_file_update_mode)])
 async def save_current_hashes(current_user: Dict[str, Any] = Depends(get_current_user)):
     """
     手动保存当前文件的哈希清单
@@ -15625,7 +15645,7 @@ async def save_current_hashes(current_user: Dict[str, Any] = Depends(get_current
         }
 
 
-@app.get('/api/update/saved-hashes')
+@app.get('/api/update/saved-hashes', dependencies=[Depends(_require_file_update_mode)])
 async def get_saved_hashes(current_user: Dict[str, Any] = Depends(get_current_user)):
     """
     获取上次保存的文件哈希清单
@@ -15666,7 +15686,7 @@ async def get_saved_hashes(current_user: Dict[str, Any] = Depends(get_current_us
         }
 
 
-@app.post('/api/update/restart')
+@app.post('/api/update/restart', dependencies=[Depends(_require_file_update_mode)])
 async def restart_application(current_user: Dict[str, Any] = Depends(get_current_user)):
     """
     重启应用（用于更新后重启）

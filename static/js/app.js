@@ -21112,6 +21112,13 @@ function refreshHotUpdateButtonState(updateInfo = remoteVersionInfo) {
     dashboardHotUpdateMenuBtn.disabled = false;
     dashboardHotUpdateGroup.classList.remove('has-update', 'is-loading');
 
+    if (updateInfo?.update_mode === 'git') {
+        dashboardHotUpdateBtn.innerHTML = '<i class="bi bi-git me-1"></i>Git 分支维护';
+        dashboardHotUpdateBtn.title = updateInfo.message || '通过兼容合并后发布';
+        dashboardHotUpdateMenuBtn.disabled = true;
+        return;
+    }
+
     const hasUpdate = Boolean(updateInfo && (updateInfo.has_update || updateInfo.new_version));
     if (!hasUpdate || shouldSuppressHotUpdateHint(updateInfo)) {
         return;
@@ -22268,7 +22275,7 @@ async function performHotUpdate() {
         }
         
         if (!checkResult.has_update) {
-            showToast('已是最新版本，无需更新', 'info');
+            showToast(checkResult.message || '已是最新版本，无需更新', 'info');
             resetHotUpdateBtn();
             return;
         }

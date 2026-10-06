@@ -15,6 +15,7 @@ services:
       - ${XYMB_ENV_FILE:-../runtime/xianyu-management-bot/local.env}
     environment:
       XYMB_DEV_RELOAD: "true"
+      XYMB_UPDATE_MODE: "git"
       RELOAD: "false"
       USE_XVFB: "true"
       ENABLE_HEADFUL: "true"
