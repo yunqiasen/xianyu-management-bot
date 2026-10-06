@@ -839,6 +839,13 @@ class XianyuLive:
         if backoff_reason not in {'slider_failed', 'verification_required', 'credentials', 'risk_control', 'browser_crash'}:
             return False
 
+        reason_label = {
+            'slider_failed': '滑块验证失败',
+            'verification_required': '需要人工验证',
+            'credentials': '账号或密码错误',
+            'risk_control': '平台风控',
+            'browser_crash': '登录浏览器异常',
+        }[backoff_reason]
         remaining_time = failure_backoff.get('remaining_time', 0.0)
         should_log = (
             self.last_token_refresh_status != "password_login_backoff_wait" or
@@ -846,13 +853,13 @@ class XianyuLive:
         )
         if should_log:
             logger.warning(
-                f"【{self.cookie_id}】密码登录失败退避中（原因: {backoff_reason}），"
+                f"【{self.cookie_id}】{reason_label}，恢复冷却中（原因: {backoff_reason}），"
                 f"直接跳过本次token刷新，还需等待 {remaining_time:.1f} 秒"
             )
             self.last_password_login_backoff_log_time = current_time
 
         self.last_token_refresh_status = "password_login_backoff_wait"
-        self.last_token_refresh_error_message = f"密码登录失败退避中，剩余{remaining_time:.1f}秒"
+        self.last_token_refresh_error_message = f"{reason_label}，恢复冷却中，剩余{remaining_time:.1f}秒"
         return True
 
     @staticmethod

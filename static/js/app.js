@@ -4310,6 +4310,9 @@ function getAboutStatusText(type, value) {
             exception: '执行异常',
         },
         token: {
+            password_login_backoff_wait: '恢复冷却中',
+            verification_pending_manual: '等待人工验证',
+            manual_verification_required: '等待人工验证',
             started: '执行中',
             success: '成功',
             skipped_cooldown: '冷却跳过',
@@ -4545,6 +4548,22 @@ function getAboutRuntimeOverview(runtimeStatus, readinessCount = 0) {
             tone: 'danger',
             title: '实例未启动',
             note: '轻保活和历史消息查询都依赖账号实例，当前应先启动实例。',
+        };
+    }
+
+    const tokenStatus = runtimeStatus?.token_refresh_status;
+    if (tokenStatus === 'password_login_backoff_wait') {
+        return {
+            tone: 'warning',
+            title: '恢复冷却中',
+            note: runtimeStatus.token_refresh_error_message || '上次恢复失败，正在等待冷却；账号尚未上线。',
+        };
+    }
+    if (tokenStatus === 'verification_pending_manual' || tokenStatus === 'manual_verification_required') {
+        return {
+            tone: 'warning',
+            title: '等待人工验证',
+            note: runtimeStatus.token_refresh_error_message || '请完成账号验证后再刷新状态；账号尚未上线。',
         };
     }
 
