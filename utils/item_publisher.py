@@ -539,13 +539,25 @@ class ItemPublisher:
             payload.update(currentCardList=selection['current_card_list'], selectedList=selection['selected_list'],
                            catId=selection['cat_id'], catName=selection['cat_name'], channelCatId=selection['channel_cat_id'])
 
-        return await self._post_mtop(
-            api_name="mtop.taobao.idle.kgraph.property.recommend",
-            version="2.0",
-            payload=payload,
-            spm_cnt="a21ybx.publish.0.0",
-            spm_pre="a21ybx.item.sidebar.1.67321598K9Vgx8",
-        )
+        # Adapt upstream's bounded Set-Cookie retry only for this read operation.
+        # Never retry the actual publish request: that could create duplicate items.
+        for attempt in range(2):
+            previous_token = self.cookies.get('_m_h5_tk')
+            response = await self._post_mtop(
+                api_name="mtop.taobao.idle.kgraph.property.recommend",
+                version="2.0",
+                payload=payload,
+                spm_cnt="a21ybx.publish.0.0",
+                spm_pre="a21ybx.item.sidebar.1.67321598K9Vgx8",
+            )
+            ret = str(response.get('ret') or '') if isinstance(response, dict) else ''
+            expired = any(code in ret for code in (
+                'FAIL_SYS_TOKEN_EXOIRED', 'FAIL_SYS_TOKEN_EXPIRED', 'FAIL_SYS_TOKEN_EMPTY',
+            ))
+            new_token = self.cookies.get('_m_h5_tk')
+            if not expired or attempt == 1 or not new_token or new_token == previous_token:
+                return response
+            logger.info(f"【{self.cookie_id}】类目接口已更新签名令牌，重试一次")
 
     async def get_default_location(self) -> Dict[str, Any]:
         payload = {

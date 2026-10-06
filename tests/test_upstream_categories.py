@@ -82,6 +82,31 @@ class CategoryCompatTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             await pub.recommend_categories('手机','描述',[],platform_category=choice)
 
+    async def test_expired_recommendation_retries_once_only_when_response_rotates_token(self):
+        pub = ItemPublisher('unb=fixture; _m_h5_tk=old_1')
+        async def response(**kwargs):
+            if pub._post_mtop.await_count == 1:
+                pub.cookies['_m_h5_tk'] = 'new_2'
+                pub.cookies_str = 'unb=fixture; _m_h5_tk=new_2'
+                return {'ret':['FAIL_SYS_TOKEN_EXOIRED::令牌过期']}
+            return recommendation()
+        pub._post_mtop = AsyncMock(side_effect=response)
+        result = await pub.recommend_categories('手机','描述',[])
+        self.assertEqual(result['category']['cat_id'], '22')
+        self.assertEqual(pub._post_mtop.await_count, 2)
+
+    async def test_token_retry_never_loops_or_retries_identity_verification(self):
+        for error, rotate, count in [('FAIL_SYS_TOKEN_EXOIRED',False,1),('FAIL_SYS_TOKEN_EXOIRED',True,2),('FAIL_SYS_USER_VALIDATE',True,1)]:
+            pub = ItemPublisher('unb=fixture; _m_h5_tk=old_1')
+            async def response(**kwargs):
+                if rotate:
+                    pub.cookies['_m_h5_tk'] = f'new{pub._post_mtop.await_count}_1'
+                return {'ret':[error]}
+            pub._post_mtop=AsyncMock(side_effect=response)
+            with self.assertRaises(ValueError):
+                await pub.recommend_categories('手机','描述',[])
+            self.assertEqual(pub._post_mtop.await_count,count)
+
 
 class MaterialCategoryPersistence(unittest.TestCase):
     def test_category_survives_create_update_list_and_reopen(self):
