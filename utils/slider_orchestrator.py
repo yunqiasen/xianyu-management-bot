@@ -232,6 +232,25 @@ def run_slider_strict(
     return validate_slider_result(success, cookies, engine=engine)
 
 
+def _stopped_primary_result(slider: Any, result: SliderVerificationResult) -> Optional[SliderVerificationResult]:
+    """Keep the primary engine's stop decision across both fallback paths."""
+    feedback = getattr(slider, "last_verification_feedback", None) or {}
+    status = str(feedback.get("status") or "").strip().lower()
+    stopped = status in {"preflight_deferred", "hard_block"}
+    message = str(feedback.get("message") or result.message)
+    if not stopped:
+        should_stop = getattr(slider, "_should_abort_slider_retry_after_failure", None)
+        if callable(should_stop):
+            stopped, reason = should_stop()
+            if stopped and reason:
+                message = str(reason)
+    if not stopped:
+        return None
+    return SliderVerificationResult(
+        success=False, cookies=None, engine=result.engine, x5_cookies={}, message=message,
+    )
+
+
 def run_slider_with_fallback(
     slider: Any,
     url: str,
@@ -266,19 +285,9 @@ def run_slider_with_fallback(
     if primary_result.success:
         return primary_result
 
-    # 风险门控或硬风控已经明确要求停止时，不得再启动 DrissionPage。
-    # 否则主引擎刚拦截，旧兜底链路又会弹出验证码窗口并重复拖动。
-    feedback = getattr(slider, "last_verification_feedback", None) or {}
-    feedback_status = str(feedback.get("status") or "").strip().lower()
-    if feedback_status in {"preflight_deferred", "hard_block"}:
-        message = str(feedback.get("message") or primary_result.message)
-        return SliderVerificationResult(
-            success=False,
-            cookies=None,
-            engine=str(engine or DEFAULT_SLIDER_ENGINE),
-            x5_cookies={},
-            message=message,
-        )
+    stopped_result = _stopped_primary_result(slider, primary_result)
+    if stopped_result is not None:
+        return stopped_result
 
     enabled = _env_bool("XY_SLIDER_DRISSION_FALLBACK", True) if fallback_enabled is None else bool(fallback_enabled)
     if not enabled:
@@ -345,6 +354,10 @@ async def run_slider_async_with_fallback(
     primary_result = await run_slider_async_strict(slider, url, engine=engine, **kwargs)
     if primary_result.success:
         return primary_result
+
+    stopped_result = _stopped_primary_result(slider, primary_result)
+    if stopped_result is not None:
+        return stopped_result
 
     enabled = _env_bool("XY_SLIDER_DRISSION_FALLBACK", True) if fallback_enabled is None else bool(fallback_enabled)
     if not enabled:
