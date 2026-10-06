@@ -1,36 +1,44 @@
-# 本地GuDong底座与发布状态
+# 本地GuDong底座与单实例运行
 
-## 分支
+## 源码与分支
 
-- `main`：GuDong原样基线 e8fe7ba。
-- `upstream-zhinianboke`：原版对照 1be6493。
-- `fork`：GuDong底座上的定制代码，实际开发分支。
-- 旧二开保存在标签 `archive/pre-gudong-rebase-20261005`；尚有旧分支用于迁移对照，完成切换后删除分支，不删标签。
+唯一源码：`/home/div/1_Project_dir/Project/Xianyu/xianyu-management-bot`。
 
-## 运行目录
+- `main`：GuDong原样基线。
+- `upstream-zhinianboke`：zhinianboke原样对照。
+- `fork`：实际开发、部署分支。
+- 旧二开只保留标签 `archive/pre-gudong-rebase-20261005`，不再独立运行。
 
-源码保持一个仓库。数据在源码外 `../runtime/xianyu-management-bot/gudong`。
-私有 `local.env` 保存管理账号初始化信息、JWT密钥；0600，不提交。
-SQLite与旧MySQL格式不同，禁止将旧库目录直接挂进新实例。
+## 运行入口
+
+GuDong单服务SQLite，容器8090映射19010。统一使用 `http://100.126.43.55:19010` 或 `http://127.0.0.1:19010`。
+旧 `/accounts` 书签重定向至新版登录入口，登录后进入GuDong后台。账号设置与校验保持GuDong原有流程。
+
+运行数据：`/home/div/1_Project_dir/Project/Xianyu/runtime/xianyu-management-bot`，不再嵌套另一份gudong实例。
+私有 `local.env` 保存后台账号初始化信息与JWT密钥，0600且不提交。现用后台用户与密码已从原私有配置保留。
 
 ```bash
-export XYMB_RUNTIME="$(realpath ../runtime/xianyu-management-bot/gudong)"
-export XYMB_ENV_FILE="$XYMB_RUNTIME/local.env"
-mkdir -p data logs backups static/uploads trajectory_history browser_data
-# 正式端口默认19010；首次验收使用本机19011，避免替换正在运行的旧后台。
-XYMB_BIND=127.0.0.1 XYMB_PORT=19011 docker compose -p xymb-gudong -f compose.local.yml up -d --build
+# 在源码根目录执行（当前fork分支）
+bash tools/local.sh up -d --build
+bash tools/local.sh ps
+bash tools/local.sh logs --tail 50 app
+bash tools/local.sh stop
 ```
 
-源码只读挂载。Python/yaml变更由单个监督进程等待写入稳定后，终止整个Start.py进程组再启动，避免仅重启Web而留下旧CookieManager。HTML/JS由静态文件实时读取，浏览器刷新加载。代码重载会短暂断开消息连接；数据、日志、浏览器资料独立持久化。依赖和镜像修改需要重新构建。切换分支前停止开发容器，检查该分支编排后再启动；Git切分支不等于发布。
+`tools/local.sh` 固定Compose项目名xymb-gudong，补齐只读源码下的挂载点，默认无需额外环境变量。旧19011临时入口不再使用。
 
-Dockerfile.local固定GuDong基础镜像摘要；依赖变化须更新镜像。VNC不发布到公网；人工验证使用原有后台入口。
+## 热加载
 
-## 当前结果与待办
+源码只读挂载。Python/yaml变更由单个监督进程等待写入稳定后，终止整个Start.py进程组再启动，避免仅重启Web而留下旧CookieManager。HTML/JS实时读取，浏览器刷新加载。重载会短暂断开消息连接；数据、日志、浏览器资料独立持久化。依赖、Dockerfile变更后重新构建。
 
-- 备份：旧Git bundle验证成功，MySQL导出压缩校验成功；旧运行配置和容器描述私有留存。
-- 清理：旧React/node_modules、旧venv、旧服务缓存和测试缓存已清理；旧日志先归档。
-- 新实例目前仅本机19011，尚未替换19010。
-- 真实账号数据迁移、扫码上线、消息收发、恢复及删除验收尚未完成。
-- 旧七个容器和其业务数据尚未删除。切换前先核实新实例，再停旧执行方，保留数据备份。
-- 目标访问仍是 http://100.126.43.55:19010；实际Tailscale访问待切换验证。
-- 热加载测试、GuDong测试与通知模板兼容测试不能替代真实账号验收。
+切换分支前停止开发容器，核对该分支编排后再启动；`main`、原版对照分支保持上游原样，因此不强行加入定制脚本。Git切分支不等于发布。
+Dockerfile.local固定GuDong基础镜像摘要。VNC不发布到公网；人工验证使用后台原有入口。
+
+## 旧数据与验收边界
+
+旧MySQL的105张表已导出并恢复至独立MySQL核对逐表行数；旧运行数据、配置、消息历史与测试卷备份统一归档至：
+`/home/div/1_Project_dir/Project/archives/xianyu-management-bot/backups/cleanup-20261006`。
+
+迁移当前1个闲鱼账号的Cookie、账密、代理、备注与对应开关，保留后台登录。旧订单和关键词为0；旧4条消息事件等异构历史只保存在归档，没有冒充迁入GuDong。新库无额外默认回复或AI开关开启。
+
+现行测试涵盖接口、配置和本地运行；真实扫码、消息收发和长期保活单独验收。上游兼容完成度见 `UPSTREAM-INTEGRATION.md`，不是全量合并声明。

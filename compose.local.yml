@@ -12,7 +12,7 @@ services:
     ports:
       - "${XYMB_BIND:-0.0.0.0}:${XYMB_PORT:-19010}:8090"
     env_file:
-      - ${XYMB_ENV_FILE:?set private runtime env path}
+      - ${XYMB_ENV_FILE:-../runtime/xianyu-management-bot/local.env}
     environment:
       XYMB_DEV_RELOAD: "true"
       RELOAD: "false"
@@ -26,12 +26,12 @@ services:
       TZ: Asia/Shanghai
     volumes:
       - .:/app:ro
-      - ${XYMB_RUNTIME:?set runtime path}/data:/app/data
-      - ${XYMB_RUNTIME}/logs:/app/logs
-      - ${XYMB_RUNTIME}/backups:/app/backups
-      - ${XYMB_RUNTIME}/uploads:/app/static/uploads
-      - ${XYMB_RUNTIME}/trajectory_history:/app/trajectory_history
-      - ${XYMB_RUNTIME}/browser_data:/app/browser_data
+      - ${XYMB_RUNTIME:-../runtime/xianyu-management-bot}/data:/app/data
+      - ${XYMB_RUNTIME:-../runtime/xianyu-management-bot}/logs:/app/logs
+      - ${XYMB_RUNTIME:-../runtime/xianyu-management-bot}/backups:/app/backups
+      - ${XYMB_RUNTIME:-../runtime/xianyu-management-bot}/uploads:/app/static/uploads
+      - ${XYMB_RUNTIME:-../runtime/xianyu-management-bot}/trajectory_history:/app/trajectory_history
+      - ${XYMB_RUNTIME:-../runtime/xianyu-management-bot}/browser_data:/app/browser_data
     extra_hosts:
       - "host.docker.internal:host-gateway"
     shm_size: 1gb

@@ -1316,6 +1316,12 @@ async def health_check():
         }
 
 
+# 保留旧后台的账号页书签；登录仍走GuDong原有认证。
+@app.get('/accounts', include_in_schema=False)
+async def legacy_accounts_entry():
+    return RedirectResponse(url='/', status_code=307)
+
+
 # 重定向根路径到登录页面
 @app.get('/', response_class=HTMLResponse)
 async def root():
