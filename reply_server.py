@@ -46,6 +46,7 @@ from utils.time_utils import (
     utc_timestamp_to_local_date_string,
     utc_timestamp_to_local_datetime,
 )
+from utils.channel_templates import validate_notification_templates, validate_notification_template, normalize_template_context, render_notification_template as render_channel_template
 from utils.notification_dispatcher import (
     build_face_verify_notification,
     SUPPORTED_NOTIFICATION_TEMPLATE_TYPES,
@@ -7651,6 +7652,40 @@ def clear_default_reply_records(cid: str, current_user: Dict[str, Any] = Depends
 
 # ------------------------- 通知渠道管理接口 -------------------------
 
+def _validate_channel_config(config: str):
+    try:
+        parsed = json.loads(config)
+    except (ValueError, TypeError):
+        return  # Legacy plain-string channel configuration.
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=400, detail="渠道JSON配置必须为对象")
+    error = validate_notification_templates(parsed)
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+
+
+@app.post('/notification-template-preview')
+def preview_channel_template(data: dict, current_user: Dict[str, Any] = Depends(get_current_user)):
+    kind = data.get('template_type', 'chat')
+    template = data.get('template', '')
+    error = validate_notification_template(template, kind)
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+    raw_context = data.get('context') or {}
+    if not isinstance(raw_context, dict):
+        raise HTTPException(status_code=400, detail="预览变量必须为对象")
+    context = normalize_template_context({
+        'account_id': '测试账号', 'account_remark': '测试备注', 'buyer_nick': '测试买家',
+        'message': '你好，还有货吗？', 'result': '发货成功', 'detail': '需要确认登录',
+        'title': '账号通知', 'time': time.strftime('%Y-%m-%d %H:%M:%S'), **raw_context,
+    })
+    # Explicit legacy aliases from the caller take precedence over sample defaults.
+    context.update(normalize_template_context(raw_context))
+    legacy_type = {'chat': 'message', 'delivery': 'delivery', 'account': 'token_refresh'}[kind]
+    default = render_notification_template(legacy_type, **context)
+    return {'success': True, 'preview': render_channel_template({kind + '_template': template}, kind, context, default)}
+
+
 @app.get('/notification-channels')
 def get_notification_channels(current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取所有通知渠道"""
@@ -7666,6 +7701,7 @@ def get_notification_channels(current_user: Dict[str, Any] = Depends(get_current
 def create_notification_channel(channel_data: NotificationChannelIn, current_user: Dict[str, Any] = Depends(get_current_user)):
     """创建通知渠道"""
     from db_manager import db_manager
+    _validate_channel_config(channel_data.config)
     try:
         user_id = current_user['user_id']
         channel_id = db_manager.create_notification_channel(
@@ -7699,6 +7735,7 @@ def get_notification_channel(channel_id: int, current_user: Dict[str, Any] = Dep
 def update_notification_channel(channel_id: int, channel_data: NotificationChannelUpdate, current_user: Dict[str, Any] = Depends(get_current_user)):
     """更新通知渠道"""
     from db_manager import db_manager
+    _validate_channel_config(channel_data.config)
     try:
         user_id = current_user['user_id']
         success = db_manager.update_notification_channel(

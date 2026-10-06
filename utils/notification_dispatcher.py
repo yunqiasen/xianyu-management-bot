@@ -16,6 +16,7 @@ from typing import Any, Dict, Iterable, Optional
 
 import aiohttp
 from loguru import logger
+from utils.channel_templates import render_notification_template as render_channel_template, normalize_template_context
 
 
 SUPPORTED_NOTIFICATION_TEMPLATE_TYPES = (
@@ -520,7 +521,7 @@ async def send_channel_notification(channel_type: Any, config_data: Dict[str, An
     return False
 
 
-async def dispatch_notifications(notifications: Iterable[Dict[str, Any]], message: str, *, title: str = '闲鱼管理系统通知', notification_type: str = 'info', attachment_path: Optional[str] = None, account_id: str = '') -> bool:
+async def dispatch_notifications(notifications: Iterable[Dict[str, Any]], message: str, *, title: str = '闲鱼管理系统通知', notification_type: str = 'info', attachment_path: Optional[str] = None, account_id: str = '', template_context: Optional[Dict[str, Any]] = None) -> bool:
     notification_sent = False
 
     for notification in notifications or []:
@@ -532,10 +533,17 @@ async def dispatch_notifications(notifications: Iterable[Dict[str, Any]], messag
         channel_config = notification.get('channel_config') if 'channel_config' in notification else notification.get('config')
         try:
             config_data = parse_notification_config(channel_config)
+            template_type = 'chat' if notification_type in ('message', 'chat') else ('delivery' if notification_type == 'delivery' else 'account')
+            context = normalize_template_context({
+                'account_id': account_id, 'title': title, 'notification_type': notification_type,
+                'detail': message, 'message': message, 'time': time.strftime('%Y-%m-%d %H:%M:%S'),
+                **(template_context or {}),
+            })
+            channel_message = render_channel_template(config_data, template_type, context, message)
             channel_sent = await send_channel_notification(
                 channel_type,
                 config_data,
-                message,
+                channel_message,
                 title=title,
                 notification_type=notification_type,
                 attachment_path=attachment_path,
@@ -549,7 +557,7 @@ async def dispatch_notifications(notifications: Iterable[Dict[str, Any]], messag
     return notification_sent
 
 
-async def dispatch_account_notifications(account_id: str, message: str, *, title: str = '闲鱼管理系统通知', notification_type: str = 'info', attachment_path: Optional[str] = None) -> bool:
+async def dispatch_account_notifications(account_id: str, message: str, *, title: str = '闲鱼管理系统通知', notification_type: str = 'info', attachment_path: Optional[str] = None, template_context: Optional[Dict[str, Any]] = None) -> bool:
     from db_manager import db_manager
 
     try:
@@ -562,6 +570,13 @@ async def dispatch_account_notifications(account_id: str, message: str, *, title
         logger.warning(f"【{account_id}】未配置消息通知，跳过发送")
         return False
 
+    context = dict(template_context or {})
+    try:
+        account = db_manager.get_cookie_by_id(account_id) or {}
+        context.setdefault('account_remark', account.get('remark') or '')
+    except Exception:
+        context.setdefault('account_remark', '')
+
     return await dispatch_notifications(
         notifications,
         message,
@@ -569,10 +584,11 @@ async def dispatch_account_notifications(account_id: str, message: str, *, title
         notification_type=notification_type,
         attachment_path=attachment_path,
         account_id=account_id,
+        template_context=context,
     )
 
 
-def dispatch_account_notifications_sync(account_id: str, message: str, *, title: str = '闲鱼管理系统通知', notification_type: str = 'info', attachment_path: Optional[str] = None) -> bool:
+def dispatch_account_notifications_sync(account_id: str, message: str, *, title: str = '闲鱼管理系统通知', notification_type: str = 'info', attachment_path: Optional[str] = None, template_context: Optional[Dict[str, Any]] = None) -> bool:
     result: Dict[str, bool] = {'sent': False}
 
     async def runner() -> None:
@@ -582,6 +598,7 @@ def dispatch_account_notifications_sync(account_id: str, message: str, *, title:
             title=title,
             notification_type=notification_type,
             attachment_path=attachment_path,
+            template_context=template_context,
         )
 
     def thread_main() -> None:

@@ -10428,6 +10428,7 @@ class XianyuLive:
                     notification_msg,
                     title='接收消息通知',
                     notification_type='message',
+                    template_context={'buyer_nick': send_user_name, 'buyer_id': send_user_id, 'item_id': item_id, 'chat_id': chat_id, 'message': send_message},
                 )
 
                 if not notification_sent:
@@ -11111,6 +11112,7 @@ class XianyuLive:
                 title='闲鱼管理系统通知',
                 notification_type=notification_type,
                 attachment_path=attachment_path,
+                template_context={'detail': error_message, 'verification_url': verification_url or '', 'verification_info': verification_type or ''},
             )
 
             # 如果成功发送了通知，更新最后发送时间
@@ -11343,6 +11345,7 @@ class XianyuLive:
                 notification_message,
                 title='自动发货通知',
                 notification_type='delivery',
+                template_context={'buyer_nick': resolved_buyer_name, 'buyer_id': send_user_id, 'item_id': item_id, 'chat_id': chat_id, 'order_id': order_id, 'result': error_message, 'message': error_message},
             )
             if not notification_sent:
                 logger.warning(f"【{self.cookie_id}】自动发货通知未发送成功")

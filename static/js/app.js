@@ -7659,6 +7659,48 @@ const channelTypeConfigs = {
 };
 
 // 显示添加渠道模态框
+// Per-channel bodies, adapted from upstream 2b95816 / 565df70.
+let editingChannelConfig = {};
+function renderChannelTemplateFields(container, prefix, config = {}) {
+    const fields = [
+        ['chat', '聊天消息', 'account, account_id, account_remark, buyer_nick, buyer_id, message, item_id, chat_id, time'],
+        ['delivery', '自动发货', 'account, account_id, account_remark, buyer_nick, buyer_id, message, item_id, chat_id, time, order_id, amount, quantity, result'],
+        ['account', '账号状态', 'account, account_id, account_remark, title, notification_type, detail, chat_id, verification_url, verification_info, time'],
+    ];
+    container.insertAdjacentHTML('beforeend', '<hr><h6>该渠道专属通知模板</h6><p class="small text-muted">留空沿用全局模板；使用 {{变量名}}。预览不发送通知。</p>');
+    for (const [kind, label, variables] of fields) {
+        const id = prefix + kind + '_template';
+        container.insertAdjacentHTML('beforeend', `<div class="mb-3">
+            <label for="${id}" class="form-label">${label}</label>
+            <textarea id="${id}" maxlength="10000" rows="3" class="form-control" placeholder="留空沿用全局模板"></textarea>
+            <small class="text-muted d-block">${variables}</small>
+            <button type="button" class="btn btn-sm btn-outline-secondary mt-1" onclick="previewChannelTemplate('${prefix}', '${kind}')">预览</button>
+            <pre id="${id}_preview" class="small text-wrap mt-2"></pre></div>`);
+        document.getElementById(id).value = config[kind + '_template'] || '';
+    }
+}
+
+function collectChannelTemplates(prefix, config = {}) {
+    const result = {...config};
+    for (const kind of ['chat', 'delivery', 'account']) {
+        result[kind + '_template'] = document.getElementById(prefix + kind + '_template')?.value || '';
+    }
+    return result;
+}
+
+async function previewChannelTemplate(prefix, kind) {
+    const output = document.getElementById(prefix + kind + '_template_preview');
+    try {
+        const response = await fetch('/notification-template-preview', {
+            method: 'POST', headers: {'Authorization': `Bearer ${authToken}`, 'Content-Type': 'application/json'},
+            body: JSON.stringify({template_type: kind, template: document.getElementById(prefix + kind + '_template').value}),
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || '预览失败');
+        output.textContent = data.preview;
+    } catch (error) { output.textContent = error.message; }
+}
+
 function showAddChannelModal(type) {
     const config = channelTypeConfigs[type];
     if (!config) {
@@ -7679,6 +7721,8 @@ function showAddChannelModal(type) {
     const fieldHtml = generateFieldHtml(field, 'add_');
     fieldsContainer.insertAdjacentHTML('beforeend', fieldHtml);
     });
+
+    renderChannelTemplateFields(fieldsContainer, 'add_');
 
     // 显示模态框
     const modal = new bootstrap.Modal(document.getElementById('addChannelModal'));
@@ -7737,7 +7781,7 @@ async function saveNotificationChannel() {
     }
 
     // 收集配置数据
-    const configData = {};
+    const configData = collectChannelTemplates('add_', {});
     let hasError = false;
 
     config.fields.forEach(field => {
@@ -7862,8 +7906,9 @@ function renderNotificationChannels(channels) {
             return `${key}: ****`;
             }
             // 截断过长的值
-            const displayValue = value.length > 30 ? value.substring(0, 30) + '...' : value;
-            return `${key}: ${displayValue}`;
+            const textValue = String(value ?? '');
+            const displayValue = textValue.length > 30 ? textValue.substring(0, 30) + '...' : textValue;
+            return `${escapeHtml(key)}: ${escapeHtml(String(displayValue))}`;
         }).join('<br>');
         } else {
         configDisplay = channel.config || '无配置';
@@ -7881,7 +7926,7 @@ function renderNotificationChannels(channels) {
         <td>
         <div class="d-flex align-items-center">
             <i class="bi ${typeConfig ? typeConfig.icon : 'bi-bell'} me-2 text-${typeColor}"></i>
-            ${channel.name}
+            ${escapeHtml(channel.name)}
         </div>
         </td>
         <td><span class="badge bg-${typeColor}">${typeDisplay}</span></td>
@@ -8008,6 +8053,9 @@ async function editNotificationChannel(channelId) {
         }
     });
 
+    editingChannelConfig = {...configData};
+    renderChannelTemplateFields(fieldsContainer, 'edit_', configData);
+
     // 显示编辑模态框
     const modal = new bootstrap.Modal(document.getElementById('editChannelModal'));
     modal.show();
@@ -8036,7 +8084,7 @@ async function updateNotificationChannel() {
     }
 
     // 收集配置数据
-    const configData = {};
+    const configData = collectChannelTemplates('edit_', editingChannelConfig);
     let hasError = false;
 
     config.fields.forEach(field => {
@@ -8049,9 +8097,7 @@ async function updateNotificationChannel() {
         return;
     }
 
-    if (value) {
-        configData[field.id] = value;
-    }
+    configData[field.id] = value;
     });
 
     if (hasError) return;
