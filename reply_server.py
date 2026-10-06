@@ -10278,8 +10278,12 @@ def _normalize_platform_category(value):
         pid = str(attr['property_id'])
         if pid in seen or pid == '-10000':
             raise HTTPException(status_code=400, detail="平台属性 ID 重复或无效")
-        if not attr.get('value_id') and not attr.get('value_name'):
-            raise HTTPException(status_code=400, detail="平台属性缺少选项")
+        choices = attr.get('values') if 'values' in attr else [attr]
+        if not isinstance(choices, list) or not choices or len(choices) > 100:
+            raise HTTPException(status_code=400, detail="平台属性选项格式错误或数量过多")
+        for option in choices:
+            if not isinstance(option, dict) or (not option.get('value_id') and not option.get('value_name')):
+                raise HTTPException(status_code=400, detail="平台属性缺少选项")
         seen.add(pid)
     # Keep the user's ID/name vocabulary; the platform adapter normalizes aliases.
     return value

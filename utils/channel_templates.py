@@ -136,5 +136,6 @@ def normalize_template_context(context):
             result[upstream] = result[legacy]
         if legacy not in result and upstream in result:
             result[legacy] = result[upstream]
-    result.setdefault("account", result.get("account_remark") or result.get("account_id"))
+    if result.get("account_remark") or result.get("account_id"):
+        result.setdefault("account", result.get("account_remark") or result.get("account_id"))
     return result

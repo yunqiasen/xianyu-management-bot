@@ -44,7 +44,7 @@ let itemPublishSavingMaterial = false;
 let itemPublishLoadedMaterialId = null;
 let itemPublishLoadedMaterialImages = [];
 let itemPublishMaterials = [];
-let itemPublishCategoryState = {choice: null, candidates: [], properties: [], requestId: 0};
+let itemPublishCategoryState = {choice: null, candidates: [], properties: [], requestId: 0, loading: false};
 let itemPublishMaterialPage = 1;
 let itemPublishMaterialPageSize = 20;
 let itemPublishMaterialTotal = 0;
@@ -7908,7 +7908,7 @@ function renderNotificationChannels(channels) {
         configDisplay = configEntries.map(([key, value]) => {
             // 隐藏敏感信息
             if (key.includes('password') || key.includes('token') || key.includes('secret')) {
-            return `${key}: ****`;
+            return `${escapeHtml(key)}: ****`;
             }
             // 截断过长的值
             const textValue = String(value ?? '');
@@ -7916,7 +7916,7 @@ function renderNotificationChannels(channels) {
             return `${escapeHtml(key)}: ${escapeHtml(String(displayValue))}`;
         }).join('<br>');
         } else {
-        configDisplay = channel.config || '无配置';
+        configDisplay = escapeHtml(channel.config || '无配置');
         }
     } catch (e) {
         // 兼容旧格式
@@ -7924,6 +7924,7 @@ function renderNotificationChannels(channels) {
         if (configDisplay.length > 30) {
         configDisplay = configDisplay.substring(0, 30) + '...';
         }
+        configDisplay = escapeHtml(configDisplay);
     }
 
     tr.innerHTML = `
@@ -7934,7 +7935,7 @@ function renderNotificationChannels(channels) {
             ${escapeHtml(channel.name)}
         </div>
         </td>
-        <td><span class="badge bg-${typeColor}">${typeDisplay}</span></td>
+        <td><span class="badge bg-${typeColor}">${escapeHtml(typeDisplay)}</span></td>
         <td><small class="text-muted">${configDisplay}</small></td>
         <td>${statusBadge}</td>
         <td>
@@ -11953,6 +11954,7 @@ function parseOptionalPublishNumber(value, label) {
 
 function resetPublishCategory(message = '未选择，发布时由平台推荐') {
     itemPublishCategoryState.requestId++;
+    itemPublishCategoryState.loading = false;
     itemPublishCategoryState.choice = null;
     itemPublishCategoryState.candidates = [];
     itemPublishCategoryState.properties = [];
@@ -11970,7 +11972,7 @@ function renderPublishCategory() {
     const state = itemPublishCategoryState;
     select.innerHTML = '<option value="">自动推荐（不固定类目）</option>' + state.candidates.map((c, i) =>
         `<option value="${i}" ${c.is_selected ? 'selected' : ''}>${escapeHtml(c.cat_name || c.channel_cat_name || '分类')} · ${escapeHtml(c.channel_cat_id || c.cat_id || c.tb_cat_id || '')}</option>`).join('');
-    attrs.innerHTML = state.properties.map((p, i) => `<div class="col-md-6"><label class="form-label" for="publishCategoryAttr${i}">${escapeHtml(p.property_name)}</label><select id="publishCategoryAttr${i}" class="form-select" data-property-index="${i}" onchange="updatePublishCategoryAttributes()"><option value="">按平台默认</option>${p.options.map((o, n) => `<option value="${n}" ${o.is_selected ? 'selected' : ''}>${escapeHtml(o.value_name || o.value_id)}</option>`).join('')}</select></div>`).join('');
+    attrs.innerHTML = state.properties.map((p, i) => `<div class="col-md-6"><label class="form-label" for="publishCategoryAttr${i}">${escapeHtml(p.property_name)}</label><select id="publishCategoryAttr${i}" class="form-select" data-property-index="${i}" ${p.is_multiple ? 'multiple aria-label="可多选"' : ''} onchange="updatePublishCategoryAttributes()">${p.is_multiple ? '' : '<option value="">按平台默认</option>'}${p.options.map((o, n) => `<option value="${n}" ${o.is_selected ? 'selected' : ''}>${escapeHtml(o.value_name || o.value_id)}</option>`).join('')}</select></div>`).join('');
     const status = document.getElementById('publishPlatformCategoryStatus');
     if (status) status.textContent = state.choice ? `已选择：${state.choice.cat_name || state.choice.channel_cat_name || state.choice.channel_cat_id}；发布时重新校验` : '未选择，发布时由平台推荐';
 }
@@ -11982,8 +11984,10 @@ function updatePublishCategoryAttributes() {
     document.getElementById('publishCategoryAttributes')?.querySelectorAll('select').forEach(el => {
         if (el.value === '') return;
         const p = state.properties[Number(el.dataset.propertyIndex)];
-        const v = p?.options[Number(el.value)];
-        if (v) attrs.push({property_id: p.property_id, value_id: v.value_id, value_name: v.value_name});
+        const options = Array.from(el.selectedOptions).filter(o => o.value !== '').map(o => p?.options[Number(o.value)]).filter(Boolean);
+        if (!options.length) return;
+        const values = options.map(v => ({value_id: v.value_id, value_name: v.value_name}));
+        attrs.push(p.is_multiple ? {property_id: p.property_id, values} : {property_id: p.property_id, ...values[0]});
     });
     state.choice.attributes = attrs;
 }
@@ -12000,6 +12004,7 @@ async function loadPublishCategories(choice = null) {
     if (!values.accountId || !values.title) { showToast('先选择账号并填写标题', 'warning'); return; }
     const state = itemPublishCategoryState;
     const requestId = ++state.requestId;
+    state.loading = true;
     state.choice = null; // Do not save an old category while a new request is pending.
     state.properties = [];
     const button = document.getElementById('publishCategoryRecommendBtn');
@@ -12024,7 +12029,10 @@ async function loadPublishCategories(choice = null) {
         resetPublishCategory('推荐失败：' + error.message);
         showToast(error.message, 'warning');
     } finally {
-        if (requestId === state.requestId && button) button.disabled = false;
+        if (requestId === state.requestId) {
+            state.loading = false;
+            if (button) button.disabled = false;
+        }
     }
 }
 
@@ -12035,7 +12043,7 @@ function restorePublishCategory(choice) {
     itemPublishCategoryState.candidates = [{...choice, is_selected: true}];
     // Saved choices are retained without contacting the platform; recommend again to edit options.
     itemPublishCategoryState.properties = (choice.attributes || []).map(a => ({property_id:a.property_id,
-        property_name:a.property_id, options:[{value_id:a.value_id, value_name:a.value_name || a.value_id, is_selected:true}]}));
+        property_name:a.property_id, is_multiple:Array.isArray(a.values), options:(a.values || [a]).map(v => ({value_id:v.value_id, value_name:v.value_name || v.value_id, is_selected:true}))}));
     renderPublishCategory();
 }
 
@@ -12078,6 +12086,7 @@ function getItemPublishFormValues() {
 }
 
 function validateItemPublishValues(values, { requireAccount = true, requireImages = true } = {}) {
+    if (itemPublishCategoryState.loading) throw new Error("类目正在加载，请等待完成后保存或发布");
     if (requireAccount && !values.accountId) {
         throw new Error('请选择发布账号');
     }

@@ -572,7 +572,7 @@ async def dispatch_account_notifications(account_id: str, message: str, *, title
 
     context = dict(template_context or {})
     try:
-        account = db_manager.get_cookie_by_id(account_id) or {}
+        account = db_manager.get_cookie_details(account_id) or {}
         context.setdefault('account_remark', account.get('remark') or '')
     except Exception:
         context.setdefault('account_remark', '')

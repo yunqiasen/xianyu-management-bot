@@ -6,7 +6,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 from fastapi.testclient import TestClient
 import reply_server
-from utils.notification_dispatcher import dispatch_notifications
+from utils.notification_dispatcher import dispatch_notifications, dispatch_account_notifications
+from db_manager import db_manager
 
 
 class ChannelTemplates(unittest.IsolatedAsyncioTestCase):
@@ -28,6 +29,16 @@ class ChannelTemplates(unittest.IsolatedAsyncioTestCase):
                template_context={'buyer_name':'买家','message':'literal {{account_id}}'})
             self.assertTrue(sent)
             self.assertEqual([r['message'] for r in received],['A 买家: literal {{account_id}}','B acct'])
+            db_manager.save_cookie('template-fixture', 'unb=fixture', user_id=1)
+            db_manager.update_cookie_remark('template-fixture', '店铺备注')
+            channels = [{'type':'webhook','config':{'url':url,'account_template':'{{account}} / {{account_remark}} / {{detail}}',
+                        'delivery_template':'{{order_id}} / {{result}} / {{quantity}}'}}]
+            with patch.object(db_manager, 'get_account_notifications', return_value=channels):
+                await dispatch_account_notifications('template-fixture', 'detail', notification_type='token_refresh')
+                await dispatch_account_notifications('template-fixture', 'delivery', notification_type='delivery',template_context={'order_id':'123','result':'已发货'})
+            self.assertEqual(received[2]['message'], '店铺备注 / 店铺备注 / detail')
+            self.assertEqual(received[3]['message'], '123 / 已发货 / 未知')
+
         finally:
             server.shutdown();server.server_close();thread.join()
 
@@ -57,3 +68,8 @@ class TemplateAPITests(unittest.TestCase):
         with patch('db_manager.db_manager.update_notification_channel') as write:
             r=self.client.put('/notification-channels/10',json={'name':'test','config':'{"delivery_template":"{{"}'})
         self.assertEqual(r.status_code,400);write.assert_not_called()
+
+    def test_preview_account_uses_sample_remark_not_unknown(self):
+        r=self.client.post('/notification-template-preview',json={'template_type':'account','template':'{{account}}'})
+        self.assertEqual(r.status_code,200)
+        self.assertEqual(r.json()['preview'],'测试备注')

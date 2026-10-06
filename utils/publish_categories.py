@@ -88,15 +88,25 @@ def describe_categories(response, choice=None):
         pid = str(attr.get('property_id') or '')
         card = by_id.get(pid)
         if not card or pid == '-10000': raise ValueError('所选属性已失效，请重新获取类目')
-        matches = []
+        choices = attr.get('values') if 'values' in attr else [attr]
+        if not isinstance(choices, list) or not choices or any(not isinstance(c, dict) for c in choices):
+            raise ValueError('平台属性选项格式异常')
+        if len(choices) > 1 and not selected(card.get('isMultiple')):
+            raise ValueError('当前平台属性仅支持单选')
+        matches = [0] * len(choices)
         for value in card.get('valuesList') or []:
-            t = value.get('transportData') or {}
-            vid = first_text(value.get('valueId'), t.get('valueId'))
-            name = first_text(value.get('text'), t.get('valueName'), t.get('text'))
-            hit = (str(attr.get('value_id')) == vid) if attr.get('value_id') not in (None, '') else (str(attr.get('value_name') or '') == name)
-            value['isClicked'] = '1' if hit else '0'
-            if hit: matches.append(value)
-        if len(matches) != 1: raise ValueError('所选属性值已失效或不唯一，请重新选择')
+            transport = value.get('transportData') or {}
+            vid = first_text(value.get('valueId'), transport.get('valueId'))
+            name = first_text(value.get('text'), transport.get('valueName'), transport.get('text'))
+            hits = []
+            for index, option in enumerate(choices):
+                hit = (str(option.get('value_id')) == vid) if option.get('value_id') not in (None, '') else (str(option.get('value_name') or '') == name)
+                if hit:
+                    matches[index] += 1
+                    hits.append(index)
+            value['isClicked'] = '1' if hits else '0'
+        if any(count != 1 for count in matches):
+            raise ValueError('所选属性值已失效或不唯一，请重新选择')
     candidates = []
     properties = []
     for card in cards:
@@ -114,7 +124,7 @@ def describe_categories(response, choice=None):
                 options.append({'value_id': first_text(v.get('valueId'), t.get('valueId')),
                                 'value_name': first_text(v.get('text'), v.get('valueName'), t.get('valueName'), t.get('text')),
                                 'is_selected': selected(v.get('isClicked'))})
-            properties.append({'property_id': str(card['propertyId']), 'property_name': card.get('propertyName') or str(card['propertyId']), 'options': options})
+            properties.append({'property_id': str(card['propertyId']), 'property_name': card.get('propertyName') or str(card['propertyId']), 'is_multiple': selected(card.get('isMultiple')), 'options': options})
     if not candidates: candidates = [{**category, 'is_selected': True}]
     return {'category': category, 'candidates': candidates, 'properties': properties, 'cards': cards}
 

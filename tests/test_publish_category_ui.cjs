@@ -19,3 +19,16 @@ test('material pagination requests selected page and page size',async()=>{
  let requested;const {ctx,nodes}=setup(['loadItemPublishMaterials'],{itemPublishMaterialPage:2,itemPublishMaterialPageSize:10,itemPublishMaterialTotal:0,itemPublishMaterialRequestId:0,renderItemPublishMaterials:()=>{},renderItemPublishMaterialPager:()=>{},requestItemPublishJson:async path=>{requested=path;return {list:[],total:25,page:2,page_size:10};}});
  nodes.publishMaterialList={};await ctx.loadItemPublishMaterials();assert.equal(requested,'/product-materials?page=2&page_size=10');
 });
+
+test('save or publish waits for the selected category request to finish',()=>{
+ const {ctx}=setup(['validateItemPublishValues'],{itemPublishCategoryState:{loading:true}});
+ assert.throws(()=>ctx.validateItemPublishValues({accountId:'fixture',title:'test',description:'desc',files:[]}), /类目.*等待|等待.*类目/);
+});
+
+test('multi-select property keeps every selected platform value',()=>{
+ const state={choice:{},properties:[{property_id:'tags',is_multiple:true,options:[{value_id:'a'},{value_id:'b'}]}]};
+ const {ctx,nodes}=setup(['updatePublishCategoryAttributes'],{itemPublishCategoryState:state});
+ nodes.publishCategoryAttributes.querySelectorAll=()=>[{value:'0',dataset:{propertyIndex:'0'},selectedOptions:[{value:'0'},{value:'1'}]}];
+ ctx.updatePublishCategoryAttributes();
+ assert.deepEqual(Array.from(state.choice.attributes[0].values,v=>v.value_id),['a','b']);
+});

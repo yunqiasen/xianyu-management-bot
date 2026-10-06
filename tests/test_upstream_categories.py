@@ -68,6 +68,20 @@ class CategoryCompatTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             await pub.recommend_categories('手机','描述',[])
 
+    async def test_multiple_property_values_are_preserved_in_labels(self):
+        response = recommendation()
+        response['data']['cardList'][1]['cardData']['isMultiple'] = '1'
+        pub = ItemPublisher('unb=fixture')
+        pub.get_public_channel = AsyncMock(return_value=response)
+        choice = {'channel_cat_id':'20','attributes':[{'property_id':'brand','values':[{'value_id':'b1'},{'value_id':'b2'}]}]}
+        result = await pub.recommend_categories('手机','描述',[],platform_category=choice)
+        labels = pub._build_item_label_list(result['cards'])
+        self.assertEqual([v['valueId'] for v in labels if v['propertyId']=='brand'], ['b1','b2'])
+        self.assertTrue(result['properties'][0]['is_multiple'])
+        response['data']['cardList'][1]['cardData']['isMultiple'] = False
+        with self.assertRaises(ValueError):
+            await pub.recommend_categories('手机','描述',[],platform_category=choice)
+
 
 class MaterialCategoryPersistence(unittest.TestCase):
     def test_category_survives_create_update_list_and_reopen(self):
