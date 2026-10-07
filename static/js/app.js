@@ -11982,10 +11982,12 @@ function updatePublishCategoryAttributes() {
     if (!state.choice) return;
     const attrs = [];
     document.getElementById('publishCategoryAttributes')?.querySelectorAll('select').forEach(el => {
-        if (el.value === '') return;
         const p = state.properties[Number(el.dataset.propertyIndex)];
         const options = Array.from(el.selectedOptions).filter(o => o.value !== '').map(o => p?.options[Number(o.value)]).filter(Boolean);
-        if (!options.length) return;
+        if (!options.length) {
+            if (p?.is_multiple) attrs.push({property_id: p.property_id, values: []});
+            return;
+        }
         const values = options.map(v => ({value_id: v.value_id, value_name: v.value_name}));
         attrs.push(p.is_multiple ? {property_id: p.property_id, values} : {property_id: p.property_id, ...values[0]});
     });
@@ -12019,7 +12021,7 @@ async function loadPublishCategories(choice = null) {
         });
         if (requestId !== state.requestId) return;
         if (!result.success) throw new Error(result.message || '类目推荐失败');
-        state.choice = {...result.category};
+        state.choice = result.category ? {...result.category} : null;
         state.candidates = result.candidates || [];
         state.properties = result.properties || [];
         renderPublishCategory();

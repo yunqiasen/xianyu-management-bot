@@ -34,6 +34,10 @@ async def fake_mtop(self, *, api_name, payload, **kwargs):
         {'valueId':'t1','text':'标签一','transportData':{'valueId':'t1','valueName':'标签一'}},
         {'valueId':'t2','text':'标签二','transportData':{'valueId':'t2','valueName':'标签二'}},
     ]}})
+    if '无默认分类' in str(payload):
+        response['data'].pop('categoryPredictResult', None)
+        for value in response['data']['cardList'][0]['cardData']['valuesList']:
+            value['isClicked'] = '0'
     return response
 ItemPublisher._post_mtop = fake_mtop
 uvicorn.run(reply_server.app, host='0.0.0.0', port=8090)

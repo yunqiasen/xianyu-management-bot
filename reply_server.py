@@ -5488,6 +5488,11 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                                 notification_message,
                                 title='闲鱼账号需要验证',
                                 notification_type='face_verify',
+                                template_context={
+                                    'verification_url': verification_url or '',
+                                    'verification_info': verification_type_label,
+                                    'detail': message,
+                                },
                                 attachment_path=actual_screenshot_path,
                             )
                             if notification_sent:
@@ -5535,6 +5540,11 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                                 notification_message,
                                 title='闲鱼账号需要验证',
                                 notification_type='face_verify',
+                                template_context={
+                                    'verification_url': verification_url or '',
+                                    'verification_info': verification_type_label,
+                                    'detail': message,
+                                },
                             )
                             if notification_sent:
                                 log_with_user('info', f"✅ 已发送账号验证通知: {account_id}", current_user)
@@ -6071,6 +6081,11 @@ async def _execute_manual_cookie_import(
                             notification_message,
                             title='闲鱼账号需要验证',
                             notification_type='face_verification',
+                            template_context={
+                                'verification_url': verification_url or '',
+                                'verification_info': verification_type_label,
+                                'detail': message,
+                            },
                             attachment_path=actual_screenshot_path,
                         )
                         if notification_sent:
@@ -10279,7 +10294,7 @@ def _normalize_platform_category(value):
         if pid in seen or pid == '-10000':
             raise HTTPException(status_code=400, detail="平台属性 ID 重复或无效")
         choices = attr.get('values') if 'values' in attr else [attr]
-        if not isinstance(choices, list) or not choices or len(choices) > 100:
+        if not isinstance(choices, list) or len(choices) > 100:
             raise HTTPException(status_code=400, detail="平台属性选项格式错误或数量过多")
         for option in choices:
             if not isinstance(option, dict) or (not option.get('value_id') and not option.get('value_name')):

@@ -32,3 +32,12 @@ test('multi-select property keeps every selected platform value',()=>{
  ctx.updatePublishCategoryAttributes();
  assert.deepEqual(Array.from(state.choice.attributes[0].values,v=>v.value_id),['a','b']);
 });
+
+test('clearing a multi-select sends explicit empty values',()=>{
+ const state={choice:{},properties:[{property_id:'tags',is_multiple:true,options:[]}]};
+ const {ctx,nodes}=setup(['updatePublishCategoryAttributes'],{itemPublishCategoryState:state});
+ nodes.publishCategoryAttributes.querySelectorAll=()=>[{value:'',dataset:{propertyIndex:'0'},selectedOptions:[]}];
+ ctx.updatePublishCategoryAttributes();
+ assert.equal(state.choice.attributes[0].property_id,'tags');
+ assert.equal(state.choice.attributes[0].values.length,0);
+});

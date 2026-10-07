@@ -320,6 +320,9 @@ class ItemPublisher:
         recommended = await self.recommend_categories(publish_title, publish_desc, uploaded_images,
                                                       category_hint=category_hint, platform_category=platform_category)
         category_result = self._normalize_category_result(recommended['category'])
+        missing = [key for key in ('catId', 'channelCatId', 'tbCatId') if not category_result.get(key)]
+        if missing:
+            raise ValueError('发布类目信息不完整，请重新选择分类，缺少: ' + ', '.join(missing))
         channel_res = {'data': {'cardList': recommended['cards']}}
         category_debug = {'category_hint': category_hint, 'category': recommended['category']}
 

@@ -8,12 +8,20 @@ def selected(value):
     return value is True or str(value).lower() in ('1', 'true')
 
 
+def value_name(value):
+    transport = value.get('transportData') if isinstance(value.get('transportData'), dict) else {}
+    name = first_text(value.get('valueName'), value.get('text'), value.get('catName'),
+                      transport.get('valueName'), transport.get('text'), transport.get('channelCateName'))
+    properties = first_text(value.get('properties'), transport.get('properties'))
+    return name or (properties.rsplit('##', 1)[-1].strip() if '##' in properties else '')
+
+
 def normalize_category(value):
     value = category_result(value) or {}
     t = value.get('transportData') if isinstance(value.get('transportData'), dict) else {}
     return {
         'cat_id': first_text(value.get('cat_id'), value.get('catId'), value.get('categoryId'), t.get('catId'), t.get('categoryId')),
-        'cat_name': first_text(value.get('cat_name'), value.get('catName'), value.get('text'), t.get('text'), t.get('valueName'), t.get('channelCateName')),
+        'cat_name': first_text(value.get('cat_name'), value.get('catName'), value_name(value)),
         'channel_cat_id': first_text(value.get('channel_cat_id'), value.get('channelCatId'), value.get('channelCategoryId'), t.get('channelCateId'), t.get('channelCategoryId')),
         'channel_cat_name': first_text(value.get('channel_cat_name'), value.get('channelCatName'), t.get('channelCateName')),
         'tb_cat_id': first_text(value.get('tb_cat_id'), value.get('tbCatId'), value.get('taobaoCategoryId'), t.get('tbCatId'), t.get('taobaoCategoryId')),
@@ -62,7 +70,9 @@ def describe_categories(response, choice=None):
         # Use prediction if supplied, otherwise the platform's explicit selected option.
         source = predicted if any(predicted.values()) else next(
             (v for c in category_cards for v in c.get('valuesList') or [] if selected(v.get('isClicked'))), {})
-        selection = choose_cards(cards, source)
+        selection = choose_cards(cards, source) if source else {
+            "current_card_list": cards, "selected_list": []
+        }
     elif any(predicted.get(k) for k in ('cat_id', 'channel_cat_id', 'tb_cat_id')):
         selection = {'current_card_list': cards, 'selected_list': [], **predicted}
     else:
@@ -89,7 +99,7 @@ def describe_categories(response, choice=None):
         card = by_id.get(pid)
         if not card or pid == '-10000': raise ValueError('所选属性已失效，请重新获取类目')
         choices = attr.get('values') if 'values' in attr else [attr]
-        if not isinstance(choices, list) or not choices or any(not isinstance(c, dict) for c in choices):
+        if not isinstance(choices, list) or any(not isinstance(c, dict) for c in choices):
             raise ValueError('平台属性选项格式异常')
         if len(choices) > 1 and not selected(card.get('isMultiple')):
             raise ValueError('当前平台属性仅支持单选')
@@ -97,7 +107,7 @@ def describe_categories(response, choice=None):
         for value in card.get('valuesList') or []:
             transport = value.get('transportData') or {}
             vid = first_text(value.get('valueId'), transport.get('valueId'))
-            name = first_text(value.get('text'), transport.get('valueName'), transport.get('text'))
+            name = value_name(value)
             hits = []
             for index, option in enumerate(choices):
                 hit = (str(option.get('value_id')) == vid) if option.get('value_id') not in (None, '') else (str(option.get('value_name') or '') == name)
@@ -122,10 +132,12 @@ def describe_categories(response, choice=None):
             for v in card.get('valuesList') or []:
                 t = v.get('transportData') or {}
                 options.append({'value_id': first_text(v.get('valueId'), t.get('valueId')),
-                                'value_name': first_text(v.get('text'), v.get('valueName'), t.get('valueName'), t.get('text')),
+                                'value_name': value_name(v),
                                 'is_selected': selected(v.get('isClicked'))})
             properties.append({'property_id': str(card['propertyId']), 'property_name': card.get('propertyName') or str(card['propertyId']), 'is_multiple': selected(card.get('isMultiple')), 'options': options})
     if not candidates: candidates = [{**category, 'is_selected': True}]
+    if not any(category.get(k) for k in ('cat_id', 'channel_cat_id', 'tb_cat_id')):
+        category = None
     return {'category': category, 'candidates': candidates, 'properties': properties, 'cards': cards}
 
 
@@ -138,7 +150,8 @@ def build_labels(cards):
             t = deepcopy(v.get('transportData') or {})
             t.update(propertyId=str(card['propertyId']), propertyName=card.get('propertyName'), isUserClick='1', labelFrom='newPublish', **{'from': 'newPublishChoice'})
             t.setdefault('valueId', v.get('valueId'))
-            t.setdefault('valueName', v.get('text') or v.get('valueName'))
+            if not t.get('valueName') and str(card['propertyId']) != '-10000':
+                t['valueName'] = value_name(v)
             t.setdefault('text', v.get('text') or v.get('catName') or t.get('valueName'))
             if not t.get('properties') and v.get('properties'): t['properties'] = v['properties']
             labels.append(t)

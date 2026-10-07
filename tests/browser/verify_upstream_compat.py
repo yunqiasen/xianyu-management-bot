@@ -52,6 +52,31 @@ with sync_playwright() as p:
     page.locator('#publishMaterialList button').filter(has_text='载入').first.click()
     assert page.evaluate('itemPublishCategoryState.choice.channel_cat_id')=='10'
     expect(page.locator('#publishCategoryAttr1 option:checked')).to_have_count(2)
+    page.locator('#publishCategoryAttr1').select_option([])
+    page.locator('#itemPublishSaveMaterialBtn').click()
+    expect(page.locator('#itemPublishSaveMaterialBtn')).to_be_enabled()
+    material = context.request.get(base+f'/product-materials/{mid}',headers={'Authorization':'Bearer '+token}).json()['material']
+    assert material['platform_category']['attributes'][1]['values'] == []
+    page.reload(wait_until='networkidle')
+    page.evaluate("showSection('item-publish')")
+    page.evaluate('async mid => {const data=await requestItemPublishJson(`/product-materials/${mid}`); itemPublishMaterials=[data.material]; renderItemPublishMaterials();}', mid)
+    page.locator('#publishMaterialList button').filter(has_text='载入').first.click()
+    expect(page.locator('#publishCategoryAttr1 option:checked')).to_have_count(0)
+    assert page.evaluate('itemPublishCategoryState.choice.attributes[1].values') == []
+    page.locator('#itemPublishSaveMaterialBtn').click()
+    expect(page.locator('#itemPublishSaveMaterialBtn')).to_be_enabled()
+    material = context.request.get(base+f'/product-materials/{mid}',headers={'Authorization':'Bearer '+token}).json()['material']
+    assert material['platform_category']['attributes'][1]['values'] == []
+    checks.append('explicit multi-select clear persists through save, reload and second save')
+    page.locator('#publishTitle').fill('无默认分类')
+    page.locator('#publishCookieId').select_option('fixture-account')
+    page.locator('#publishCategoryRecommendBtn').click()
+    expect(page.locator('#publishPlatformCategory option')).to_have_count(3)
+    assert page.evaluate('itemPublishCategoryState.choice') is None
+    page.locator('#publishPlatformCategory').select_option('0')
+    expect(page.locator('#publishPlatformCategoryStatus')).to_contain_text('已选择')
+    assert page.evaluate('itemPublishCategoryState.choice.channel_cat_id') == '10'
+    checks.append('candidates without platform default remain visible and manually selectable')
     page.locator('#publishTitle').fill('修改标题后清除分类')
     expect(page.locator('#publishPlatformCategoryStatus')).to_contain_text('未选择')
     assert page.evaluate('itemPublishCategoryState.choice') is None
