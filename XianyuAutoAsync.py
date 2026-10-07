@@ -13240,13 +13240,13 @@ class XianyuLive:
         # 如果没有token或者token过期，获取新token
         token_refresh_attempted = False
         if not self.current_token or (time.time() - self.last_token_refresh_time) >= self.token_refresh_interval:
-            if self._should_defer_auth_recovery_for_qr_grace():
-                raise InitAuthError(self.last_token_refresh_error_message or "扫码登录稳定期中，暂缓初始化Token预检")
-
+            # Fresh QR cookies still need an IM token. Grace suppresses automatic
+            # password re-login, not the first token request / message connection.
+            allow_password_recovery = not self._is_in_qr_login_grace_period()
             logger.info(f"【{self.cookie_id}】获取初始token...")
             token_refresh_attempted = True
 
-            await self.refresh_token()
+            await self.refresh_token(allow_password_login_recovery=allow_password_recovery)
 
         if not self.current_token:
             self.last_init_failure_type = 'init_auth_failed'
